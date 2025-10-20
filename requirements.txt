@@ -1,0 +1,22 @@
+# --- Core Orchestration ---
+python-dotenv         # Para gestionar variables de entorno (API keys)
+langchain             # El framework base
+langgraph             # El motor de grafos
+langchain-openai      # O -anthropic, -google-genai, etc.
+
+# --- Observability (CRÍTICO para LLMOps) ---
+langsmith             # Para debug, tracing y evaluación
+
+# --- Serving (Para productivizar) ---
+fastapi               # Para crear un endpoint API para tu agente
+uvicorn               # El servidor para FastAPI
+
+# --- Herramientas Comunes (RAG, etc.) ---
+langchain-community   # Contiene muchas integraciones
+faiss-cpu             # Vector store local y rápida (o chromadb)
+pypdf                 # Para leer documentos PDF
+beautifulsoup4        # Para web scraping
+
+# --- Testing ---
+pytest
+pytest-asyncio        # Para testear funciones async
