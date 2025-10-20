@@ -1,2 +1,4 @@
 /myLinuxVenv
 .env
+*.env
+*.env/*
