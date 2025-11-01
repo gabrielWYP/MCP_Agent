@@ -20,3 +20,6 @@ beautifulsoup4        # Para web scraping
 # --- Testing ---
 pytest
 pytest-asyncio        # Para testear funciones async
+pandas                # Para manipulación de datos en tests
+pytest-asyncio        # Para testear funciones async
+s3fs                  # Para interactuar con Object Storage de forma agnóstica

@@ -1,4 +1,7 @@
 /myLinuxVenv
+/.venv
 .env
 *.env
 *.env/*
+*.pycache
+__pycache__/
