@@ -1,8 +1,12 @@
 
 import os
+import sys
 import s3fs
 from typing import Dict, Any
 from typing_extensions import TypedDict
+from langgraph.graph import StateGraph, END
+import json
+import pandas as pd
 
 # --- Definición del Estado del Grafo ---
 class MLOpsState(TypedDict):
@@ -20,6 +24,7 @@ S3_ENDPOINT_URL = os.getenv("S3_ENDPOINT_URL")
 S3_ACCESS_KEY = os.getenv("S3_ACCESS_KEY")
 S3_SECRET_KEY = os.getenv("S3_SECRET_KEY")
 BUCKET_NAME = os.getenv("BUCKET_NAME") # Puedes sobrescribir el nombre del bucket si es necesario
+
 
 def get_s3fs():
     """Inicializa y devuelve un sistema de archivos s3fs."""
@@ -127,3 +132,9 @@ def alert_human(state: MLOpsState) -> MLOpsState:
     else:
         print("Alerta de Despliegue: El modelo fue rechazado.")
     return state
+
+__all__ = [
+    'MLOpsState',
+    'get_gemini_manager', # Exportamos la función, no la variable
+    # ...
+]
