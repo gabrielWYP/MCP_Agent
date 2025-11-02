@@ -33,8 +33,6 @@ wheels/
 
 # Jupyter Notebooks
 *.ipynb
-notebooks/
-!notebooks/.gitkeep
 
 # IDE
 .vscode/
