@@ -8,13 +8,14 @@ load_dotenv()
 # Añadimos el directorio de notebooks al path para poder importar utils
 sys.path.append(os.path.join(os.path.dirname(__file__), 'notebooks'))
 
-from notebooks.utils import list_all_bucket_objects, BUCKET_NAME
+from src.utils.ObjectStorage import count_and_list_objects, BUCKET_NAME
 
 if __name__ == "__main__":
     print("\n--- Iniciando prueba de conexión S3 a OCI ---")
     try:
-        objects = list_all_bucket_objects(BUCKET_NAME)
+        cantidad, objects = count_and_list_objects(BUCKET_NAME)
         if objects:
+            print(f"Cantidad de objetos en el bucket '{BUCKET_NAME}': {cantidad}")
             print(f"Objetos encontrados en el bucket '{BUCKET_NAME}':")
             for obj in objects:
                 print(f" - {obj}")
