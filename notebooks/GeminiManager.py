@@ -35,7 +35,7 @@ class GeminiManager_class:
     
     def _initialize_llm(self):
         """Inicializa o reinicializa el cliente de Gemini con configuración actual"""
-        self.llm = ChatGoogleGenerativeAI(
+        self.llm =
             model=self.config["model"],
             temperature=self.config["temperature"],
             api_key=os.getenv("GOOGLE_API_KEY"),
@@ -56,7 +56,7 @@ class GeminiManager_class:
         
         self.config.update(kwargs)
         self._initialize_llm()
-        print(f"✅ Configuración de Gemini actualizada: {self.config}")
+        print(f"Configuración de Gemini actualizada: {self.config}")
     
     def get_config(self):
         """Retorna la configuración actual"""
