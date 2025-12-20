@@ -22,7 +22,7 @@ class MLOpsState(TypedDict):
 S3_ENDPOINT_URL = os.getenv("S3_ENDPOINT_URL")
 S3_ACCESS_KEY = os.getenv("S3_ACCESS_KEY")
 S3_SECRET_KEY = os.getenv("S3_SECRET_KEY")
-BUCKET_NAME = os.getenv("BUCKET_NAME") # Puedes sobrescribir el nombre del bucket si es necesario
+BUCKET_NAME = os.getenv("BUCKET_NAME")
 
 
 def get_s3fs():
