@@ -24,3 +24,5 @@ pandas                # Para manipulación de datos en tests
 pytest-asyncio        # Para testear funciones async
 s3fs                  # Para interactuar con Object Storage de forma agnóstica
 langchain-google-genai
+
+opencv-contrib-python
