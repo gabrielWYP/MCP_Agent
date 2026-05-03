@@ -28,10 +28,10 @@ logger.debug(f"Project root: {PROJECT_ROOT}")
 # ==========================================
 # ⚠️ OBLIGATORIO: Agarra una regla y mide tu hoja impresa físicamente.
 # Reemplaza estos valores en metros (ej. si mide 35mm, pon 0.035).
-SQUARES_X = 11   # Columnas de tu PDF
+SQUARES_X = 11  # Columnas de tu PDF
 SQUARES_Y = 8   # Filas de tu PDF
-SQUARE_LENGTH = 0.023  # Lado del cuadrado negro (EN METROS)
-MARKER_LENGTH = 0.016  # Lado del código QR interior (EN METROS)
+SQUARE_LENGTH = 0.012  # Lado del cuadrado negro (EN METROS)
+MARKER_LENGTH = 0.009  # Lado del código QR interior (EN METROS)
 
 # Rutas por defecto (relativas a la raíz del proyecto)
 DEFAULT_DIR_RGB_REL = 'calibracion/rgb/news/rgb/*.jpg'
@@ -114,7 +114,7 @@ def run_homography_calibration(
     """
     try:
         # Setup estricto para OpenCV 4.7+
-        aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_6X6_250)
+        aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
         board = cv2.aruco.CharucoBoard(
             (squares_x, squares_y), 
             square_length, 
@@ -151,8 +151,30 @@ def run_homography_calibration(
                 continue
             
             # Detección del tablero en ambos espectros
-            charucoCorners_rgb, charucoIds_rgb, _, _ = charuco_detector.detectBoard(img_rgb)
-            charucoCorners_nir, charucoIds_nir, _, _ = charuco_detector.detectBoard(img_nir)
+            charucoCorners_rgb, charucoIds_rgb, markerCorners_rgb, markerIds_rgb = charuco_detector.detectBoard(img_rgb)
+            charucoCorners_nir, charucoIds_nir, markerCorners_nir, markerIds_nir = charuco_detector.detectBoard(img_nir)
+            
+            # Analizador estático de fallos
+            def auditar_deteccion(nombre_camara, charucoIds, markerIds):
+                num_markers = len(markerIds) if markerIds is not None else 0
+                num_corners = len(charucoIds) if charucoIds is not None else 0
+                
+                if num_corners > 0:
+                    return True, f"✅ [{nombre_camara}] OK: {num_markers} QRs encontrados -> {num_corners} esquinas interpoladas."
+                elif num_markers > 0:
+                    return False, f"⚠️ [{nombre_camara}] FALLA GEOMÉTRICA: Vio {num_markers} QRs, pero 0 esquinas. \n   └ Causa: SQUARES_X/Y en el script no coinciden con el papel, tablero doblado, o falta margen blanco."
+                else:
+                    return False, f"❌ [{nombre_camara}] FALLA ÓPTICA: Vio 0 QRs. \n   └ Causa: Contraste insuficiente, fuera de foco, o diccionario DICT_6X6_250 equivocado."
+
+            ok_rgb, msg_rgb = auditar_deteccion("RGB", charucoIds_rgb, markerIds_rgb)
+            ok_nir, msg_nir = auditar_deteccion("NIR", charucoIds_nir, markerIds_nir)
+            
+            # Reportar estado exacto si alguna falla
+            if not (ok_rgb and ok_nir):
+                logger.warning(f"Descartando par: {os.path.basename(ruta_rgb)}")
+                logger.warning(msg_rgb)
+                logger.warning(msg_nir)
+                continue # Saltamos al siguiente par
             
             if charucoCorners_rgb is not None and charucoCorners_nir is not None:
                 puntos_rgb_filtrados = []
