@@ -126,9 +126,8 @@ def run_training_job(state: MLOpsState) -> MLOpsState:
         state["candidate_model_path"] = f"s3://{BUCKET_NAME}/models/mango_model_v{new_version}.tflite"
         state["candidate_metrics"] = {
             "accuracy": 0.90,
-            "f1_class_maduro": 0.95,
-            "f1_class_verde": 0.88,
-            "f1_class_pinton": 0.92,
+            "f1_class_sano": 0.92,
+            "f1_class_danado": 0.88,
             "loss": 0.24
         }
         state["timestamp"] = datetime.now().isoformat()
@@ -169,9 +168,8 @@ def analyze_performance(state: MLOpsState) -> MLOpsState:
         # Métricas de producción (valores por defecto)
         production_metrics = state.get("production_metrics", {
             "accuracy": 0.91,
-            "f1_class_maduro": 0.88,
-            "f1_class_verde": 0.90,
-            "f1_class_pinton": 0.87,
+            "f1_class_sano": 0.92,
+            "f1_class_danado": 0.89,
             "loss": 0.26
         })
         
@@ -181,27 +179,27 @@ def analyze_performance(state: MLOpsState) -> MLOpsState:
         # prompt = f"""
         # Producción v{state['model_version']-1}: {production_metrics}
         # Candidato v{state['model_version']}: {candidate_metrics}
-        # ¿Es el candidato mejor para identificar mangos maduros?
+        # ¿Es el candidato mejor para detectar daño mecánico en mangos?
+        # La clase crítica es 'danado' — un falso negativo es costoso.
         # Retorna JSON con 'decision' ('APPROVE'/'REJECT') y 'reason'.
         # """
         # response = llm.invoke(prompt)
         
-        # Lógica simulada: comparar F1 score de clase "maduro"
-        candidate_f1_maduro = candidate_metrics.get("f1_class_maduro", 0)
-        production_f1_maduro = production_metrics.get("f1_class_maduro", 0)
+        # Lógica simulada: la clase crítica es "danado" (falso negativo = mango dañado pasa como sano)
+        candidate_f1_danado = candidate_metrics.get("f1_class_danado", 0)
+        production_f1_danado = production_metrics.get("f1_class_danado", 0)
         
-        if candidate_f1_maduro > production_f1_maduro:
+        if candidate_f1_danado > production_f1_danado:
             decision = "APPROVE"
             reason = (
-                f"Aunque la precisión general bajó ligeramente, "
-                f"F1 score para 'maduro' mejoró de {production_f1_maduro} "
-                f"a {candidate_f1_maduro}. Crítico para objetivos de negocio."
+                f"F1 score para 'danado' mejoró de {production_f1_danado} "
+                f"a {candidate_f1_danado}. Reduce falsos negativos — mangos dañados que escapan al control."
             )
         else:
             decision = "REJECT"
             reason = (
-                f"F1 score para 'maduro' bajó de {production_f1_maduro} "
-                f"a {candidate_f1_maduro}. Inaceptable para producción."
+                f"F1 score para 'danado' bajó de {production_f1_danado} "
+                f"a {candidate_f1_danado}. Inaceptable: más mangos dañados llegarían al mercado."
             )
         
         state["deployment_decision"] = decision

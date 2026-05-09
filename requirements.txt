@@ -21,8 +21,16 @@ beautifulsoup4        # Para web scraping
 pytest
 pytest-asyncio        # Para testear funciones async
 pandas                # Para manipulación de datos en tests
-pytest-asyncio        # Para testear funciones async
 s3fs                  # Para interactuar con Object Storage de forma agnóstica
 langchain-google-genai
 
 opencv-contrib-python
+
+# --- Deep Learning (ConvNext Teacher + KD Pipeline) ---
+torch>=2.1.0
+torchvision>=0.16.0
+timm>=0.9.12          # ConvNeXtV2 de Meta + muchas variantes preentrenadas
+albumentations>=1.3.0 # Augmentaciones avanzadas (compatible con N canales)
+Pillow>=10.0.0
+scikit-learn>=1.3.0   # Métricas: F1, confusion matrix, classification report
+tqdm>=4.65.0          # Progress bars en entrenamiento
