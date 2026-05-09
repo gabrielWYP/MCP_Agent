@@ -33,9 +33,6 @@ wheels/
 *.jpg
 *.png
 
-# Jupyter Notebooks
-*.ipynb
-
 # IDE
 .vscode/
 .idea/
