@@ -2,7 +2,7 @@
 Master Model — Full architecture for multimodal mango damage detection.
 
 Input:  RGB image (N, 3, H, W) + NIR image (N, 1, H, W)
-Output: Detection results + intermediate features for knowledge distillation
+Output: YOLO-style detections + intermediate features for knowledge distillation
 
 Full pipeline:
     RGB + NIR
@@ -17,17 +17,18 @@ Full pipeline:
         ↓
     DualFPN (two FPNs + per-level fusion)
         ↓
-    unified_pyramid [P2, P3, P4, P5]
+    unified_pyramid [P3, P4, P5]
         ↓
-    CascadeRCNNHead (3 stages, IoU 0.5 / 0.6 / 0.7)
+    YOLODetectionHead (anchor-free, decoupled)
         ↓
-    {cls_scores, bbox_deltas, distill_feats}
+    {preds, cls_preds, reg_preds, distill_feats}
 
 Distillation outputs exposed:
     - backbone_rgb_features:  [S1..S4] from RGB encoder
     - backbone_fused_features: [F1..F4] after cross-attention
-    - fpn_pyramid:            [P2..P5] unified pyramid
-    - head_distill_feats:     [FC2_s1, FC2_s2, FC2_s3] from cascade stages
+    - fpn_pyramid:            [P3..P5] unified pyramid
+    - head_cls_feats:         [cls_stem_P3, cls_stem_P4, cls_stem_P5]
+    - head_reg_feats:         [reg_stem_P3, reg_stem_P4, reg_stem_P5]
 """
 
 import torch
@@ -36,7 +37,7 @@ import torch.nn as nn
 from .backbone import DualConvNeXtBackbone
 from .fusion import CrossModalFusion
 from .neck import DualFPN
-from .head import CascadeRCNNHead
+from .head import YOLODetectionHead, NUM_CLASSES
 
 
 class MasterModel(nn.Module):
@@ -44,13 +45,12 @@ class MasterModel(nn.Module):
     Multimodal master model for cross-modal knowledge distillation.
 
     Args:
-        num_classes (int): Detection classes including background (default 3).
+        num_classes (int): Detection classes (default 2: sano, danado).
         pretrained_backbone (bool): Load ImageNet weights for ConvNeXt stages.
         fpn_channels (int): FPN output channels (default 256).
-        fc_channels (int): Cascade R-CNN FC hidden size (default 1024).
-        roi_out_size (int): RoIAlign output size (default 7).
         fusion_dropout (float): Dropout in cross-attention fusion.
         fpn_dropout (float): Dropout in FPN fusion convs.
+        head_strides (list[int]): Strides for YOLO head levels.
     """
 
     # ConvNeXt-Small stage channels
@@ -58,13 +58,12 @@ class MasterModel(nn.Module):
 
     def __init__(
         self,
-        num_classes: int = 3,
+        num_classes: int = NUM_CLASSES,
         pretrained_backbone: bool = True,
         fpn_channels: int = 256,
-        fc_channels: int = 1024,
-        roi_out_size: int = 7,
         fusion_dropout: float = 0.1,
         fpn_dropout: float = 0.1,
+        head_strides: list[int] = None,
     ):
         super().__init__()
 
@@ -84,16 +83,12 @@ class MasterModel(nn.Module):
             dropout=fpn_dropout,
         )
 
-        # --- 4. Cascade R-CNN head ---
-        self.head = CascadeRCNNHead(
-            roi_out_size=roi_out_size,
+        # --- 4. YOLO-style detection head (compatible with YOLO Nano student) ---
+        self.head = YOLODetectionHead(
             fpn_channels=fpn_channels,
-            fc_channels=fc_channels,
             num_classes=num_classes,
+            strides=head_strides or [8, 16, 32],
         )
-
-        # Storage for distillation features (populated during forward)
-        self._distill_cache: dict[str, list[torch.Tensor]] = {}
 
     # ------------------------------------------------------------------
     # Forward
@@ -103,24 +98,22 @@ class MasterModel(nn.Module):
         self,
         rgb: torch.Tensor,
         nir: torch.Tensor,
-        proposals: list[torch.Tensor] = None,
     ) -> dict:
         """
         Args:
-            rgb:       (N, 3, H, W) — RGB image, normalized [0,1] or ImageNet norm
-            nir:       (N, 1, H, W) — NIR grayscale image, normalized [0,1]
-            proposals: list of (M_i, 4) proposal boxes per image.
-                       Required for training. At inference, an RPN would generate these.
-                       Format: (x1, y1, x2, y2) in pixel coordinates.
+            rgb: (N, 3, H, W) — RGB image, normalized
+            nir: (N, 1, H, W) — NIR grayscale image, normalized
 
         Returns:
             dict with keys:
-                'cls_scores'             : list of 3 tensors (cascade stages)
-                'bbox_deltas'            : list of 3 tensors (cascade stages)
+                'preds'              : list of (B, nc+4, H_i, W_i) per level
+                'cls_preds'          : list of (B, nc, H_i, W_i) per level
+                'reg_preds'          : list of (B, 4, H_i, W_i) per level
                 'distill_backbone_rgb'   : [S1..S4] RGB backbone features
                 'distill_backbone_fused' : [F1..F4] cross-attention fused features
-                'distill_fpn'            : [P2..P5] unified FPN pyramid
-                'distill_head'           : [FC2_s1, FC2_s2, FC2_s3] head features
+                'distill_fpn'            : [P3..P5] unified FPN pyramid
+                'distill_head_cls'       : [cls_stem x3] head classification features
+                'distill_head_reg'       : [reg_stem x3] head regression features
         """
         # --- Backbone ---
         rgb_features, nir_features = self.backbone(rgb, nir)
@@ -133,27 +126,24 @@ class MasterModel(nn.Module):
 
         # --- Dual FPN ---
         pyramid = self.neck(fused_features, nir_features_pass)
-        # pyramid: [P2..P5] at fpn_channels (256)
+        # pyramid: [P3..P5] at fpn_channels (256)
 
-        # --- Detection head ---
-        if proposals is None:
-            # Inference mode: return features only (RPN not implemented here)
-            # In production, plug in an RPN or use pre-computed proposals
-            head_output = {"cls_scores": [], "bbox_deltas": [], "distill_feats": []}
-        else:
-            head_output = self.head(pyramid, proposals)
+        # --- YOLO Detection Head ---
+        head_output = self.head(pyramid)
 
         # --- Assemble output with all distillation features ---
         return {
             # Detection outputs
-            "cls_scores":   head_output["cls_scores"],
-            "bbox_deltas":  head_output["bbox_deltas"],
+            "preds":      head_output["preds"],
+            "cls_preds":  head_output["cls_preds"],
+            "reg_preds":  head_output["reg_preds"],
 
             # Distillation features — exposed for student training
-            "distill_backbone_rgb":    rgb_features,      # [S1..S4]
-            "distill_backbone_fused":  fused_features,    # [F1..F4]
-            "distill_fpn":             pyramid,           # [P2..P5]
-            "distill_head":            head_output.get("distill_feats", []),  # [FC2 x3]
+            "distill_backbone_rgb":   rgb_features,          # [S1..S4]
+            "distill_backbone_fused": fused_features,        # [F1..F4]
+            "distill_fpn":            pyramid,               # [P3..P5]
+            "distill_head_cls":       head_output["distill_cls"],  # [cls_stem x3]
+            "distill_head_reg":       head_output["distill_reg"],  # [reg_stem x3]
         }
 
     # ------------------------------------------------------------------
