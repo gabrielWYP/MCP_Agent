@@ -16,7 +16,6 @@ logger = logging.getLogger(__name__)
 # ==========================================
 # 0. DETECCIÓN AUTOMÁTICA DE RUTAS BASE
 # ==========================================
-# Detectar si estamos ejecutando desde notebooks/ o desde raíz del proyecto
 SCRIPT_DIR = Path(__file__).parent.absolute()
 PROJECT_ROOT = SCRIPT_DIR.parent if SCRIPT_DIR.name == 'notebooks' else SCRIPT_DIR
 
@@ -24,20 +23,16 @@ logger.debug(f"Script dir: {SCRIPT_DIR}")
 logger.debug(f"Project root: {PROJECT_ROOT}")
 
 # ==========================================
-# 1. CONFIGURACIÓN DEL TABLERO CHARUCO
+# 1. CONFIGURACIÓN DEL TABLERO
 # ==========================================
-# ⚠️ OBLIGATORIO: Agarra una regla y mide tu hoja impresa físicamente.
-# Reemplaza estos valores en metros (ej. si mide 35mm, pon 0.035).
-SQUARES_X = 11  # Columnas de tu PDF
-SQUARES_Y = 8   # Filas de tu PDF
-SQUARE_LENGTH = 0.012  # Lado del cuadrado negro (EN METROS)
-MARKER_LENGTH = 0.009  # Lado del código QR interior (EN METROS)
+SQUARES_X = 11  
+SQUARES_Y = 8 
+SQUARE_LENGTH = 0.012  
+MARKER_LENGTH = 0.009  
 
-# Rutas por defecto (relativas a la raíz del proyecto)
 DEFAULT_DIR_RGB_REL = 'calibracion/rgb/news/rgb/*.jpg'
 DEFAULT_DIR_NIR_REL = 'calibracion/nir/news/nir/*.jpg'
 
-# Opciones fallback por si la estructura cambia
 POSSIBLE_RGB_PATHS = [
     DEFAULT_DIR_RGB_REL,
     'calibracion/rgb/news/nir/*.jpg',
@@ -50,14 +45,7 @@ POSSIBLE_NIR_PATHS = [
     'calibracion/nir/**/*.jpg',
 ]
 
-
 def resolve_glob_pattern(path_pattern):
-    """
-    Resuelve patrones glob en este orden:
-    1) Ruta absoluta
-    2) Relativa a PROJECT_ROOT
-    3) Relativa al directorio actual (cwd)
-    """
     path = Path(path_pattern)
     if path.is_absolute():
         return str(path)
@@ -70,18 +58,14 @@ def resolve_glob_pattern(path_pattern):
     if glob.glob(str(candidate_cwd), recursive=True):
         return str(candidate_cwd)
 
-    # Mantener comportamiento predecible aunque no haya match
     return str(candidate_project)
 
-
 def find_first_existing_pattern(possible_patterns):
-    """Encuentra el primer patrón que tenga archivos."""
     for pattern in possible_patterns:
         resolved = resolve_glob_pattern(pattern)
         if glob.glob(resolved, recursive=True):
             return resolved
     return resolve_glob_pattern(possible_patterns[0])
-
 
 DIR_RGB = find_first_existing_pattern(POSSIBLE_RGB_PATHS)
 DIR_NIR = find_first_existing_pattern(POSSIBLE_NIR_PATHS)
@@ -89,42 +73,18 @@ DIR_NIR = find_first_existing_pattern(POSSIBLE_NIR_PATHS)
 def run_homography_calibration(
     dir_rgb,
     dir_nir,
-    squares_x=SQUARES_X,
-    squares_y=SQUARES_Y,
-    square_length=SQUARE_LENGTH,
-    marker_length=MARKER_LENGTH,
-    output_path='matriz_homografia_charuco.npy',
+    output_path='matriz_homografia_aruco.npy',
     ransac_threshold=5.0
 ):
     """
-    Ejecuta el calibrado de homografía para imágenes RGB y NIR usando tableros Charuco.
-    
-    Args:
-        dir_rgb (str): Ruta glob para imágenes RGB
-        dir_nir (str): Ruta glob para imágenes NIR
-        squares_x (int): Columnas del tablero Charuco
-        squares_y (int): Filas del tablero Charuco
-        square_length (float): Lado del cuadrado en metros
-        marker_length (float): Lado del marcador en metros
-        output_path (str): Ruta de salida para la matriz
-        ransac_threshold (float): Umbral RANSAC en píxeles
-    
-    Returns:
-        np.ndarray: Matriz de homografía calculada, o None si falla
+    Ejecuta el calibrado de homografía usando únicamente los centros de los marcadores ArUco.
+    Inmune a rotaciones de cámara y falta de márgenes blancos.
     """
     try:
-        # Setup estricto para OpenCV 4.7+
+        # 1. Configuración del Detector ArUco Puro (OpenCV 4.7+)
         aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
-        board = cv2.aruco.CharucoBoard(
-            (squares_x, squares_y), 
-            square_length, 
-            marker_length, 
-            aruco_dict
-        )
-        
         detector_params = cv2.aruco.DetectorParameters()
-        charuco_params = cv2.aruco.CharucoParameters()
-        charuco_detector = cv2.aruco.CharucoDetector(board, charuco_params, detector_params)
+        aruco_detector = cv2.aruco.ArucoDetector(aruco_dict, detector_params)
         
         # ==========================================
         # 2. PROCESAMIENTO MLOPS: EXTRACCIÓN Y EMPAREJAMIENTO
@@ -136,7 +96,7 @@ def run_homography_calibration(
             logger.error(f"No se encontraron imágenes. RGB: {len(rutas_rgb)}, NIR: {len(rutas_nir)}")
             return None
         
-        logger.info(f"Iniciando pipeline estéreo en {len(rutas_rgb)} pares...")
+        logger.info(f"Iniciando pipeline estéreo invariante a rotación en {len(rutas_rgb)} pares...")
         
         puntos_comunes_rgb = []
         puntos_comunes_nir = []
@@ -150,70 +110,63 @@ def run_homography_calibration(
                 logger.warning(f"❌ Error al leer: {os.path.basename(ruta_rgb)}")
                 continue
             
-            # Detección del tablero en ambos espectros
-            charucoCorners_rgb, charucoIds_rgb, markerCorners_rgb, markerIds_rgb = charuco_detector.detectBoard(img_rgb)
-            charucoCorners_nir, charucoIds_nir, markerCorners_nir, markerIds_nir = charuco_detector.detectBoard(img_nir)
+            # Detección de marcadores (No importa la orientación de las imágenes)
+            corners_rgb, ids_rgb, _ = aruco_detector.detectMarkers(img_rgb)
+            corners_nir, ids_nir, _ = aruco_detector.detectMarkers(img_nir)
             
-            # Analizador estático de fallos
-            def auditar_deteccion(nombre_camara, charucoIds, markerIds):
-                num_markers = len(markerIds) if markerIds is not None else 0
-                num_corners = len(charucoIds) if charucoIds is not None else 0
-                
-                if num_corners > 0:
-                    return True, f"✅ [{nombre_camara}] OK: {num_markers} QRs encontrados -> {num_corners} esquinas interpoladas."
-                elif num_markers > 0:
-                    return False, f"⚠️ [{nombre_camara}] FALLA GEOMÉTRICA: Vio {num_markers} QRs, pero 0 esquinas. \n   └ Causa: SQUARES_X/Y en el script no coinciden con el papel, tablero doblado, o falta margen blanco."
-                else:
-                    return False, f"❌ [{nombre_camara}] FALLA ÓPTICA: Vio 0 QRs. \n   └ Causa: Contraste insuficiente, fuera de foco, o diccionario DICT_6X6_250 equivocado."
+            num_markers_rgb = len(ids_rgb) if ids_rgb is not None else 0
+            num_markers_nir = len(ids_nir) if ids_nir is not None else 0
+            
+            if num_markers_rgb == 0 or num_markers_nir == 0:
+                logger.warning(f"Descartando {os.path.basename(ruta_rgb)}: RGB vio {num_markers_rgb} QRs, NIR vio {num_markers_nir} QRs.")
+                continue
 
-            ok_rgb, msg_rgb = auditar_deteccion("RGB", charucoIds_rgb, markerIds_rgb)
-            ok_nir, msg_nir = auditar_deteccion("NIR", charucoIds_nir, markerIds_nir)
+            # Mapear ID -> Centro geométrico para la imagen NIR
+            centros_nir = {}
+            for i, id_nir in enumerate(ids_nir.flatten()):
+                # corners_nir[i][0] tiene la forma (4, 2) con las 4 esquinas del QR
+                esquinas = corners_nir[i][0]
+                cx = np.mean(esquinas[:, 0])
+                cy = np.mean(esquinas[:, 1])
+                centros_nir[id_nir] = (cx, cy)
             
-            # Reportar estado exacto si alguna falla
-            if not (ok_rgb and ok_nir):
-                logger.warning(f"Descartando par: {os.path.basename(ruta_rgb)}")
-                logger.warning(msg_rgb)
-                logger.warning(msg_nir)
-                continue # Saltamos al siguiente par
+            puntos_rgb_filtrados = []
+            puntos_nir_filtrados = []
             
-            if charucoCorners_rgb is not None and charucoCorners_nir is not None:
-                puntos_rgb_filtrados = []
-                puntos_nir_filtrados = []
-                
-                # Filtro de Correspondencia 1:1 (Solo los IDs que ambas cámaras ven)
-                for i, id_rgb in enumerate(charucoIds_rgb):
-                    if id_rgb in charucoIds_nir:
-                        idx_nir = np.where(charucoIds_nir == id_rgb)[0][0]
-                        puntos_rgb_filtrados.append(charucoCorners_rgb[i])
-                        puntos_nir_filtrados.append(charucoCorners_nir[idx_nir])
-                
-                if len(puntos_rgb_filtrados) >= 4:
-                    puntos_comunes_rgb.extend(puntos_rgb_filtrados)
-                    puntos_comunes_nir.extend(puntos_nir_filtrados)
-                    estadisticas_pares.append(len(puntos_rgb_filtrados))
-                    logger.info(f"✅ {os.path.basename(ruta_rgb)}: {len(puntos_rgb_filtrados)} IDs emparejados.")
-                else:
-                    logger.warning(f"⚠️ {os.path.basename(ruta_rgb)}: Descartado (<4 IDs en común).")
+            # Emparejar con los encontrados en RGB
+            for i, id_rgb in enumerate(ids_rgb.flatten()):
+                if id_rgb in centros_nir:
+                    esquinas_rgb = corners_rgb[i][0]
+                    cx_rgb = np.mean(esquinas_rgb[:, 0])
+                    cy_rgb = np.mean(esquinas_rgb[:, 1])
+                    
+                    puntos_rgb_filtrados.append([cx_rgb, cy_rgb])
+                    puntos_nir_filtrados.append([centros_nir[id_rgb][0], centros_nir[id_rgb][1]])
+            
+            if len(puntos_rgb_filtrados) >= 4:
+                puntos_comunes_rgb.extend(puntos_rgb_filtrados)
+                puntos_comunes_nir.extend(puntos_nir_filtrados)
+                estadisticas_pares.append(len(puntos_rgb_filtrados))
+                logger.info(f"✅ {os.path.basename(ruta_rgb)}: {len(puntos_rgb_filtrados)} QRs emparejados exactamente.")
             else:
-                logger.warning(f"❌ {os.path.basename(ruta_rgb)}: No se detectó tablero.")
+                logger.warning(f"⚠️ {os.path.basename(ruta_rgb)}: Descartado (<4 marcadores en común).")
         
         # ==========================================
         # 3. CÁLCULO ESTADÍSTICO DE LA HOMOGRAFÍA
         # ==========================================
         if len(puntos_comunes_rgb) >= 4:
-            pts_rgb = np.array(puntos_comunes_rgb).reshape(-1, 2)
-            pts_nir = np.array(puntos_comunes_nir).reshape(-1, 2)
+            pts_rgb = np.array(puntos_comunes_rgb, dtype=np.float32).reshape(-1, 2)
+            pts_nir = np.array(puntos_comunes_nir, dtype=np.float32).reshape(-1, 2)
             
-            # RANSAC con umbral configurable
+            # RANSAC para descartar outliers
             H, mascara = cv2.findHomography(pts_rgb, pts_nir, cv2.RANSAC, ransac_threshold)
             
-            # Cálculos estadísticos para el reporte
             inliers = np.sum(mascara)
             total_puntos = len(pts_rgb)
             porcentaje_inliers = (inliers / total_puntos) * 100
             
             report = "\n" + "="*50 + "\n"
-            report += "📊 REPORTE ESTADÍSTICO DE CALIBRACIÓN ÓPTICA\n"
+            report += "📊 REPORTE ESTADÍSTICO DE CALIBRACIÓN (ARUCO CENTERS)\n"
             report += "="*50 + "\n"
             report += f"Pares procesados exitosamente : {len(estadisticas_pares)}\n"
             report += f"Promedio de marcadores por par: {np.mean(estadisticas_pares):.1f}\n"
@@ -227,7 +180,6 @@ def run_homography_calibration(
             
             logger.info(report)
             
-            # Crear directorio si es necesario
             output_dir = os.path.dirname(output_path)
             if output_dir and not os.path.exists(output_dir):
                 os.makedirs(output_dir, exist_ok=True)
@@ -237,154 +189,60 @@ def run_homography_calibration(
             
             return H
         else:
-            logger.error("⚠️ ERROR CRÍTICO: No hay suficientes puntos para calcular la matriz. Revisa las fotos.")
+            logger.error("⚠️ ERROR CRÍTICO: No hay suficientes puntos en común para calcular la matriz.")
             return None
             
     except Exception as e:
         logger.error(f"Error durante calibración de homografía: {str(e)}", exc_info=True)
         return None
 
-
 def resolve_output_path(path_str):
-    """
-    Resuelve ruta de salida:
-    - Absoluta: se usa tal cual
-    - Relativa: se interpreta desde PROJECT_ROOT
-    """
     path = Path(path_str)
     if path.is_absolute():
         return str(path)
     return str(PROJECT_ROOT / path)
 
-
 def main():
-    """
-    Función principal para ejecutar el calibrado de homografía desde línea de comandos.
-    
-    Soporta rutas glob relativas y absolutas para imágenes.
-    """
     parser = argparse.ArgumentParser(
-        description='Calibración óptica de homografía RGB-NIR usando tableros Charuco',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Ejemplos de uso:
-  # Desde raíz del proyecto (detecta automáticamente)
-  python3 -m notebooks.homografia_script
-  
-  # Desde carpeta notebooks (detecta automáticamente)
-  cd notebooks && python3 homografia_script.py
-  
-  # Con rutas relativas a PROJECT_ROOT
-  python3 notebooks/homografia_script.py --dir-rgb calibracion/rgb/news/rgb/*.jpg
-  
-  # Con rutas absolutas
-  python3 notebooks/homografia_script.py --dir-rgb /home/user/project/calibracion/rgb/**/*.jpg
-  
-  # Con parámetros personalizados del tablero
-  python3 notebooks/homografia_script.py --squares-x 12 --squares-y 9 --square-length 0.025
-  
-  # Especificar ruta de salida
-  python3 notebooks/homografia_script.py --output-path ./outputs/homografia.npy --ransac-threshold 3.0
-  
-  # Verbose mode
-  python3 notebooks/homografia_script.py --verbose
-        """
+        description='Calibración de homografía RGB-NIR usando centros ArUco',
+        formatter_class=argparse.RawDescriptionHelpFormatter
     )
     
-    parser.add_argument(
-        '--dir-rgb',
-        type=str,
-        default=DIR_RGB,
-        help=f'''Ruta glob para imágenes RGB. 
-                Soporta:
-                - Relativas desde PROJECT_ROOT: "calibracion/rgb/news/rgb/*.jpg"
-                - Relativas desde cwd: "../calibracion/rgb/news/rgb/*.jpg"
-                - Absolutas: "/home/user/project/calibracion/rgb/**/*.jpg"
-                (default: autodetectado = {DIR_RGB})'''
-    )
-    parser.add_argument(
-        '--dir-nir',
-        type=str,
-        default=DIR_NIR,
-        help=f'''Ruta glob para imágenes NIR.
-                Soporta:
-                - Relativas desde PROJECT_ROOT: "calibracion/nir/news/nir/*.jpg"
-                - Relativas desde cwd: "../calibracion/nir/news/nir/*.jpg"
-                - Absolutas: "/home/user/project/calibracion/nir/**/*.jpg"
-                (default: autodetectado = {DIR_NIR})'''
-    )
-    parser.add_argument(
-        '--squares-x',
-        type=int,
-        default=SQUARES_X,
-        help=f'Columnas del tablero Charuco (default: {SQUARES_X})'
-    )
-    parser.add_argument(
-        '--squares-y',
-        type=int,
-        default=SQUARES_Y,
-        help=f'Filas del tablero Charuco (default: {SQUARES_Y})'
-    )
-    parser.add_argument(
-        '--square-length',
-        type=float,
-        default=SQUARE_LENGTH,
-        help=f'Lado del cuadrado negro en metros (default: {SQUARE_LENGTH})'
-    )
-    parser.add_argument(
-        '--marker-length',
-        type=float,
-        default=MARKER_LENGTH,
-        help=f'Lado del marcador en metros (default: {MARKER_LENGTH})'
-    )
+    parser.add_argument('--dir-rgb', type=str, default=DIR_RGB)
+    parser.add_argument('--dir-nir', type=str, default=DIR_NIR)
+    # Se mantienen por compatibilidad en la CLI, aunque el algoritmo ahora no depende de ellos
+    parser.add_argument('--squares-x', type=int, default=SQUARES_X)
+    parser.add_argument('--squares-y', type=int, default=SQUARES_Y)
+    parser.add_argument('--square-length', type=float, default=SQUARE_LENGTH)
+    parser.add_argument('--marker-length', type=float, default=MARKER_LENGTH)
+    
     parser.add_argument(
         '--output-path',
         type=str,
-        default='matriz_homografia_charuco.npy',
-        help='Ruta de salida para la matriz de homografía (default: matriz_homografia_charuco.npy)'
+        default='matriz_homografia_aruco.npy',
+        help='Ruta de salida para la matriz'
     )
-    parser.add_argument(
-        '--ransac-threshold',
-        type=float,
-        default=5.0,
-        help='Umbral RANSAC en píxeles (default: 5.0)'
-    )
-    parser.add_argument(
-        '--verbose',
-        action='store_true',
-        help='Activar logging detallado'
-    )
+    parser.add_argument('--ransac-threshold', type=float, default=5.0)
+    parser.add_argument('--verbose', action='store_true')
     
     args = parser.parse_args()
     
-    # Ajustar nivel de logging
     if args.verbose:
         logger.setLevel(logging.DEBUG)
     
-    # Resolver rutas
     dir_rgb = resolve_glob_pattern(args.dir_rgb)
     dir_nir = resolve_glob_pattern(args.dir_nir)
     
     logger.info("="*60)
-    logger.info("CALIBRACIÓN ÓPTICA - HOMOGRAFÍA RGB-NIR")
+    logger.info("CALIBRACIÓN ÓPTICA - HOMOGRAFÍA INVARIANTE")
     logger.info("="*60)
-    logger.info(f"📁 PROJECT_ROOT: {PROJECT_ROOT}")
-    logger.info(f"📁 SCRIPT_DIR: {SCRIPT_DIR}")
     logger.info(f"Directorio RGB: {dir_rgb}")
     logger.info(f"Directorio NIR: {dir_nir}")
-    logger.info(f"Tablero Charuco: {args.squares_x}x{args.squares_y}")
-    logger.info(f"Tamaño cuadrado: {args.square_length}m | Tamaño marcador: {args.marker_length}m")
-    logger.info(f"Archivo de salida: {args.output_path}")
     logger.info("="*60)
     
-    # Ejecutar calibración
     H = run_homography_calibration(
         dir_rgb=dir_rgb,
         dir_nir=dir_nir,
-        squares_x=args.squares_x,
-        squares_y=args.squares_y,
-        square_length=args.square_length,
-        marker_length=args.marker_length,
         output_path=resolve_output_path(args.output_path),
         ransac_threshold=args.ransac_threshold
     )
@@ -395,7 +253,6 @@ Ejemplos de uso:
     else:
         logger.error("❌ Calibración falló")
         return 1
-
 
 if __name__ == '__main__':
     exit(main())
