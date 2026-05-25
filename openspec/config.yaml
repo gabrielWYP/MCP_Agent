@@ -1,0 +1,70 @@
+schema: spec-driven
+
+context: |
+  Tech stack: Python 3.13, LangGraph + LangChain orchestrator, PyTorch 2.1+ (ConvNeXtV2 Teacher), FastAPI serving
+  Architecture: Graph-based agent (LangGraph StateGraph), pipeline pattern, multimodal DL (RGB+NIR, cross-modal fusion, YOLO detection head, knowledge distillation)
+  Testing: pytest installed and configured. 36 tests pass (CPU-only, 14s). 96% coverage on src/models/master/. tests/ mirrors src/ layout. No CI/CD yet (Phase 2).
+  Style: pip+requirements.txt. pyproject.toml created for pytest config. No linter/formatter/type checker configured yet (Phase 3).
+
+testing:
+  strict_tdd: false
+  reason: "Phase 1 complete — 36 tests pass on CPU; Phase 2 will add CI enforcement"
+  test_runner:
+    command: "pytest tests/"
+    framework: pytest (installed, 36 tests passing)
+  layers:
+    unit:
+      available: true
+      tool: "pytest + pytest-mock"
+      scope: "tests/agent/ (graph nodes), tests/models/master/ (model shapes)"
+      count: 36
+      coverage: "96% on src/models/master/"
+    integration:
+      available: false
+      tool: "—"
+      planned: "Phase 2"
+    e2e:
+      available: false
+      tool: "—"
+  coverage:
+    available: true
+    command: "pytest tests/ --cov=src/models/master/"
+    threshold: "96% (Phase 1 baseline)"
+  quality:
+    linter:
+      available: false
+      command: "—"
+      planned: "Phase 3 (ruff)"
+    type_checker:
+      available: false
+      command: "—"
+      planned: "Phase 3 (mypy)"
+    formatter:
+      available: false
+      command: "—"
+      planned: "Phase 3 (ruff format)"
+
+rules:
+  proposal:
+    - Include rollback plan for risky changes
+  specs:
+    - Use Given/When/Then for scenarios
+    - Use RFC 2119 keywords (MUST, SHALL, SHOULD, MAY)
+  design:
+    - Include sequence diagrams for complex flows
+    - Document architecture decisions with rationale
+    - All new AI/ML pipelines require an evaluation protocol
+  tasks:
+    - Group by phase, use hierarchical numbering
+    - Keep tasks completable in one session
+  apply:
+    - Follow existing code patterns (src/package modular structure)
+    - New modules go under src/<domain>/
+    tdd: false
+    test_command: ""
+  verify:
+    test_command: ""
+    build_command: ""
+    coverage_threshold: 0
+  archive:
+    - Warn before merging destructive deltas
