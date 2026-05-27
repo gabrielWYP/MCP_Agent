@@ -30,7 +30,6 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
-*.jpg
 *.png
 
 # IDE
