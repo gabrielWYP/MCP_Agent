@@ -1,0 +1,33 @@
+# Data Augmentation Pipeline Configuration
+# Copy this file and adjust values for your environment.
+
+# OCI / S3 Object Storage
+oci_endpoint: "https://your-namespace.compat.objectstorage.region.oraclecloud.com"
+oci_bucket: "your-bucket-name"
+oci_prefix: "news/"
+oci_access_key: ""  # Or set S3_ACCESS_KEY env var
+oci_secret_key: ""  # Or set S3_SECRET_KEY env var
+
+# Local paths
+cache_dir: "data/cache"
+output_dir: "data/augmented"
+homography_path: null  # Path to .npy homography matrix, or null for resize fallback
+
+# Image dimensions
+target_size: [640, 640]  # [height, width]
+
+# Augmentation parameters
+augmentation_factor: 3    # Total samples per original (1 = identity only)
+spatial_intensity: 0.4    # Controls rotation/scale/shift limits
+photometric_intensity: 0.3  # Controls brightness/contrast/saturation
+
+# NIR normalization statistics
+# Replace with computed values from compute_nir_stats() on your dataset
+nir_stats:
+  mean: 0.45
+  std: 0.22
+
+# Download settings
+max_workers: 8           # Parallel download threads
+retry_attempts: 3        # OCI retry count with exponential backoff
+retry_base_delay: 1.0    # Base delay in seconds (2^n * base)

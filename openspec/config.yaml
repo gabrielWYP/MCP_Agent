@@ -1,24 +1,25 @@
 schema: spec-driven
 
 context: |
-  Tech stack: Python 3.13, LangGraph + LangChain orchestrator, PyTorch 2.1+ (ConvNeXtV2 Teacher), FastAPI serving
-  Architecture: Graph-based agent (LangGraph StateGraph), pipeline pattern, multimodal DL (RGB+NIR, cross-modal fusion, YOLO detection head, knowledge distillation)
-  Testing: pytest installed and configured. 36 tests pass (CPU-only, 14s). 96% coverage on src/models/master/. tests/ mirrors src/ layout. No CI/CD yet (Phase 2).
-  Style: pip+requirements.txt. pyproject.toml created for pytest config. No linter/formatter/type checker configured yet (Phase 3).
+  Tech stack: Python 3.14 (system) / 3.12 (venv), LangGraph + LangChain orchestrator, PyTorch 2.1+ (ConvNeXtV2 Teacher), FastAPI serving
+  Architecture: Graph-based agent (LangGraph StateGraph), pipeline pattern, multimodal DL (RGB+NIR, cross-modal fusion, YOLO detection head, knowledge distillation), OCI cloud storage
+  Testing: pytest available. Single test file (src/models/master/test_arch.py) — script-style assertions, not pytest functions. No CI/CD yet (Phase 2).
+  Style: pip+requirements.txt. No pyproject.toml. No linter/formatter/type checker configured yet (Phase 3 — ruff, mypy, ruff format).
 
 testing:
   strict_tdd: false
-  reason: "Phase 1 complete — 36 tests pass on CPU; Phase 2 will add CI enforcement"
+  reason: "Phase 1 test bootstrap archived. Current test_arch.py has a level mismatch bug (DualFPN→4 levels, YOLODetectionHead←3). Needs fix before tests pass."
   test_runner:
-    command: "pytest tests/"
-    framework: pytest (installed, 36 tests passing)
+    command: "python -m pytest src/models/master/test_arch.py -v"
+    framework: pytest (installed in .venv, but no pytest-style test functions)
   layers:
     unit:
       available: true
-      tool: "pytest + pytest-mock"
-      scope: "tests/agent/ (graph nodes), tests/models/master/ (model shapes)"
-      count: 36
-      coverage: "96% on src/models/master/"
+      tool: "pytest (script-style assertions)"
+      scope: "src/models/master/test_arch.py (module-by-module sanity checks)"
+      count: 0
+      note: "test_arch.py runs as __main__ script, not pytest-collected tests. Contains assert statements that will crash on shape mismatch."
+      coverage: "N/A — broken; formerly 96%"
     integration:
       available: false
       tool: "—"
@@ -28,8 +29,8 @@ testing:
       tool: "—"
   coverage:
     available: true
-    command: "pytest tests/ --cov=src/models/master/"
-    threshold: "96% (Phase 1 baseline)"
+    command: "python -m pytest --cov=src/models/master/ src/models/master/test_arch.py"
+    threshold: "N/A (currently broken)"
   quality:
     linter:
       available: false
@@ -61,10 +62,10 @@ rules:
     - Follow existing code patterns (src/package modular structure)
     - New modules go under src/<domain>/
     tdd: false
-    test_command: ""
+    test_command: "python -m pytest src/models/master/test_arch.py -v"
   verify:
-    test_command: ""
-    build_command: ""
+    test_command: "python -m pytest src/models/master/test_arch.py -v"
+    build_command: "python -c \"import sys; exec(open('src/models/master/test_arch.py').read())\""
     coverage_threshold: 0
   archive:
     - Warn before merging destructive deltas
