@@ -1,6 +1,7 @@
 import os
 import sys
 import s3fs
+from pathlib import Path
 from typing import Dict, Any
 from typing_extensions import TypedDict
 from langgraph.graph import StateGraph, END
@@ -34,6 +35,49 @@ def get_s3fs():
         key=S3_ACCESS_KEY,
         secret=S3_SECRET_KEY,
     )
+
+def download_object(key: str, local_path: str) -> bool:
+    """
+    Download a single object from OCI/S3 to local disk.
+
+    Uses size-based dedup: if local file exists with matching size, skip download.
+
+    Args:
+        key: Full object key in the bucket (e.g. 'bucket/news/rgb/img001.jpg')
+        local_path: Local destination path
+
+    Returns:
+        True if downloaded, False if skipped (cache hit)
+    """
+    s3 = get_s3fs()
+    local = Path(local_path)
+
+    # Check cache hit by size
+    if local.exists():
+        try:
+            remote_info = s3.info(key)
+            remote_size = remote_info.get("size", remote_info.get("Size", -1))
+            if remote_size == local.stat().st_size:
+                return False  # cache hit
+        except Exception:
+            pass  # info failed, proceed with download
+
+    # Ensure parent directory exists
+    local.parent.mkdir(parents=True, exist_ok=True)
+
+    # Download to temp file, then rename (atomic, prevents partial files)
+    tmp_path = local.with_suffix(local.suffix + ".tmp")
+    try:
+        s3.get(key, str(tmp_path))
+        tmp_path.rename(local)
+    except Exception:
+        # Clean up partial download
+        if tmp_path.exists():
+            tmp_path.unlink()
+        raise
+
+    return True
+
 
 def count_and_list_objects(bucket_name: str) -> list[str]:
     """
