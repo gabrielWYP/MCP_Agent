@@ -5,15 +5,18 @@ Architecture:
     fused_features  → FPN_RGB → [P2, P3, P4, P5]  ┐
     nir_features    → FPN_NIR → [P2, P3, P4, P5]  ┘
                                         ↓
-                    FPN Fusion: concat + 1x1 conv per level
+                    FPN Fusion: concat + 1x1 conv per level (P3-P5 only)
                                         ↓
-                    [P2, P3, P4, P5] unified pyramid
+                    [P3, P4, P5] unified pyramid
 
 Why two separate FPNs?
     Each modality builds its own multi-scale representation before merging.
     This lets the model learn modality-specific multi-scale patterns
     (e.g., NIR texture gradients vs RGB color gradients) before combining.
     The 1x1 conv fusion is lightweight and learnable.
+
+P2 is computed internally by each SingleFPN for the top-down pathway but
+is dropped before fusion — YOLODetectionHead expects strides [8, 16, 32].
 
 Output channels: 256 per level (standard FPN convention for Cascade R-CNN).
 """
@@ -136,7 +139,7 @@ class DualFPN(nn.Module):
                 nn.ReLU(inplace=True),
                 nn.Dropout2d(p=dropout),
             )
-            for _ in range(4)  # one per pyramid level
+            for _ in range(3)  # one per pyramid level (P3, P4, P5 — P2 dropped)
         ])
 
     def forward(
@@ -150,19 +153,21 @@ class DualFPN(nn.Module):
             nir_features:   [S1, S2, S3, S4] — original NIR backbone features
 
         Returns:
-            pyramid: [P2, P3, P4, P5] — unified multi-scale feature pyramid
+            pyramid: [P3, P4, P5] — unified multi-scale feature pyramid
         """
         # Build per-modality pyramids
         rgb_pyramid = self.fpn_rgb(fused_features)   # [P2..P5] at 256ch
         nir_pyramid = self.fpn_nir(nir_features)     # [P2..P5] at 256ch
 
-        # Fuse per level
+        # Fuse per level (skip P2 — head expects strides [8, 16, 32])
         unified_pyramid = []
-        for i, fusion_conv in enumerate(self.fusion_convs):
+        for rgb_level, nir_level, fusion_conv in zip(
+            rgb_pyramid[1:], nir_pyramid[1:], self.fusion_convs
+        ):
             # Concatenate along channel dim: (N, 512, H, W)
-            combined = torch.cat([rgb_pyramid[i], nir_pyramid[i]], dim=1)
+            combined = torch.cat([rgb_level, nir_level], dim=1)
             # Fuse to (N, 256, H, W)
             fused_level = fusion_conv(combined)
             unified_pyramid.append(fused_level)
 
-        return unified_pyramid  # [P2, P3, P4, P5] at 256ch
+        return unified_pyramid  # [P3, P4, P5] at 256ch

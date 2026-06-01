@@ -40,6 +40,7 @@ print('  Fused features:', [tuple(f.shape) for f in fused])
 print('Testing neck...')
 neck = DualFPN().to(device)
 pyramid = neck(fused, nir_pass)
+assert len(pyramid) == 3, f"Expected 3 FPN levels [P3,P4,P5], got {len(pyramid)}"
 print('  FPN pyramid:', [tuple(f.shape) for f in pyramid])
 
 print('Testing YOLO head...')
