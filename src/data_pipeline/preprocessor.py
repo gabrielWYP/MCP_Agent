@@ -138,7 +138,8 @@ class Preprocessor:
 
         if self.H is not None:
             try:
-                warped = cv2.warpPerspective(nir, self.H, (w, h))
+                # H maps RGB→NIR; warpPerspective needs NIR→RGB, so invert
+                warped = cv2.warpPerspective(nir, np.linalg.inv(self.H), (w, h))
                 return warped
             except Exception as e:
                 logger.warning("Homography warp failed: %s. Using resize fallback.", e)

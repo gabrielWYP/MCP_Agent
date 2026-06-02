@@ -28,6 +28,7 @@ class PipelineConfig:
     oci_endpoint: str = ""
     oci_bucket: str = ""
     oci_prefix: str = "news/"
+    oci_region: str = "us-ashburn-1"
     oci_access_key: str = ""
     oci_secret_key: str = ""
 
@@ -46,6 +47,11 @@ class PipelineConfig:
 
     # NIR normalization
     nir_stats: NIRStats = field(default_factory=NIRStats)
+
+    # Pair discovery settings
+    pair_matching: str = "stem"          # "stem" or "timestamp_id"
+    min_timestamp: int = 0               # Filter pairs by timestamp ID >= this
+    default_class_name: str = "mango"    # Class name when matching by timestamp_id
 
     # Download settings
     max_workers: int = 8
@@ -80,12 +86,13 @@ class PipelineConfig:
 
         # Map top-level keys
         simple_keys = [
-            "oci_endpoint", "oci_bucket", "oci_prefix",
+            "oci_endpoint", "oci_bucket", "oci_prefix", "oci_region",
             "oci_access_key", "oci_secret_key",
             "cache_dir", "output_dir", "homography_path",
             "augmentation_factor", "spatial_intensity", "photometric_intensity",
             "max_workers", "retry_attempts", "retry_base_delay",
             "rgb_mean", "rgb_std",
+            "pair_matching", "min_timestamp", "default_class_name",
         ]
         for key in simple_keys:
             if key in raw:
@@ -115,14 +122,22 @@ class PipelineConfig:
         env_map = {
             "S3_ENDPOINT_URL": "oci_endpoint",
             "BUCKET_NAME": "oci_bucket",
+            "OCI_REGION": "oci_region",
             "S3_ACCESS_KEY": "oci_access_key",
             "S3_SECRET_KEY": "oci_secret_key",
             "CACHE_DIR": "cache_dir",
             "OUTPUT_DIR": "output_dir",
             "HOMOGRAPHY_PATH": "homography_path",
+            "PAIR_MATCHING": "pair_matching",
+            "MIN_TIMESTAMP": "min_timestamp",
+            "DEFAULT_CLASS_NAME": "default_class_name",
         }
+        int_attrs = {"min_timestamp"}
         for env_key, attr in env_map.items():
             val = os.getenv(env_key)
             if val:
-                setattr(self, attr, val)
+                if attr in int_attrs:
+                    setattr(self, attr, int(val))
+                else:
+                    setattr(self, attr, val)
         return self
