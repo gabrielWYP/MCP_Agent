@@ -51,9 +51,10 @@ class MasterModel(nn.Module):
         fusion_dropout (float): Dropout in cross-attention fusion.
         fpn_dropout (float): Dropout in FPN fusion convs.
         head_strides (list[int]): Strides for YOLO head levels.
+        backbone_variant (str): ConvNeXt variant — "tiny" or "small".
     """
 
-    # ConvNeXt-Small stage channels
+    # ConvNeXt stage channels (identical for Tiny and Small)
     STAGE_CHANNELS = [96, 192, 384, 768]
 
     def __init__(
@@ -64,11 +65,14 @@ class MasterModel(nn.Module):
         fusion_dropout: float = 0.1,
         fpn_dropout: float = 0.1,
         head_strides: list[int] = None,
+        backbone_variant: str = "tiny",
     ):
         super().__init__()
 
         # --- 1. Dual backbone (shared weights, separate stems) ---
-        self.backbone = DualConvNeXtBackbone(pretrained=pretrained_backbone)
+        self.backbone = DualConvNeXtBackbone(
+            pretrained=pretrained_backbone, variant=backbone_variant
+        )
 
         # --- 2. Cross-modal attention fusion ---
         self.fusion = CrossModalFusion(
@@ -174,6 +178,21 @@ class MasterModel(nn.Module):
 
         frozen = freeze_stages
         print(f"[MasterModel] Frozen: stems + first {frozen} shared stages.")
+
+    def unfreeze_backbone_stages(self, unfreeze_stages: list[int]):
+        """
+        Unfreeze specific backbone stages by index (0-based).
+        Stems always remain frozen to preserve modality-specific preprocessing.
+
+        Args:
+            unfreeze_stages: List of stage indices to unfreeze (e.g., [2, 3] for stages 3-4).
+        """
+        for i, stage in enumerate(self.backbone.shared_stages):
+            if i in unfreeze_stages:
+                for param in stage.parameters():
+                    param.requires_grad = True
+
+        print(f"[MasterModel] Unfrozen stages: {unfreeze_stages}. Stems remain frozen.")
 
     def count_parameters(self) -> dict[str, int]:
         """Returns parameter counts per module."""
