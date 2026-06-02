@@ -69,7 +69,15 @@ class DataAugmentationPipeline:
             objects = self.oci.list_objects()
             logger.info("Found %d objects", len(objects))
 
-            matched_pairs, unmatched_rgb = PairDiscovery.match_by_stem(objects)
+            matched_pairs, unmatched_rgb = (
+                PairDiscovery.match_by_timestamp_id(
+                    objects,
+                    class_name=self.config.default_class_name,
+                    min_timestamp=self.config.min_timestamp,
+                )
+                if self.config.pair_matching == "timestamp_id"
+                else PairDiscovery.match_by_stem(objects)
+            )
             stats["unmatched"] = len(unmatched_rgb)
             logger.info("Matched %d pairs, %d unmatched RGB", len(matched_pairs), len(unmatched_rgb))
 

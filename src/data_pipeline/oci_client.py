@@ -34,7 +34,11 @@ class OCIManager:
         if self._s3 is None:
             import s3fs
             self._s3 = s3fs.S3FileSystem(
-                client_kwargs={"endpoint_url": self.config.oci_endpoint},
+                client_kwargs={
+                    "endpoint_url": self.config.oci_endpoint,
+                    "region_name": self.config.oci_region,
+                },
+                config_kwargs={"signature_version": "s3v4"},
                 key=self.config.oci_access_key,
                 secret=self.config.oci_secret_key,
             )
@@ -74,22 +78,12 @@ class OCIManager:
 
         def _list():
             results = []
-            # s3fs.ls with detail=True returns dicts
-            entries = self.s3.ls(full_prefix, detail=True)
-            for entry in entries:
-                if isinstance(entry, dict):
-                    key = entry.get("Key", entry.get("key", ""))
-                    size = entry.get("size", entry.get("Size", 0))
-                    last_modified = entry.get("LastModified", entry.get("last_modified", None))
-                    # Skip directory entries
-                    if key and not key.endswith("/"):
-                        results.append({
-                            "key": key,
-                            "size": size,
-                            "last_modified": last_modified,
-                        })
-                elif isinstance(entry, str):
-                    results.append({"key": entry, "size": 0, "last_modified": None})
+            # Use find() for recursive listing — ls() with delimiter="/"
+            # only shows immediate "subdirectories", not nested files
+            keys = self.s3.find(full_prefix, maxdepth=None)
+            for key in keys:
+                if isinstance(key, str) and not key.endswith("/"):
+                    results.append({"key": key, "size": 0, "last_modified": None})
             return results
 
         return self._retry(_list)

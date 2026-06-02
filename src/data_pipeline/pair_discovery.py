@@ -1,11 +1,12 @@
 """
-RGB/NIR pair discovery by filename stem matching.
+RGB/NIR pair discovery by filename stem matching or timestamp ID matching.
 
-Matches RGB and NIR images by their filename stems (excluding directory
-and extension) following the convention: {class}/{rgb|nir}/{stem}.{ext}
+Stem matching: {class}/{rgb|nir}/{stem}.{ext}
+Timestamp ID matching: {prefix}_rgb_{id}.jpg / {prefix}_nir_{id}.jpg
 """
 
 import logging
+import re
 from pathlib import Path
 from typing import NamedTuple
 
@@ -108,3 +109,82 @@ class PairDiscovery:
         )
 
         return matched_pairs, unmatched_rgb
+
+    @staticmethod
+    def match_by_timestamp_id(
+        objects_list: list[dict],
+        class_name: str = "mango",
+        min_timestamp: int = 0,
+    ) -> tuple[list[PairedSample], list[str]]:
+        """
+        Match RGB and NIR images by timestamp ID embedded in filename.
+
+        Expected pattern: {prefix}_rgb_{id}.{ext} / {prefix}_nir_{id}.{ext}
+
+        Args:
+            objects_list: List of dicts with 'key' field (full object key path).
+            class_name: Class name to assign to all pairs.
+            min_timestamp: Only include pairs with timestamp ID >= this value.
+
+        Returns:
+            Tuple of (matched_pairs, unmatched_entries).
+        """
+        # Pattern: captures modality (rgb/nir) and numeric ID
+        FILENAME_RE = re.compile(
+            r'(?:.*/)?(\w+)_(rgb|nir)_(\d+)\.(jpg|jpeg|png|tiff|tif)$',
+            re.IGNORECASE,
+        )
+
+        # Index: {id: {"rgb": key, "nir": key, "prefix": str}}
+        id_index: dict[int, dict[str, str]] = {}
+
+        for obj in objects_list:
+            key = obj.get("key", obj) if isinstance(obj, dict) else obj
+            if not isinstance(key, str):
+                continue
+
+            m = FILENAME_RE.search(key)
+            if not m:
+                continue
+
+            prefix = m.group(1)
+            modality = m.group(2).lower()
+            timestamp_id = int(m.group(3))
+
+            if timestamp_id < min_timestamp:
+                continue
+
+            entry = id_index.setdefault(timestamp_id, {})
+            entry["prefix"] = prefix
+            entry[f"{modality}_key"] = key
+
+        # Match pairs — need both rgb_key and nir_key for the same id
+        matched_pairs: list[PairedSample] = []
+        unmatched: list[str] = []
+
+        for tid in sorted(id_index.keys()):
+            entry = id_index[tid]
+            rgb_key = entry.get("rgb_key")
+            nir_key = entry.get("nir_key")
+
+            if rgb_key and nir_key:
+                matched_pairs.append(PairedSample(
+                    class_name=class_name,
+                    stem=f"{entry['prefix']}_{tid}",
+                    rgb_key=rgb_key,
+                    nir_key=nir_key,
+                ))
+            else:
+                missing = entry.get("rgb_key") or entry.get("nir_key")
+                unmatched.append(missing)
+                which = "NIR" if rgb_key else "RGB"
+                logger.warning(
+                    "No %s match for timestamp %d (%s)", which, tid, missing,
+                )
+
+        logger.info(
+            "Timestamp-ID pair discovery: %d matched, %d unmatched",
+            len(matched_pairs), len(unmatched),
+        )
+
+        return matched_pairs, unmatched
