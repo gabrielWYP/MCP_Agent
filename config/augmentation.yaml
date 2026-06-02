@@ -23,8 +23,8 @@ photometric_intensity: 0.3  # Controls brightness/contrast/saturation
 
 # NIR normalization statistics
 nir_stats:
-  mean: 0.45
-  std: 0.22
+  mean: 0.0569
+  std: 0.0546
 
 # Download settings
 max_workers: 8           # Parallel download threads

@@ -1,17 +1,43 @@
 """
-Dual-stream ConvNeXt-Small backbone for RGB + NIR inputs.
+Dual-stream ConvNeXt backbone for RGB + NIR inputs.
+
+Supports ConvNeXt-Tiny and ConvNeXt-Small variants (both have identical
+stage channels [96, 192, 384, 768], differing only in block depth).
 
 Design decisions:
 - Shared weights between RGB and NIR encoders (regularization for small dataset ~2000 imgs)
 - Only the first stem layer differs: RGB accepts 3ch, NIR accepts 1ch
 - Both streams produce 4 stage feature maps: [S1, S2, S3, S4]
-  with channels [96, 192, 384, 768] for ConvNeXt-Small
+  with channels [96, 192, 384, 768]
 """
 
 import torch
 import torch.nn as nn
-from torchvision.models import convnext_small, ConvNeXt_Small_Weights
+from torchvision.models import (
+    convnext_small,
+    convnext_tiny,
+    ConvNeXt_Small_Weights,
+    ConvNeXt_Tiny_Weights,
+)
 from torchvision.models.convnext import ConvNeXt
+
+# Supported backbone variants — both have identical stage channels
+SUPPORTED_VARIANTS = {"tiny", "small"}
+
+
+def _build_convnext_tiny_body() -> nn.ModuleList:
+    """
+    Extract the 4 stages of ConvNeXt-Tiny (without the stem and classifier).
+    Returns them as a ModuleList so we can iterate per-stage.
+    """
+    model = convnext_tiny(weights=ConvNeXt_Tiny_Weights.IMAGENET1K_V1)
+    stages = nn.ModuleList([
+        model.features[1],   # stage 1  → 96ch,  H/4  x W/4
+        nn.Sequential(model.features[2], model.features[3]),   # down + stage 2 → 192ch, H/8  x W/8
+        nn.Sequential(model.features[4], model.features[5]),   # down + stage 3 → 384ch, H/16 x W/16
+        nn.Sequential(model.features[6], model.features[7]),   # down + stage 4 → 768ch, H/32 x W/32
+    ])
+    return stages
 
 
 def _build_convnext_small_body() -> nn.ModuleList:
@@ -64,7 +90,7 @@ class _LayerNorm2d(nn.Module):
 
 class DualConvNeXtBackbone(nn.Module):
     """
-    Dual-stream ConvNeXt-Small backbone.
+    Dual-stream ConvNeXt backbone (Tiny or Small).
 
     The two streams share the 4 ConvNeXt stages (shared weights act as
     regularization for the small dataset). Only the input stems differ
@@ -73,6 +99,8 @@ class DualConvNeXtBackbone(nn.Module):
     Args:
         pretrained (bool): Load ImageNet-1K weights for the shared stages.
             The NIR stem is always initialized from scratch.
+        variant (str): Backbone variant — "tiny" (28M params) or "small" (50M params).
+            Both produce identical stage channels [96, 192, 384, 768].
 
     Returns (forward):
         rgb_features: list of 4 tensors [S1, S2, S3, S4]
@@ -82,18 +110,28 @@ class DualConvNeXtBackbone(nn.Module):
         Spatial dims (for 640x640 input): [160x160, 80x80, 40x40, 20x20]
     """
 
-    # ConvNeXt-Small output channels per stage
+    # Both Tiny and Small have identical stage channel dimensions
     STAGE_CHANNELS = [96, 192, 384, 768]
 
-    def __init__(self, pretrained: bool = True):
+    def __init__(self, pretrained: bool = True, variant: str = "tiny"):
         super().__init__()
+
+        if variant not in SUPPORTED_VARIANTS:
+            raise ValueError(
+                f"Unsupported variant '{variant}'. Choose from {SUPPORTED_VARIANTS}"
+            )
+
+        self.variant = variant
 
         # --- Stems (different per modality) ---
         self.rgb_stem = _build_stem(in_channels=3)
         self.nir_stem = _build_stem(in_channels=1)  # NIR is grayscale
 
         # --- Shared stages ---
-        self.shared_stages = _build_convnext_small_body()
+        if variant == "tiny":
+            self.shared_stages = _build_convnext_tiny_body()
+        else:
+            self.shared_stages = _build_convnext_small_body()
 
         # Initialize NIR stem from scratch (RGB stem gets pretrained weights below)
         self._init_nir_stem()
@@ -146,10 +184,14 @@ class DualConvNeXtBackbone(nn.Module):
 
     def _load_pretrained_rgb_stem(self):
         """
-        Copy the pretrained ConvNeXt-Small stem weights into rgb_stem.
+        Copy the pretrained ConvNeXt stem weights into rgb_stem.
         The pretrained stem expects 3-channel input, which matches RGB.
+        Works for both Tiny and Small variants (identical stem architecture).
         """
-        pretrained_model = convnext_small(weights=ConvNeXt_Small_Weights.IMAGENET1K_V1)
+        if self.variant == "tiny":
+            pretrained_model = convnext_tiny(weights=ConvNeXt_Tiny_Weights.IMAGENET1K_V1)
+        else:
+            pretrained_model = convnext_small(weights=ConvNeXt_Small_Weights.IMAGENET1K_V1)
         pretrained_stem_state = {
             "0.weight": pretrained_model.features[0][0].weight,
             "0.bias":   pretrained_model.features[0][0].bias,
