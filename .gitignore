@@ -48,3 +48,8 @@ Thumbs.db
 .mypy_cache/
 .coverage
 htmlcov/
+
+# Credenciales y configuración sensible
+config/augmentation.yaml
+config/*credentials*
+config/*secret*
