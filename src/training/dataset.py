@@ -173,6 +173,7 @@ class YOLODataset(Dataset):
         """Discover RGB+NIR image pairs and their label files.
 
         Matches by replacing '_rgb' with '_nir' in the filename stem.
+        Only includes pairs that have a label file in the current split.
 
         Returns:
             List of dicts with keys: rgb_path, nir_path, label_path, image_id.
@@ -189,8 +190,12 @@ class YOLODataset(Dataset):
                 print(f"[YOLODataset] Warning: missing NIR pair for {rgb_path.name}, skipping.")
                 continue
 
-            # Label file uses the RGB stem
+            # Label file uses the RGB stem in the split subdirectory
             label_path = self.labels_dir / f"{rgb_path.stem}.txt"
+
+            # Only include pairs that have labels in this split
+            if not label_path.exists():
+                continue
 
             pairs.append({
                 "rgb_path": rgb_path,
@@ -266,9 +271,9 @@ class YOLODataset(Dataset):
         # Load labels
         bboxes, labels = self._load_labels(pair["label_path"])
 
-        # Letterbox both images
+        # Letterbox both images (RGB uses gray=114, NIR uses its own mean ~14)
         rgb_lb, scale, pad_x, pad_y = letterbox(rgb_img, self.image_size, self.letterbox_value)
-        nir_lb, _, _, _ = letterbox(nir_img, self.image_size, self.letterbox_value)
+        nir_lb, _, _, _ = letterbox(nir_img, self.image_size, int(self.nir_mean * 255))
 
         # Rescale bboxes from original normalized coords to letterbox normalized coords
         if len(bboxes) > 0:

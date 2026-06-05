@@ -61,6 +61,7 @@ class Trainer:
             box_weight=config.box_weight,
             cls_weight=config.cls_weight,
             class_weights=config.class_weights,
+            focal_gamma=getattr(config, 'focal_gamma', 2.0),
         ).to(self.device)
 
         # AMP
@@ -271,14 +272,25 @@ class Trainer:
                     targets = {"bboxes": bboxes, "labels": labels}
                     loss, loss_dict = self.criterion(predictions, targets)
 
-                self.scaler.scale(loss).backward()
+                # NaN / Inf guard: skip batch if loss explodes
+                if torch.isnan(loss) or torch.isinf(loss):
+                    print(f"  [NaN] Skipping batch (loss={loss.item():.2f})")
+                    continue
+
+                if self.config.amp:
+                    self.scaler.scale(loss).backward()
+                    self.scaler.unscale_(optimizer)
+                else:
+                    loss.backward()
 
                 # Gradient clipping
-                self.scaler.unscale_(optimizer)
                 nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip)
 
-                self.scaler.step(optimizer)
-                self.scaler.update()
+                if self.config.amp:
+                    self.scaler.step(optimizer)
+                    self.scaler.update()
+                else:
+                    optimizer.step()
 
             except RuntimeError as e:
                 if "out of memory" in str(e).lower():
