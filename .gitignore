@@ -53,3 +53,13 @@ htmlcov/
 config/augmentation.yaml
 config/*credentials*
 config/*secret*
+
+# Datos generados (imágenes, anotaciones, cache, debug)
+data/cache/
+data/augmented/
+data/annotations/
+data/label_studio*/
+checkpoints/
+
+# Pero SÍ permitir los zips del dataset
+!data/mango_*.zip

@@ -68,11 +68,17 @@ class DecoupledHead(nn.Module):
 
     def _init_weights(self):
         """Inicialización consistente con YOLOv8."""
+        import math
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
                 nn.init.normal_(m.weight, std=0.01)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
+        # YOLOv8 standard: initialize classification bias to give ~0.01 prior probability
+        # This prevents the model from predicting "object everywhere" at epoch 0
+        prior_prob = 0.01
+        bias_value = -math.log((1.0 - prior_prob) / prior_prob)
+        nn.init.constant_(self.cls_pred.bias, bias_value)
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """

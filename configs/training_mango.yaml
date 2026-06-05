@@ -1,0 +1,53 @@
+# Training config for MasterModel — Mango damage detection
+# Small-dataset strategy: Phase 1 only (frozen backbone), aggressive augmentations
+
+# Data paths
+rgb_dir: "data/cache/mango/rgb"
+nir_dir: "data/cache/mango/nir"
+labels_dir: "data/annotations/yolo/labels"
+output_dir: "checkpoints/mastermodel_mango"
+
+# Model
+backbone_variant: "tiny"
+num_classes: 2
+
+# Image
+image_size: 640
+letterbox_value: 114
+
+# Training — Phase 1 warmup + Phase 2 backbone unfreeze
+batch_size: 4
+epochs_phase1: 80
+epochs_phase2: 0          # Skip Phase 2 — unfreezing hurts with small dataset
+lr_phase1: 0.0005
+lr_phase2: 0.0001          # Lower LR for backbone fine-tuning
+weight_decay: 0.0005
+
+# Loss
+box_weight: 7.5
+cls_weight: 0.5
+class_weights: [2.7, 0.5]  # [mango, damaged] — more weight on full mango bboxes
+
+# Scheduler
+warmup_epochs: 5
+patience: 30               # High patience — mAP oscillates on small datasets
+
+# Logging
+log_interval: 5
+save_interval: 10
+
+# Mixed precision
+amp: false  # FP16 causes NaN in YOLOv8Loss — using FP32
+
+# Gradient clipping
+grad_clip: 10.0
+
+# DataLoader
+num_workers: 2             # Conservative for small dataset
+
+# NIR normalization stats
+nir_mean: 0.0569
+nir_std: 0.0546
+
+# Reproducibility
+seed: 42

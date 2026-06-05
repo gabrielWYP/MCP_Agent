@@ -102,10 +102,22 @@ class TaskAlignedAssigner:
                 pos_idx = topk_idx[:, gt_i]  # (topk,)
                 pos_scores = topk_vals[:, gt_i]  # (topk,)
 
-                # Filter out zero-score anchors
-                valid = pos_scores > 0
-                pos_idx = pos_idx[valid]
-                pos_scores = pos_scores[valid]
+                # Keep at least 1 anchor per GT, even if alignment is 0
+                if pos_scores.max() <= 0:
+                    # Fallback: use closest anchor by center distance
+                    gt_cx = gt_box[gt_i, 0].item()
+                    gt_cy = gt_box[gt_i, 1].item()
+                    anchor_cx = pred_bboxes[b, :, 0]
+                    anchor_cy = pred_bboxes[b, :, 1]
+                    dist = (anchor_cx - gt_cx)**2 + (anchor_cy - gt_cy)**2
+                    _, fallback_idx = dist.topk(min(3, num_anchors), largest=False)
+                    pos_idx = fallback_idx
+                    pos_scores = torch.ones(len(fallback_idx), device=device) * 0.01
+                else:
+                    # Filter out zero-score anchors
+                    valid = pos_scores > 0
+                    pos_idx = pos_idx[valid]
+                    pos_scores = pos_scores[valid]
 
                 if len(pos_idx) == 0:
                     continue
@@ -186,13 +198,14 @@ def _generate_anchors(
 class YOLOv8Loss(nn.Module):
     """YOLOv8-style detection loss with TAL assignment.
 
-    Combines class-weighted BCE classification loss with CIoU regression loss.
+    Combines Focal classification loss with CIoU regression loss.
 
     Args:
         num_classes: Number of detection classes.
         box_weight: Weight for regression (CIoU) loss.
-        cls_weight: Weight for classification (BCE) loss.
-        class_weights: Per-class weights for BCE loss.
+        cls_weight: Weight for classification (Focal) loss.
+        class_weights: Per-class weights for classification loss.
+        focal_gamma: Focal loss gamma (0 = standard BCE, 2.0 default).
         strides: FPN level strides.
     """
 
@@ -202,12 +215,14 @@ class YOLOv8Loss(nn.Module):
         box_weight: float = 7.5,
         cls_weight: float = 0.5,
         class_weights: list[float] | None = None,
+        focal_gamma: float = 2.0,
         strides: list[int] | None = None,
     ):
         super().__init__()
         self.num_classes = num_classes
         self.box_weight = box_weight
         self.cls_weight = cls_weight
+        self.focal_gamma = focal_gamma
         self.strides = strides or [8, 16, 32]
 
         if class_weights is None:
@@ -297,30 +312,34 @@ class YOLOv8Loss(nn.Module):
             pred_scores, pred_bboxes, gt_labels_list, gt_bboxes_pixel, anchors, self.strides
         )
 
-        # --- Classification loss ---
-        # BCE with logits for all anchors
-        # Target: one-hot for positive, all-zero for negative
+        # Build target_cls: one-hot for positives (binary), zero for negatives
         target_cls = torch.zeros_like(pred_cls)  # (B, A, nc)
         for b in range(B):
             pos = fg_mask[b]
             if pos.any():
                 pos_classes = target_classes[b, pos]  # (K,)
-                # Clamp to valid range
                 pos_classes = pos_classes.clamp(0, self.num_classes - 1)
                 target_cls[b, pos] = F.one_hot(pos_classes, self.num_classes).float()
-                # Scale by alignment score
-                target_cls[b, pos] *= target_scores[b, pos].unsqueeze(1)
 
-        # Apply class weights
-        cls_weights = self.class_weights.to(device)  # (nc,)
-        cls_loss = F.binary_cross_entropy_with_logits(
-            pred_cls, target_cls,
-            weight=cls_weights.unsqueeze(0).unsqueeze(0).expand_as(pred_cls),
-            reduction="sum",
-        )
-        # Normalize by number of positive samples
+        # --- Classification loss: Focal BCE ---
+        # BCE with logits (element-wise)
+        bce = F.binary_cross_entropy_with_logits(
+            pred_cls, target_cls, reduction="none"
+        )  # (B, A, nc)
+
+        # Focal weight: (1 - p_t)^gamma
+        p_t = torch.exp(-bce)
+        focal_weight = (1.0 - p_t) ** self.focal_gamma
+
+        # Class weights
+        cls_weights = self.class_weights.to(device).unsqueeze(0).unsqueeze(0)  # (1, 1, nc)
+
+        # Sum over classes, then over anchors
+        weighted = (focal_weight * cls_weights * bce).sum(dim=-1)  # (B, A)
+
+        # Normalize by number of positive anchors
         num_pos = fg_mask.sum().clamp(min=1)
-        cls_loss = cls_loss / num_pos
+        cls_loss = weighted.sum() / num_pos
 
         # --- Regression loss (CIoU on positives only) ---
         box_loss = torch.tensor(0.0, device=device)
@@ -374,11 +393,11 @@ class YOLOv8Loss(nn.Module):
         anchor_cy = anchors[:, 1].unsqueeze(0)  # (1, A)
 
         # Decode: cx = anchor_cx + dx, cy = anchor_cy + dy
-        # w and h are exp-predicted
+        # w and h are exp-predicted, clamp raw inputs to avoid exp→∞
         dx = reg_preds[:, :, 0]
         dy = reg_preds[:, :, 1]
-        w = reg_preds[:, :, 2].exp()
-        h = reg_preds[:, :, 3].exp()
+        w = reg_preds[:, :, 2].clamp(-9.0, 9.0).exp()   # exp(9)≈8103, safe
+        h = reg_preds[:, :, 3].clamp(-9.0, 9.0).exp()
 
         cx = anchor_cx + dx
         cy = anchor_cy + dy
