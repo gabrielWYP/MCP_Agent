@@ -32,10 +32,10 @@ Chain strategy: pending
 
 ## Phase 2: Neck & Head
 
-- [ ] 2.1 Create `src/models/student/neck.py` — `PANet` with lateral convs (S2→128, S3→256, S4→256), top-down path (upsample + concat + C2f), bottom-up path (Conv s=2 downsample + concat + C2f). Output: `[P3(128,80×80), P4(256,40×40), P5(256,20×20)]`
-- [ ] 2.2 Create `src/models/student/head.py` — `DecoupledHead(fpn_ch, stem_ch, num_classes)` with cls_stem (3×3 conv→SiLU), reg_stem (3×3 conv→SiLU), cls_pred (1×1→num_classes), reg_pred (1×1→4). `YOLOStudentHead` instantiates 3 heads with `fpn_channels=[128,256,256]`, `stem_channels=[64,128,256]`. Forward returns preds, cls_preds, reg_preds, distill_head_cls, distill_head_reg
-- [ ] 2.3 Create `tests/models/student/test_neck.py` — feed backbone features, assert output channels `[128,256,256]` at spatial sizes `[80,40,20]`
-- [ ] 2.4 Create `tests/models/student/test_head.py` — feed FPN features, assert `preds[i]=(B,6,H,W)`, `cls=(B,2,H,W)`, `reg=(B,4,H,W)`; distill stems at `[64,128,256]`ch
+- [x] 2.1 Create `src/models/student/neck.py` — `PANet` with lateral convs (S2→128, S3→256, S4→256), top-down path (upsample + concat + C2f), bottom-up path (Conv s=2 downsample + concat + C2f). Output: `[P3(128,80×80), P4(256,40×40), P5(256,20×20)]`
+- [x] 2.2 Create `src/models/student/head.py` — `DecoupledHead(fpn_ch, stem_ch, num_classes)` with cls_stem (3×3 conv→SiLU), reg_stem (3×3 conv→SiLU), cls_pred (1×1→num_classes), reg_pred (1×1→4). `YOLOStudentHead` instantiates 3 heads with `fpn_channels=[128,256,256]`, `stem_channels=[64,128,256]`. Forward returns preds, cls_preds, reg_preds, distill_head_cls, distill_head_reg
+- [x] 2.3 Create `tests/models/student/test_neck.py` — feed backbone features, assert output channels `[128,256,256]` at spatial sizes `[80,40,20]`
+- [x] 2.4 Create `tests/models/student/test_head.py` — feed FPN features, assert `preds[i]=(B,6,H,W)`, `cls=(B,2,H,W)`, `reg=(B,4,H,W)`; distill stems at `[64,128,256]`ch
 
 ## Phase 3: Integration & Verification
 
