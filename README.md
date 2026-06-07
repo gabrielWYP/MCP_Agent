@@ -1,131 +1,256 @@
-# MLOps Orchestrator for Mango Ripeness Detection using LangGraph
+# Detección de Daño en Mango con Imágenes Multiespectrales y Knowledge Distillation
 
-## 1. Overview
+**Tesis de pregrado — Ingeniería de Sistemas**
 
-This project implements an advanced MLOps pipeline to manage the lifecycle of a Deep Learning (DL) model for mango ripeness detection. The core challenge in production-level DL is not just model training, but the continuous orchestration, validation, and failure analysis required to maintain performance.
+Pipeline end-to-end de detección de daño en mango usando imágenes RGB+NIR (cámara MAPIR Survey3W), modelos de visión multimodal con backbone ConvNeXtV2, y conocimiento destilado (KD) hacia un modelo estudiante YOLOv8-Nano para despliegue eficiente.
 
-To address this, we use **LangGraph** not to train the model itself, but to build an **intelligent, cyclical, and reactive Orchestrator Agent**. This agent acts as a "smart manager" for our DL model (the "brute-force worker," e.g., a MobileNetV2), deciding when it should train, evaluating its performance, and managing its deployment.
+---
 
-The final system is designed for cloud deployment, potentially on a PaaS like OCI, where it will manage the re-training and deployment of a `.tflite` model used in a mobile application.
+## 1. Visión General
 
-## 2. Core Architecture
+El proyecto construye un sistema de detección de daño en frutos de mango usando:
 
-The system is composed of two main parts:
+- **Imágenes multiespectrales** (RGB + NIR) capturadas con cámara MAPIR Survey3W
+- **Anotación automática** con Florence-2-large + refinamiento manual en Label Studio
+- **Modelo maestro (Teacher)** multimodal: DualConvNeXt + CrossModalFusion + DualFPN + YOLODetectionHead (~50M params)
+- **Modelo estudiante (Student)** YOLOv8-Nano from scratch (~6.9M params) para recibir conocimiento destilado en capas intermedias
+- **Training loop** YOLOv8 personalizado (TAL assigner, CIoU, Focal Loss) — sin dependencia de ultralytics
+- **Knowledge Distillation** a nivel de features (backbone, FPN, head stems), no solo logits finales
 
-- **The DL Worker**: A standard computer vision model (e.g., MobileNetV2) trained to classify the ripeness of mangoes from images. Its only job is to train on new data and produce a model artifact.
-- **The LangGraph Orchestrator**: An intelligent agent that manages the entire MLOps workflow, from data ingestion to deployment. It operates based on a state machine defined in a graph structure.
+### Resultados actuales
 
-### 2.1. The Graph State
+| Métrica | Valor |
+|---------|-------|
+| mAP@0.5 (maestro) | **0.3003** |
+| AP mango (clase 0) | 0.57 |
+| AP daño (clase 1) | 0.03–0.08 |
+| Pares de imágenes | 65 RGB+NIR |
+| Bboxes de daño | 186 manuales |
+| Épocas entrenadas | 80 (Fase 1, backbone congelado) |
 
-The entire orchestration process is driven by a shared state object that is passed between nodes in the graph.
+---
 
-```python
-from typing import TypedDict
+## 2. Arquitectura
 
-class MLOpsState(TypedDict):
-    new_data_path: str                 # Location of new mango images
-    model_version: int                 # Current version (e.g., 2)
-    candidate_model_path: str          # Path to the newly trained model
-    candidate_metrics: dict            # Metrics of the new model (e.g., {'accuracy': 0.92})
-    production_metrics: dict           # Metrics of the model in production
-    deployment_decision: str           # "APPROVE", "REJECT", "HUMAN_REVIEW"
-    failure_analysis_report: str       # Report explaining why a process failed
+### 2.1 Modelo Maestro (Teacher) — `src/models/master/`
+
+```
+RGB ──→ DualConvNeXtSmall ──→ CrossModalFusion ──→ DualFPN ──→ YOLODetectionHead
+NIR ──→ DualConvNeXtSmall ──┘                                    │
+                                                                  ├── preds (bboxes + clases)
+                                                                  ├── distill_backbone → Proyecciones → KD
+                                                                  ├── distill_fpn      → Proyecciones → KD
+                                                                  ├── distill_head_cls → Proyecciones → KD
+                                                                  └── distill_head_reg → Proyecciones → KD
 ```
 
-## 3. The Orchestration Flow
+- **DualConvNeXt**: Dos backbones ConvNeXtV2 independientes para RGB y NIR (pesos compartidos en Fase 1)
+- **CrossModalFusion**: Fusión cross-modal aprendible (concat + convolución 1×1)
+- **DualFPN**: Feature Pyramid Network bidireccional con C2f blocks, salida 3 niveles [P3, P4, P5]
+- **YOLODetectionHead**: Head YOLOv8 decoupled (cls + reg) con bias init calibrado
+- **ProjectionLayers**: Capas de proyección lineal que adaptan features del maestro a las dimensiones del estudiante para KD
 
-The agent operates as a cyclical graph, capable of handling complex logic, retries, and human-in-the-loop interventions.
+### 2.2 Modelo Estudiante (Student) — `src/models/student/`
 
-```mermaid
-graph TD
-    A[Start] --> B{1. Check for New Data};
-    B -- new_data_found --> C[2. Validate Data Quality];
-    B -- no_new_data --> K[End & Sleep];
-    C -- quality_score >= 7.0 --> D[3. Run Training Job];
-    C -- quality_score < 7.0 --> F[6. Alert Human: Bad Data];
-    D --> E[4. Analyze Performance];
-    E --> G{5. Check Deployment Decision};
-    G -- 'APPROVE' --> H[7. Deploy to Production];
-    G -- 'REJECT' --> I[6. Alert Human: Deployment Rejected];
-    H --> J[End & Success];
-    I --> L[End & Halted];
-    F --> M[End & Halted];
+```
+RGB ──→ CSPDarknetNano ──→ PANet ──→ YOLOStudentHead
+                             │              │
+                             ├── distill_fpn       → compatible con proyecciones del maestro
+                             ├── distill_head_cls  → compatible con proyecciones del maestro
+                             └── distill_head_reg  → compatible con proyecciones del maestro
 ```
 
-### 3.1. Node Descriptions
+El estudiante expone un contrato de **7 claves de output** idéntico al del maestro, permitiendo KD a nivel de features intermedias: `distill_backbone`, `distill_fpn`, `distill_head_cls`, `distill_head_reg`.
 
-**Node 1: `check_for_new_data` (Data Ingest)**
+| Módulo | Params |
+|--------|--------|
+| CSPDarknetNano | 1.27M |
+| PANet Neck | 2.13M |
+| YOLOStudentHead | 3.47M |
+| **Total** | **6.87M** |
 
-- **Action**: A script monitors a cloud storage bucket (e.g., OCI/S3) for new data uploads.
-- **Edge Logic**:
-  - If new data is found, it updates `new_data_path` in the state and transitions to `validate_data`.
-  - If not, the graph run ends and waits for the next scheduled trigger.
+---
 
-**Node 2: `validate_data` (A2A with a VLM)**
+## 3. Pipeline End-to-End
 
-- **Action**: An Agent-to-Agent (A2A) call is made to a Vision Language Model (VLM) like Gemini 1.5 Pro.
-- **Prompt to VLM**: *"Analyze a sample of images from `new_data_path`. Are they clear photos of mangoes? Are they blurry, poorly lit, or corrupt? Return a JSON with a `quality_score` out of 10."*
-- **Edge Logic**:
-  - If `quality_score` is high (e.g., >= 7.0), the data is good for training. Transition to `run_training_job`.
-  - If `quality_score` is low, training is aborted. Transition to `alert_human`.
+```
+OCI Object Storage                    Label Studio
+      │                                    │
+      ▼                                    ▼
+download_oci.py                  Anotación manual
+(65 pares RGB+NIR)               (186 bboxes daño en NIR)
+      │                                    │
+      ▼                                    ▼
+annotate_mango_florence.py       convert_nir_labels.py
+(Florence-2-large → bboxes)      (Homografía NIR→RGB)
+      │                                    │
+      └────────────┬───────────────────────┘
+                   ▼
+           Dataset YOLO (RGB+NIR .txt labels)
+                   │
+                   ▼
+          Training Loop (80 epochs)
+          ┌────────┴────────┐
+          ▼                 ▼
+   MasterModel        YOLOv8-Nano Student
+   (Teacher ~50M)     (Student ~6.9M)
+          │                 │
+          └────────┬────────┘
+                   ▼
+          Knowledge Distillation
+          (features intermedias)
+```
 
-**Node 3: `run_training_job` (The DL Worker Tool)**
+### Componentes del pipeline
 
-- **Action**: This node executes the `train_model.py` script. This is a long-running, non-LLM tool that trains the DL model on the validated new data.
-- **Output**: It saves the new model artifact (e.g., `mango_model_v3.tflite`) and its performance metrics (`metrics_v3.json`).
-- **Transition**: Proceeds to `analyze_performance`.
+| Script / Módulo | Función |
+|-----------------|---------|
+| `scripts/download_oci.py` | Descarga pares RGB+NIR desde bucket OCI |
+| `scripts/annotate_mango_florence.py` | Detección de bboxes de mango con Florence-2-large |
+| Label Studio (externo) | Anotación manual de daño en imágenes NIR |
+| `scripts/convert_nir_labels.py` | Conversión NIR→RGB vía matriz de homografía |
+| `scripts/annotate_v2.py` | Detección de daño por ROI (umbral NIR sobre bbox mango) |
+| `src/training/` | Training loop YOLOv8 personalizado |
+| `src/data_pipeline/` | OCI client, preprocesamiento, augmentación, vector store |
 
-**Node 4: `analyze_performance` (The LLM Analyst)**
+---
 
-- **Action**: This is the core "intelligent" node. An LLM receives the metrics for the new candidate model and the current production model.
-- **Prompt to LLM**: *"The production model v2 has `{'accuracy': 0.91, 'f1_class_maduro': 0.88}`. The candidate v3 has `{'accuracy': 0.90, 'f1_class_maduro': 0.95}`. Is v3 a better model for our business goal of identifying ripe mangoes? The overall accuracy dropped, but the F1 score for the key 'maduro' class increased significantly. Generate a JSON with a `decision` ('APPROVE' or 'REJECT') and a `reason`."*
-- **Output**: The LLM provides a nuanced decision, e.g., `{'decision': 'APPROVE', 'reason': 'Although overall accuracy dropped 1%, the F1 score for the critical "maduro" class improved by 7%, which is a worthwhile trade-off for the business.'}`.
-- **Transition**: Proceeds to `check_deployment_decision`.
+## 4. Bugs Resueltos Durante el Entrenamiento
 
-**Node 5: `check_deployment_decision`**
+El pipeline de entrenamiento atravesó 7 bugs críticos que fueron diagnosticados y corregidos:
 
-- **Action**: A simple conditional node that reads the `deployment_decision` from the state.
-- **Edge Logic**:
-  - If `APPROVE`, transition to `deploy_to_production`.
-  - If `REJECT`, transition to `alert_human` to report the rejection.
+| # | Bug | Solución |
+|---|-----|----------|
+| 1 | **AMP NaN** — Loss divergía a NaN con Automatic Mixed Precision | `exp clamp` en `bbox_decode()` |
+| 2 | **TAL Soft Targets** — Positivos con target≈0, gradiente nulo | Binary targets directos (positivo=1.0) |
+| 3 | **OHEM** — Online Hard Example Mining reforzaba falsos positivos | OHEM desactivado, Focal Loss basta |
+| 4 | **NIR Padding** — Padding RGB (114) producía valores erróneos en NIR | Padding separado con `nir_mean * 255 ≈ 14` |
+| 5 | **Bias Init** — Pérdida inicial muy alta | `cls_pred` bias init = −4.6 |
+| 6 | **Focal Loss γ** — γ=1.5 insuficiente para desbalance extremo | γ=2.0 |
+| 7 | **TAL Fallback** — Assertion cuando cero matches válidos | Fallback a asignación por IoU máximo |
 
-**Node 6: `alert_human` (Failure/Rejection Reporting)**
+---
 
-- **Action**: This node is triggered by data validation failure or deployment rejection. It uses the `failure_analysis_report` or the rejection `reason` from the state to send a detailed, actionable notification to a human operator via Slack, Teams, or email.
-- **Example Alert**: *"🛑 Deployment of mango model REJECTED. Reason: The new model v3 confused 'green mango' with 'leaf' 15% more often than v2."*
-- **Transition**: The graph run ends, awaiting human intervention or the next cycle.
+## 5. Desarrollo con SDD (Spec-Driven Development)
 
-**Node 7: `deploy_to_production`**
+El proyecto se desarrolló siguiendo la metodología SDD con artefactos versionados:
 
-- `.env`: Stores environment variables like API keys and bucket names.
-- `requirements.txt`: Lists all Python dependencies for the project.
-- `src/`: Contains the main source code for the orchestrator agent and related tools.
-- `notebooks/`: Jupyter notebooks for prototyping, testing, and visualization.
-- `tests/`: Unit and integration tests for the MLOps pipeline.
+```
+openspec/
+├── specs/              ← Especificaciones "source of truth"
+│   ├── testing-teacher-arch/
+│   ├── data-augmentation/
+│   ├── data-extraction/
+│   ├── data-preprocessing/
+│   ├── training-loop/
+│   ├── training-metrics/
+│   ├── yolo-dataset/
+│   ├── yolo-loss/
+│   └── yolo-nano-student/
+└── changes/archive/    ← Cambios completados
+    ├── 2026-05-18-testing-bootstrap/
+    ├── 2026-06-01-fix-dualfpn-levels/
+    ├── 2026-06-01-data-aug-pipeline/
+    ├── 2026-06-02-pipeline-e2e-homography/
+    ├── 2026-06-07-mastermodel-training-loop/
+    └── 2026-06-07-yolo-nano-student/
+```
 
-## 4. Project Structure
+---
 
-- `.env`: Stores environment variables like API keys and bucket names.
+## 6. Estructura del Proyecto
 
-1. **Create a virtual environment:**
+```
+.
+├── src/
+│   ├── agent/              # LangGraph orchestrator (legacy, en pausa)
+│   ├── annotation/         # Florence-2, bbox projection, NIR segmentation
+│   ├── data_pipeline/      # OCI client, homography, pair discovery, augmentation
+│   ├── ml_pipeline/        # Training/predict (legacy)
+│   ├── models/
+│   │   ├── master/         # Teacher: DualConvNeXt, Fusion, DualFPN, YOLODetectionHead
+│   │   └── student/        # Student: CSPDarknetNano, PANet, YOLOStudentHead
+│   ├── training/           # Training loop: dataset, loss (TAL+BCE+CIoU), metrics, augmentations
+│   ├── storage_logic/      # Object storage (S3/OCI)
+│   ├── utils/              # Logger, object storage helpers
+│   └── variables/          # Config variables
+├── scripts/                # Pipeline scripts (download, annotation, conversion)
+├── tests/
+│   ├── data_pipeline/      # 46 tests (OCI extraction, homography, augmentation)
+│   ├── training/           # 30 tests (letterbox, TAL, mAP, training step, e2e)
+│   └── models/student/     # 12 tests (backbone, neck, head, StudentModel integration)
+├── configs/                # Training configs (training_mango.yaml)
+├── config/                 # OCI credentials (gitignored)
+├── calibracion/            # Camera calibration data
+├── checkpoints/            # Model checkpoints (best_model.pt)
+├── data/                   # Datasets (zips: RGB, NIR, YOLO labels)
+├── notebooks/              # Homography scripts, Gemini manager, utils
+├── openspec/               # SDD specs and archived changes
+└── resumen_sesion_*.md     # Session summaries
+```
 
-   ```bash
-   python -m venv myLinuxVenv
-   source myLinuxVenv/bin/activate
-   ```
+---
 
-2. **Install dependencies:**
+## 7. Setup
 
-   ```bash
-   pip install -r requirements.txt
-   ```
+### Requisitos
 
-3. **Configure environment:**
+- Python 3.12+ (venv incluido: `myLinuxVenv`)
+- PyTorch 2.1+ con CUDA (para entrenamiento)
+- 10 GB+ VRAM recomendado (RTX 3080 usado en desarrollo)
 
-   - Copy `.env.example` to `.env` and fill in your API keys and other configuration details.
+### Instalación
 
-4. **Run the orchestrator:**
+```bash
+# Activar entorno virtual
+source myLinuxVenv/bin/activate
 
-   ```bash
-   python src/main.py
-   ```
+# Instalar dependencias
+pip install -r requirements.txt
+
+# Variables de entorno (credenciales OCI, API keys)
+cp .env.example .env  # Completar con valores reales
+```
+
+### Tests
+
+```bash
+# Tests de modelos (maestro + estudiante)
+python -m pytest tests/models/ -v
+
+# Tests de training loop
+python -m pytest tests/training/ -v
+
+# Tests de data pipeline
+python -m pytest tests/data_pipeline/ -v
+
+# Todos los tests
+python -m pytest tests/ -v
+```
+
+---
+
+## 8. Próximos Pasos
+
+1. **Knowledge Distillation training** — Entrenar al estudiante usando las proyecciones del maestro
+2. **Más datos** — 100-200+ pares RGB+NIR adicionales para mejorar AP de daño
+3. **Fase 2 de entrenamiento** — Descongelar backbone del maestro cuando haya ≥200 imágenes
+4. **Exportar modelos** — ONNX / TorchScript para inferencia en producción
+5. **Mergear feature-branch-chain** del estudiante a main
+6. **Redacción de tesis** — Documentar métricas, arquitectura y resultados
+
+---
+
+## 9. Commits Relevantes
+
+| Commit | Descripción |
+|--------|-------------|
+| `4d9d98f` | Pipeline v1 completo: OCI download, Florence-2, training, mAP 0.30 |
+| `e256856` | Training curves plot |
+| `6bd270f` | CSPDarknet-Nano backbone + building blocks |
+| `be1868d` | PANet neck + DecoupledHead con stems de KD |
+| `803abf7` | StudentModel integración final, contrato 7-key KD |
+
+---
+
+*Repositorio de tesis. Desarrollado con SDD (Spec-Driven Development) + Engram persistent memory.*
