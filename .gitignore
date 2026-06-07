@@ -8,6 +8,7 @@
 .env
 .env.local
 *.env
+.atl
 
 # Cache de Python
 __pycache__/
