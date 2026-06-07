@@ -39,7 +39,7 @@ Chain strategy: pending
 
 ## Phase 3: Integration & Verification
 
-- [ ] 3.1 Create `src/models/student/student_model.py` — `StudentModel` composes backbone→neck→head. Forward returns 7-key dict. `count_parameters()` method. CPU eval mode by default
-- [ ] 3.2 Update `src/models/__init__.py` — add `StudentModel` to imports and `__all__`; update `src/models/student/__init__.py` with public API exports
-- [ ] 3.3 Create `tests/models/student/conftest.py` — shared fixtures: `device` (CPU), `batch_input` (N,3,640,640), `student_model`
-- [ ] 3.4 Create `tests/models/student/test_student_model.py` — verify 7-key dict with all shapes per spec table; projection compatibility (distill outputs pass through `ProjectionLayers`); param count 2.7M–3.7M
+- [x] 3.1 Create `src/models/student/student_model.py` — `StudentModel` composes backbone→neck→head. Forward returns 7-key dict. `count_parameters()` method. CPU eval mode by default
+- [x] 3.2 Update `src/models/__init__.py` — add `StudentModel` to imports and `__all__`; update `src/models/student/__init__.py` with public API exports
+- [x] 3.3 Create `tests/models/student/conftest.py` — shared fixtures: `device` (CPU), `batch_input` (N,3,640,640), `student_model`
+- [x] 3.4 Create `tests/models/student/test_student_model.py` — verify 7-key dict with all shapes per spec table; projection compatibility (distill outputs pass through `ProjectionLayers`); param count 6.0M–7.5M
