@@ -22,15 +22,23 @@ from src.training.dataset import YOLODataset, collate_fn, build_weighted_sampler
 from src.training.augmentations import get_train_transforms, get_val_transforms
 from src.training.loop import Trainer
 from src.models.master.master_model import MasterModel
+from src.models.student.student_model import StudentModel
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="MasterModel Training")
+    parser = argparse.ArgumentParser(description="MasterModel / StudentModel Training")
     parser.add_argument(
         "--config",
         type=str,
         default=None,
         help="Path to YAML config file.",
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        choices=["master", "student"],
+        default=None,
+        help="Model type to train: master or student.",
     )
     parser.add_argument(
         "--override",
@@ -64,14 +72,21 @@ def main():
                 value = float(value)
             setattr(config, key, value)
 
+    # CLI --model flag overrides config model_type
+    if args.model is not None:
+        config.model_type = args.model
+
     # Set seed
     torch.manual_seed(config.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(config.seed)
 
-    print(f"Config: backbone={config.backbone_variant}, image_size={config.image_size}")
-    print(f"  Phase 1: {config.epochs_phase1} epochs, lr={config.lr_phase1}")
-    print(f"  Phase 2: {config.epochs_phase2} epochs, lr={config.lr_phase2}")
+    print(f"Config: model_type={config.model_type}, backbone={config.backbone_variant}, image_size={config.image_size}")
+    if config.model_type == "student":
+        print(f"  Single-phase: {config.epochs} epochs, lr={config.lr}")
+    else:
+        print(f"  Phase 1: {config.epochs_phase1} epochs, lr={config.lr_phase1}")
+        print(f"  Phase 2: {config.epochs_phase2} epochs, lr={config.lr_phase2}")
     print(f"  Batch size: {config.batch_size}, AMP: {config.amp}")
 
     # Create datasets
@@ -126,14 +141,18 @@ def main():
     )
 
     # Create model
-    model = MasterModel(
-        num_classes=config.num_classes,
-        pretrained_backbone=True,
-        backbone_variant=config.backbone_variant,
-    )
-
-    params = model.count_parameters()
-    print(f"Model parameters: {params['total']:,} total, {params['backbone']:,} backbone")
+    if config.model_type == "student":
+        model = StudentModel(num_classes=config.num_classes)
+        params = model.count_parameters()
+        print(f"StudentModel parameters: {params['total']:,} total")
+    else:
+        model = MasterModel(
+            num_classes=config.num_classes,
+            pretrained_backbone=True,
+            backbone_variant=config.backbone_variant,
+        )
+        params = model.count_parameters()
+        print(f"Model parameters: {params['total']:,} total, {params['backbone']:,} backbone")
 
     # Train
     trainer = Trainer(

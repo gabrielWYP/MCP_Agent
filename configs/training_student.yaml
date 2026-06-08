@@ -1,0 +1,53 @@
+# Training config for StudentModel — RGB-only single-phase training
+# Student uses cosine+warmup LR with all params trainable from epoch 1
+
+# Model type
+model_type: "student"
+
+# Data paths (no nir_dir needed for student)
+rgb_dir: "data/cache/mango/rgb"
+labels_dir: "data/annotations/yolo/labels"
+output_dir: "checkpoints/student"
+
+# Model
+backbone_variant: "tiny"
+num_classes: 2
+
+# Image
+image_size: 640
+letterbox_value: 114
+
+# Training — single-phase
+batch_size: 4
+epochs: 50
+lr: 0.001
+weight_decay: 0.0005
+
+# Loss
+box_weight: 7.5
+cls_weight: 0.5
+class_weights: [2.7, 0.5]
+
+# Scheduler
+warmup_epochs: 5
+patience: 15
+
+# Logging
+log_interval: 5
+save_interval: 10
+
+# Mixed precision
+amp: false
+
+# Gradient clipping
+grad_clip: 10.0
+
+# DataLoader
+num_workers: 2
+
+# NIR normalization stats (unused by student, kept for config compat)
+nir_mean: 0.0569
+nir_std: 0.0546
+
+# Reproducibility
+seed: 42

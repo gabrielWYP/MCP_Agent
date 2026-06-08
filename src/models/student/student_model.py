@@ -94,6 +94,26 @@ class StudentModel(nn.Module):
             "distill_head_reg": head_out["distill_head_reg"],
         }
 
+    def freeze_backbone(self, freeze_stages: int = 0) -> None:
+        """No-op for single-phase student training (API compatibility).
+
+        This method exists so that Trainer can call freeze_backbone()
+        polymorphically on both MasterModel and StudentModel. Since student
+        training is single-phase with all parameters trainable from epoch 1,
+        no freezing is performed.
+        """
+        pass
+
+    def unfreeze_backbone_stages(self, unfreeze_stages: list[int]) -> None:
+        """No-op for single-phase student training (API compatibility).
+
+        This method exists so that Trainer can call unfreeze_backbone_stages()
+        polymorphically on both MasterModel and StudentModel. Since student
+        training is single-phase with all parameters trainable from epoch 1,
+        no unfreezing is performed.
+        """
+        pass
+
     def count_parameters(self) -> dict[str, int]:
         """Returns parameter counts per module and total."""
         def count(module: nn.Module) -> int:
