@@ -1,0 +1,58 @@
+# Knowledge Distillation Training Configuration
+# Student (YOLO Nano) trained with frozen MasterModel teacher via per-level MSE.
+
+# --- Teacher ---
+teacher_checkpoint: checkpoints/mastermodel_mango/best_model.pt
+
+# --- KD Hyperparameters ---
+kd_weight: 1.0
+kd_temperature: 1.0
+distill_levels:
+  backbone: 1.0
+  fpn: 0.1
+  head_cls: 0.3
+  head_reg: 0.5
+
+# --- Training (overridden defaults for KD) ---
+epochs: 80
+patience: 30
+amp: false
+batch_size: 4
+model_type: student
+
+# --- Model ---
+num_classes: 2
+backbone_variant: tiny
+image_size: 640
+letterbox_value: 114
+
+# --- Loss ---
+box_weight: 7.5
+cls_weight: 0.5
+class_weights: [2.7, 0.5]
+
+# --- Optimizer ---
+lr: 0.001
+weight_decay: 0.0005
+grad_clip: 10.0
+warmup_epochs: 3
+
+# --- Paths ---
+rgb_dir: data/cache/mango/rgb
+nir_dir: data/cache/mango/nir
+labels_dir: data/annotations/yolo/labels
+output_dir: checkpoints/kd_student
+
+# --- DataLoader ---
+num_workers: 4
+
+# --- NIR normalization ---
+nir_mean: 0.0569
+nir_std: 0.0546
+
+# --- Logging ---
+log_interval: 10
+save_interval: 5
+
+# --- Reproducibility ---
+seed: 42
