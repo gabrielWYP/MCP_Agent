@@ -72,7 +72,7 @@ class StageAttentionFusion(nn.Module):
 
     def forward(
         self, rgb_feat: torch.Tensor, nir_feat: torch.Tensor
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """
         Args:
             rgb_feat: (N, C, H, W)
@@ -80,6 +80,8 @@ class StageAttentionFusion(nn.Module):
 
         Returns:
             fused: (N, C, H, W) — RGB enriched with NIR context
+            attn_map: (N, H, W) or None — spatial attention map
+                (average over heads and key dims, upsampled to original resolution)
         """
         N, C, H, W = rgb_feat.shape
 
@@ -106,7 +108,7 @@ class StageAttentionFusion(nn.Module):
         nir_norm = self.norm_nir(nir_seq)
 
         # Cross-attention: Q from RGB, K/V from NIR
-        attn_out, _ = self.attn(
+        attn_out, attn_weights = self.attn(
             query=rgb_norm,
             key=nir_norm,
             value=nir_norm,
@@ -120,6 +122,26 @@ class StageAttentionFusion(nn.Module):
         P = pool_size
         fused_pooled = rgb_seq.permute(0, 2, 1).reshape(N, C, P, P)
 
+        # --- Extract attention map for visualization ---
+        # attn_weights: (N, L, S) with batch_first=True (Q_len=L=RGB tokens, K_len=S=NIR tokens)
+        # Each row (query) sums to 1.0 due to softmax.
+        # Visualization: sum over query dim → "which NIR positions are most attended to?"
+        if attn_weights.dim() == 4:
+            attn_avg = attn_weights.mean(dim=1)      # (N, L, S)
+        else:
+            attn_avg = attn_weights                   # (N, L, S)
+        attn_spatial = attn_avg.sum(dim=1)            # (N, S) — total attention RECEIVED per NIR position
+        attn_spatial = attn_spatial / (attn_spatial.max(dim=-1, keepdim=True)[0].clamp(min=1e-8) + 1e-8)
+        attn_map = attn_spatial.reshape(N, P, P)      # (N, P, P)
+
+        # Upsample attention map to original resolution
+        attn_map = F.interpolate(
+            attn_map.unsqueeze(1),                     # (N, 1, P, P)
+            size=(H, W),
+            mode="bilinear",
+            align_corners=False,
+        ).squeeze(1)                                   # (N, H, W)
+
         # Upsample back to original resolution if we pooled
         if needs_pool:
             fused = F.interpolate(fused_pooled, size=(H, W), mode="bilinear", align_corners=False)
@@ -128,7 +150,7 @@ class StageAttentionFusion(nn.Module):
         else:
             fused = fused_pooled
 
-        return fused
+        return fused, attn_map
 
 
 class CrossModalFusion(nn.Module):
@@ -178,20 +200,28 @@ class CrossModalFusion(nn.Module):
         self,
         rgb_features: list[torch.Tensor],
         nir_features: list[torch.Tensor],
-    ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+        return_attention: bool = False,
+    ) -> tuple[list[torch.Tensor], list[torch.Tensor]] | tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]]:
         """
         Args:
             rgb_features: [S1, S2, S3, S4] from RGB encoder
             nir_features: [S1, S2, S3, S4] from NIR encoder
+            return_attention: If True, also return attention maps per stage.
 
         Returns:
             fused_features: [F1, F2, F3, F4] — RGB enriched with NIR
             nir_features:   [S1, S2, S3, S4] — original NIR (for NIR FPN)
+            attn_maps:      (only if return_attention=True) [M1, M2, M3, M4] each (N, H, W)
         """
         fused_features = []
+        attn_maps = [] if return_attention else None
         for i, fusion in enumerate(self.fusion_stages):
-            fused = fusion(rgb_features[i], nir_features[i])
+            fused, attn_map = fusion(rgb_features[i], nir_features[i])
             fused_features.append(fused)
+            if return_attention:
+                attn_maps.append(attn_map)
 
         # NIR features are returned unchanged for the parallel NIR FPN
+        if return_attention:
+            return fused_features, nir_features, attn_maps
         return fused_features, nir_features

@@ -102,11 +102,13 @@ class MasterModel(nn.Module):
         self,
         rgb: torch.Tensor,
         nir: torch.Tensor,
+        return_attention: bool = False,
     ) -> dict:
         """
         Args:
             rgb: (N, 3, H, W) — RGB image, normalized
             nir: (N, 1, H, W) — NIR grayscale image, normalized
+            return_attention: If True, include 'attention_maps' in output dict.
 
         Returns:
             dict with keys:
@@ -118,6 +120,7 @@ class MasterModel(nn.Module):
                 'distill_fpn'            : [P3..P5] unified FPN pyramid
                 'distill_head_cls'       : [cls_stem x3] head classification features
                 'distill_head_reg'       : [reg_stem x3] head regression features
+                'attention_maps'         : (if return_attention) [M1..M4] each (N,H,W)
         """
         # --- Backbone ---
         rgb_features, nir_features = self.backbone(rgb, nir)
@@ -125,7 +128,12 @@ class MasterModel(nn.Module):
         # nir_features: [S1..S4], same channels
 
         # --- Cross-modal fusion ---
-        fused_features, nir_features_pass = self.fusion(rgb_features, nir_features)
+        if return_attention:
+            fused_features, nir_features_pass, attn_maps = self.fusion(
+                rgb_features, nir_features, return_attention=True
+            )
+        else:
+            fused_features, nir_features_pass = self.fusion(rgb_features, nir_features)
         # fused_features: [F1..F4] — RGB enriched with NIR context
 
         # --- Dual FPN ---
@@ -136,7 +144,7 @@ class MasterModel(nn.Module):
         head_output = self.head(pyramid)
 
         # --- Assemble output with all distillation features ---
-        return {
+        output = {
             # Detection outputs
             "preds":      head_output["preds"],
             "cls_preds":  head_output["cls_preds"],
@@ -149,6 +157,11 @@ class MasterModel(nn.Module):
             "distill_head_cls":       head_output["distill_cls"],  # [cls_stem x3]
             "distill_head_reg":       head_output["distill_reg"],  # [reg_stem x3]
         }
+
+        if return_attention:
+            output["attention_maps"] = attn_maps  # [M1..M4] each (N, H, W)
+
+        return output
 
     # ------------------------------------------------------------------
     # Utility
