@@ -7,11 +7,15 @@ or pycocotools dependency required.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import torch
 import numpy as np
 from torchvision.ops import box_iou
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -197,3 +201,62 @@ def compute_map(
         "per_class_ap_50": per_class_50,
         "per_class_ap_50_95": per_class_95,
     }
+
+
+def generate_training_curves(history: LossHistory, output_dir: Path) -> None:
+    """Generate training_curves.png from LossHistory.
+
+    Plots 3 subplots (cls_loss, box_loss, total_loss) over epoch indices
+    and saves the result as training_curves.png in output_dir.
+
+    Args:
+        history: LossHistory with per-epoch loss data.
+        output_dir: Directory to save the PNG file.
+    """
+    if not history.total_loss:
+        logger.warning("No loss data to plot — skipping training_curves.png")
+        return
+
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        logger.warning("matplotlib unavailable, skipping training_curves.png")
+        return
+
+    try:
+        epochs = range(1, len(history.total_loss) + 1)
+
+        fig, axes = plt.subplots(3, 1, figsize=(8, 10), sharex=True)
+
+        axes[0].plot(epochs, history.cls_loss, "b-", label="cls_loss")
+        axes[0].set_ylabel("Loss")
+        axes[0].set_title("Classification Loss")
+        axes[0].legend()
+        axes[0].grid(True, alpha=0.3)
+
+        axes[1].plot(epochs, history.box_loss, "r-", label="box_loss")
+        axes[1].set_ylabel("Loss")
+        axes[1].set_title("Box Regression Loss")
+        axes[1].legend()
+        axes[1].grid(True, alpha=0.3)
+
+        axes[2].plot(epochs, history.total_loss, "g-", label="total_loss")
+        axes[2].set_xlabel("Epoch")
+        axes[2].set_ylabel("Loss")
+        axes[2].set_title("Total Loss")
+        axes[2].legend()
+        axes[2].grid(True, alpha=0.3)
+
+        plt.tight_layout()
+
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        fig.savefig(output_dir / "training_curves.png", dpi=150, bbox_inches="tight")
+        plt.close(fig)
+
+        logger.info("Training curves saved to %s", output_dir / "training_curves.png")
+
+    except (RuntimeError, ValueError) as e:
+        logger.warning("Could not generate training_curves.png: %s", e)

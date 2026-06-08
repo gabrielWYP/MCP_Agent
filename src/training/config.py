@@ -96,8 +96,26 @@ class TrainingConfig:
     nir_mean: float = 0.0569
     nir_std: float = 0.0546
 
+    # Model type dispatch
+    model_type: str = "master"  # "master" | "student"
+
+    # Single-phase training (student)
+    epochs: int = 50
+    lr: float = 1e-3
+
     # Reproducibility
     seed: int = 42
+
+    def __post_init__(self) -> None:
+        valid_types = {"master", "student"}
+        if self.model_type not in valid_types:
+            raise ValueError(
+                f"Invalid model_type '{self.model_type}'. "
+                f"Must be one of: {valid_types}"
+            )
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        super().__init_subclass__(**kwargs)
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> TrainingConfig:
@@ -127,4 +145,6 @@ class TrainingConfig:
 
     @property
     def total_epochs(self) -> int:
+        if self.model_type == "student":
+            return self.epochs
         return self.epochs_phase1 + self.epochs_phase2

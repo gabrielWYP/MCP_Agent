@@ -1,44 +1,10 @@
-# training-loop Specification
+# Delta for training-loop
 
-## Purpose
+## Overview
 
-Multi-model training loop supporting MasterModel (2-phase, dual-input RGB+NIR) and StudentModel (single-phase, RGB-only) via model_type dispatch. Manages the full training lifecycle: data loading, forward/backward passes, gradient optimization, validation, checkpointing, early stopping, and logging.
+Extends the training loop to support both MasterModel (2-phase, dual-input) and StudentModel (single-phase, RGB-only) via model_type dispatch. Student training uses cosine+warmup LR with the full model trainable from epoch 1.
 
-## Requirements
-
-### Requirement: Two-Phase Fine-Tuning
-
-The trainer SHALL execute 2-phase fine-tuning ONLY when model_type="master". Phase 1 MUST freeze the entire backbone (stems + stages 1-4) and train only fusion, neck, and head modules (~18.8M params) at lr=1e-3. Phase 2 MUST unfreeze backbone stages 3-4 (stems remain frozen) and train all unfrozen parameters at lr=1e-4. When model_type="student", two-phase logic SHALL NOT execute.
-(Previously: Two-phase training was unconditional for all models)
-
-#### Scenario: Phase 1 freezes backbone and trains head
-
-- GIVEN MasterModel with model_type="master" and 68.3M total parameters
-- WHEN training phase 1 starts
-- THEN backbone stems and stages 1-4 SHALL have requires_grad=False
-- AND fusion, neck, and head SHALL have requires_grad=True
-- AND optimizer SHALL use lr=1e-3 for trainable parameters only
-
-#### Scenario: Phase 2 unfreeze stages 3-4
-
-- GIVEN Phase 1 completed at least one epoch
-- WHEN training transitions to Phase 2
-- THEN backbone stages 3-4 SHALL have requires_grad=True
-- AND stems SHALL remain frozen (requires_grad=False)
-- AND optimizer SHALL use lr=1e-4
-
-#### Scenario: Student training skips two-phase entirely
-
-- GIVEN model_type="student"
-- WHEN training begins
-- THEN no freeze/unfreeze phases SHALL execute
-- AND all model parameters SHALL be trainable from epoch 1
-
-#### Scenario: ConvNeXt-Tiny backbone variant
-
-- GIVEN training config specifies backbone_variant="tiny"
-- WHEN MasterModel is instantiated
-- THEN the ConvNeXt-Tiny backbone (28M params) SHALL replace ConvNeXt-Small (50M params)
+## ADDED Requirements
 
 ### R1: Model-Type Dispatch
 
@@ -102,24 +68,41 @@ The Trainer MUST branch the forward call based on model_type. Master models rece
 - THEN `model(rgb, nir)` SHALL be called with both RGB and NIR tensors
 - AND behavior SHALL be identical to existing two-phase training
 
-### Requirement: Training Step Execution
+## MODIFIED Requirements
 
-Each training step MUST perform: load batch → forward pass → loss computation → backward pass → gradient clipping → optimizer step. Mixed precision (AMP) SHALL be used when `config.amp=True`.
+### Requirement: Two-Phase Fine-Tuning
 
-#### Scenario: Standard training step with AMP
+The trainer SHALL execute 2-phase fine-tuning ONLY when model_type="master". Phase 1 MUST freeze the entire backbone (stems + stages 1-4) and train only fusion, neck, and head modules (~18.8M params) at lr=1e-3. Phase 2 MUST unfreeze backbone stages 3-4 (stems remain frozen) and train all unfrozen parameters at lr=1e-4. When model_type="student", two-phase logic SHALL NOT execute.
+(Previously: Two-phase training was unconditional for all models)
 
-- GIVEN a batch of (rgb, nir, bboxes, class_labels) tensors
-- WHEN the training step runs with AMP enabled
-- THEN forward pass SHALL use `torch.cuda.amp.autocast`
-- AND gradients SHALL be scaled before backward pass
-- AND `clip_grad_norm_` SHALL clip at `config.grad_clip` (default 10.0)
+#### Scenario: Phase 1 freezes backbone and trains head
 
-#### Scenario: OOM fallback
+- GIVEN MasterModel with model_type="master" and 68.3M total parameters
+- WHEN training phase 1 starts
+- THEN backbone stems and stages 1-4 SHALL have requires_grad=False
+- AND fusion, neck, and head SHALL have requires_grad=True
+- AND optimizer SHALL use lr=1e-3 for trainable parameters only
 
-- GIVEN RTX 3080 (10GB VRAM) with batch_size=4 and image_size=640
-- WHEN training step encounters CUDA OOM
-- THEN the step SHALL be skipped and a warning logged
-- AND training SHALL continue with the next batch
+#### Scenario: Phase 2 unfreeze stages 3-4
+
+- GIVEN Phase 1 completed at least one epoch
+- WHEN training transitions to Phase 2
+- THEN backbone stages 3-4 SHALL have requires_grad=True
+- AND stems SHALL remain frozen (requires_grad=False)
+- AND optimizer SHALL use lr=1e-4
+
+#### Scenario: Student training skips two-phase entirely
+
+- GIVEN model_type="student"
+- WHEN training begins
+- THEN no freeze/unfreeze phases SHALL execute
+- AND all model parameters SHALL be trainable from epoch 1
+
+#### Scenario: ConvNeXt-Tiny backbone variant
+
+- GIVEN training config specifies backbone_variant="tiny"
+- WHEN MasterModel is instantiated
+- THEN the ConvNeXt-Tiny backbone (28M params) SHALL replace ConvNeXt-Small (50M params)
 
 ### Requirement: Validation and Checkpointing
 
@@ -153,12 +136,13 @@ After each epoch, the trainer MUST run validation on the val split, compute mAP 
 - WHEN epoch is a multiple of 10
 - THEN a checkpoint SHALL be saved to checkpoints/epoch_{N}.pt
 
-### Requirement: Logging
+## Dependencies
 
-The trainer MUST log to TensorBoard: loss components (cls_loss, reg_loss, total_loss) per step; mAP@0.5, mAP@0.5:0.95 per epoch; learning rate per step; per-class AP per epoch.
+- yolo-nano-student: StudentModel freeze/unfreeze stubs for API compatibility
+- training-metrics: LossHistory feeds training_curves.png generation
 
-#### Scenario: Loss curves logged during training
+## Non-functional
 
-- GIVEN a training step completes
-- WHEN logging is enabled
-- THEN cls_loss, reg_loss, and total_loss SHALL be logged as TensorBoard scalars
+- Model-type branching MUST NOT add measurable overhead to master training loop (<1% wall time)
+- Student training with ~3M params SHOULD complete one epoch in <60s on RTX 3080 (10GB)
+- Config validation MUST reject unknown model_type values at startup

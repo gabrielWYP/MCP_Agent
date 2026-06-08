@@ -27,7 +27,7 @@ from torch.utils.data import DataLoader
 
 from .config import TrainingConfig
 from .loss import YOLOv8Loss
-from .metrics import compute_map, LossHistory
+from .metrics import compute_map, generate_training_curves, LossHistory
 
 
 class Trainer:
@@ -86,35 +86,53 @@ class Trainer:
             print("[Trainer] TensorBoard not available, skipping logging.")
 
     def fit(self) -> dict:
-        """Run both training phases sequentially.
+        """Run training (single-phase for student, two-phase for master).
 
         Returns:
             Dict with final metrics and checkpoint paths.
         """
+        model_label = "StudentModel" if self.config.model_type == "student" else "MasterModel"
+
         print(f"\n{'='*60}")
-        print(f"Training MasterModel on {self.device}")
-        print(f"Phase 1: {self.config.epochs_phase1} epochs (frozen backbone)")
-        print(f"Phase 2: {self.config.epochs_phase2} epochs (unfreeze stages 3-4)")
+        print(f"Training {model_label} on {self.device}")
+
+        if self.config.model_type == "student":
+            print(f"Single-phase: {self.config.epochs} epochs, lr={self.config.lr}")
+        else:
+            print(f"Phase 1: {self.config.epochs_phase1} epochs (frozen backbone)")
+            print(f"Phase 2: {self.config.epochs_phase2} epochs (unfreeze stages 3-4)")
+
         print(f"{'='*60}\n")
 
-        # Phase 1
-        if self.config.epochs_phase1 > 0:
+        if self.config.model_type == "student":
+            # Single-phase student training
             self._train_phase(
                 phase=1,
-                epochs=self.config.epochs_phase1,
-                lr=self.config.lr_phase1,
-                freeze_stages=4,
+                epochs=self.config.epochs,
+                lr=self.config.lr,
+                freeze_stages=0,
             )
+        else:
+            # Two-phase master training
+            if self.config.epochs_phase1 > 0:
+                self._train_phase(
+                    phase=1,
+                    epochs=self.config.epochs_phase1,
+                    lr=self.config.lr_phase1,
+                    freeze_stages=4,
+                )
 
-        # Phase 2
-        if self.config.epochs_phase2 > 0:
-            self._train_phase(
-                phase=2,
-                epochs=self.config.epochs_phase2,
-                lr=self.config.lr_phase2,
-                freeze_stages=2,
-                unfreeze_stages=[2, 3],
-            )
+            if self.config.epochs_phase2 > 0:
+                self._train_phase(
+                    phase=2,
+                    epochs=self.config.epochs_phase2,
+                    lr=self.config.lr_phase2,
+                    freeze_stages=2,
+                    unfreeze_stages=[2, 3],
+                )
+
+        # Generate training curves after training completes
+        generate_training_curves(self.loss_history, self.output_dir)
 
         if self.writer:
             self.writer.close()
@@ -266,7 +284,10 @@ class Trainer:
 
             try:
                 with autocast("cuda", enabled=self.config.amp):
-                    output = self.model(rgb, nir)
+                    if self.config.model_type == "student":
+                        output = self.model(rgb)
+                    else:
+                        output = self.model(rgb, nir)
                     predictions = output["preds"]
 
                     targets = {"bboxes": bboxes, "labels": labels}
@@ -332,7 +353,10 @@ class Trainer:
             nir = batch["nir"].to(self.device)
 
             with autocast("cuda", enabled=self.config.amp):
-                output = self.model(rgb, nir)
+                if self.config.model_type == "student":
+                    output = self.model(rgb)
+                else:
+                    output = self.model(rgb, nir)
 
             # Decode predictions for mAP computation
             preds = output["preds"]  # list of (B, nc+4, H, W)
