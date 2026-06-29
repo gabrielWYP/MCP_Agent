@@ -99,26 +99,37 @@ class StageAttentionFusion(nn.Module):
             rgb_pooled = rgb_feat
             nir_pooled = nir_feat
 
-        # Flatten spatial dims: (N, C, P, P) → (N, P*P, C)
+        # Flatten spatial dims: (N, C, P, P) -> (N, P*P, C)
         rgb_seq = rgb_pooled.flatten(2).permute(0, 2, 1)
         nir_seq = nir_pooled.flatten(2).permute(0, 2, 1)
+        seq_dtype = rgb_seq.dtype
 
-        # Pre-LN
-        rgb_norm = self.norm_rgb(rgb_seq)
-        nir_norm = self.norm_nir(nir_seq)
+        # Multi-head attention is numerically fragile under CUDA autocast with
+        # large feature magnitudes. Run this block in FP32 and cast back after
+        # the transformer-style fusion to keep AMP-safe forward passes.
+        device_type = rgb_feat.device.type
+        with torch.amp.autocast(device_type=device_type, enabled=False):
+            rgb_seq_fp32 = rgb_seq.float()
+            nir_seq_fp32 = nir_seq.float()
 
-        # Cross-attention: Q from RGB, K/V from NIR
-        attn_out, attn_weights = self.attn(
-            query=rgb_norm,
-            key=nir_norm,
-            value=nir_norm,
-        )
+            # Pre-LN
+            rgb_norm = self.norm_rgb(rgb_seq_fp32)
+            nir_norm = self.norm_nir(nir_seq_fp32)
 
-        # Residual + FFN
-        rgb_seq = rgb_seq + attn_out
-        rgb_seq = rgb_seq + self.ffn(rgb_seq)
+            # Cross-attention: Q from RGB, K/V from NIR
+            attn_out, attn_weights = self.attn(
+                query=rgb_norm,
+                key=nir_norm,
+                value=nir_norm,
+            )
 
-        # Restore to spatial map: (N, P*P, C) → (N, C, P, P)
+            # Residual + FFN
+            rgb_seq_fp32 = rgb_seq_fp32 + attn_out
+            rgb_seq_fp32 = rgb_seq_fp32 + self.ffn(rgb_seq_fp32)
+
+        rgb_seq = rgb_seq_fp32.to(seq_dtype)
+
+        # Restore to spatial map: (N, P*P, C) -> (N, C, P, P)
         P = pool_size
         fused_pooled = rgb_seq.permute(0, 2, 1).reshape(N, C, P, P)
 

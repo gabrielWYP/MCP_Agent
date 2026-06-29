@@ -251,6 +251,7 @@ class YOLOv8Loss(nn.Module):
             total_loss: Scalar loss for backward().
             loss_dict: {"box_loss": float, "cls_loss": float}.
         """
+        predictions = [pred.float() for pred in predictions]
         device = predictions[0].device
         B = predictions[0].shape[0]
 

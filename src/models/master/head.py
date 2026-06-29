@@ -8,11 +8,11 @@ Arquitectura por nivel FPN:
                   └─► conv 3×3 ──► conv_reg (4)
 
 Output por nivel: (B, nc + 4, H_i, W_i)
-    - nc = num_classes (sano, danado)
+    - nc = num_classes (mango, danado)
     - 4  = bbox deltas (xywh)
 
 Clases:
-    0: sano
+    0: mango
     1: danado
 
 Para distilación directa con YOLO Nano:
@@ -31,7 +31,7 @@ import torch.nn as nn
 
 
 # Número de clases de detección (sin background — YOLO es class-specific)
-NUM_CLASSES = 2  # sano, danado
+NUM_CLASSES = 2  # mango, danado
 
 
 class DecoupledHead(nn.Module):
@@ -43,7 +43,7 @@ class DecoupledHead(nn.Module):
 
     Args:
         in_channels (int): Canales de entrada del nivel FPN (default 256).
-        num_classes (int): Clases de detección (default 2).
+        num_classes (int): Clases de deteccion (default 2).
     """
 
     def __init__(self, in_channels: int = 256, num_classes: int = NUM_CLASSES):
@@ -102,7 +102,7 @@ class YOLODetectionHead(nn.Module):
 
     Args:
         fpn_channels (int): Canales de cada nivel FPN (default 256).
-        num_classes (int): Clases de detección (default 2).
+        num_classes (int): Clases de deteccion (default 2).
         strides (list[int]): Strides de cada nivel FPN (default [8, 16, 32]).
 
     Forward returns:
