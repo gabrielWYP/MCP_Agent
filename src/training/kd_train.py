@@ -19,7 +19,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from src.training.kd_config import KDConfig
 from src.training.dataset import YOLODataset, collate_fn, build_weighted_sampler
-from src.training.augmentations import get_train_transforms, get_val_transforms
 from src.training.kd_trainer import KDTrainer
 from src.models.student.student_model import StudentModel
 
@@ -73,16 +72,14 @@ def main():
     print(f"  KD weight: {config.kd_weight}, temperature: {config.kd_temperature}")
     print(f"  Distill levels: {config.distill_levels}")
 
-    # Create datasets
-    train_transform = get_train_transforms(config.image_size)
-    val_transform = get_val_transforms(config.image_size)
-
+    # Create datasets. Do not pass explicit transforms here: YOLODataset's
+    # default path keeps spatial augmentations synchronized across RGB, NIR,
+    # and bounding boxes.
     train_dataset = YOLODataset(
         rgb_dir=config.rgb_dir,
         nir_dir=config.nir_dir,
         labels_dir=config.labels_dir,
         split="train",
-        transform=train_transform,
         image_size=config.image_size,
         nir_mean=config.nir_mean,
         nir_std=config.nir_std,
@@ -94,7 +91,6 @@ def main():
         nir_dir=config.nir_dir,
         labels_dir=config.labels_dir,
         split="val",
-        transform=val_transform,
         image_size=config.image_size,
         nir_mean=config.nir_mean,
         nir_std=config.nir_std,
