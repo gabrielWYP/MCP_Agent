@@ -45,7 +45,7 @@ class MasterModel(nn.Module):
     Multimodal master model for cross-modal knowledge distillation.
 
     Args:
-        num_classes (int): Detection classes (default 2: sano, danado).
+        num_classes (int): Detection classes (default 2: mango, danado).
         pretrained_backbone (bool): Load ImageNet weights for ConvNeXt stages.
         fpn_channels (int): FPN output channels (default 256).
         fusion_dropout (float): Dropout in cross-attention fusion.

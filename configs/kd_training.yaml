@@ -29,7 +29,7 @@ letterbox_value: 114
 # --- Loss ---
 box_weight: 7.5
 cls_weight: 0.5
-class_weights: [2.7, 0.5]
+class_weights: [2.7, 0.5]  # [mango, damaged]; keep aligned with teacher training
 
 # --- Optimizer ---
 lr: 0.001

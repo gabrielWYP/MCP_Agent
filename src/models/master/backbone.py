@@ -155,18 +155,23 @@ class DualConvNeXtBackbone(nn.Module):
             rgb_features: [S1, S2, S3, S4]
             nir_features: [S1, S2, S3, S4]
         """
-        # Pass through modality-specific stems
-        rgb_x = self.rgb_stem(rgb)   # (N, 96, H/4, W/4)
-        nir_x = self.nir_stem(nir)   # (N, 96, H/4, W/4)
+        # ConvNeXt stage 4 is numerically fragile under CUDA autocast in this
+        # dual-stream setup. Run the backbone in FP32 so the teacher produces
+        # stable features for both detection and future distillation.
+        device_type = rgb.device.type
+        with torch.amp.autocast(device_type=device_type, enabled=False):
+            # Pass through modality-specific stems
+            rgb_x = self.rgb_stem(rgb.float())   # (N, 96, H/4, W/4)
+            nir_x = self.nir_stem(nir.float())   # (N, 96, H/4, W/4)
 
-        rgb_features, nir_features = [], []
+            rgb_features, nir_features = [], []
 
-        # Pass through shared stages — same weights, different activations
-        for stage in self.shared_stages:
-            rgb_x = stage(rgb_x)
-            nir_x = stage(nir_x)
-            rgb_features.append(rgb_x)
-            nir_features.append(nir_x)
+            # Pass through shared stages: same weights, different activations
+            for stage in self.shared_stages:
+                rgb_x = stage(rgb_x)
+                nir_x = stage(nir_x)
+                rgb_features.append(rgb_x)
+                nir_features.append(nir_x)
 
         return rgb_features, nir_features
 
