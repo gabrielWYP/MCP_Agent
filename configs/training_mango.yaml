@@ -26,7 +26,7 @@ weight_decay: 0.0005
 # Loss
 box_weight: 7.5
 cls_weight: 0.5
-class_weights: [2.7, 0.5]  # [mango, damaged] — more weight on full mango bboxes
+class_weights: [2.7, 0.5]  # [mango, damaged]; instance-balanced from current train labels
 
 # Scheduler
 warmup_epochs: 5

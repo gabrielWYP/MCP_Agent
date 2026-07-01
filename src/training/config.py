@@ -35,7 +35,7 @@ class TrainingConfig:
         weight_decay: AdamW weight decay.
         box_weight: Regression loss weight.
         cls_weight: Classification loss weight.
-        class_weights: Per-class BCE weights [sano, danado].
+        class_weights: Per-class BCE weights [mango, danado].
         warmup_epochs: Linear warmup epochs per phase.
         patience: Early stopping patience (epochs without mAP improvement).
         log_interval: Steps between TensorBoard logs.
