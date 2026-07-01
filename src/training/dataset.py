@@ -18,7 +18,12 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset, WeightedRandomSampler
 
-from .augmentations import get_train_transforms, get_val_transforms
+from .augmentations import (
+    get_rgb_photometric_transforms,
+    get_train_spatial_transforms,
+    get_train_transforms,
+    get_val_transforms,
+)
 
 # ImageNet RGB normalization stats
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
@@ -158,13 +163,18 @@ class YOLODataset(Dataset):
         self.nir_std = nir_std
         self.letterbox_value = letterbox_value
 
-        if transform is None:
-            self.transform = (
-                get_train_transforms(image_size)
-                if split == "train"
-                else get_val_transforms(image_size)
-            )
+        self._uses_default_multimodal_transforms = transform is None
+        if self._uses_default_multimodal_transforms:
+            if split == "train":
+                self.spatial_transform = get_train_spatial_transforms(image_size)
+                self.rgb_photometric_transform = get_rgb_photometric_transforms(image_size)
+            else:
+                self.spatial_transform = None
+                self.rgb_photometric_transform = None
+            self.transform = get_val_transforms(image_size)
         else:
+            self.spatial_transform = None
+            self.rgb_photometric_transform = None
             self.transform = transform
 
         self.pairs = self._load_pairs()
@@ -280,34 +290,39 @@ class YOLODataset(Dataset):
             orig_h, orig_w = rgb_img.shape[:2]
             bboxes = self._rescale_bboxes(bboxes, orig_w, orig_h, scale, pad_x, pad_y)
 
-        # Apply albumentations (bbox-aware)
-        if len(bboxes) > 0:
-            augmented = self.transform(
-                image=rgb_lb,
-                bboxes=bboxes.tolist(),
-                class_labels=labels.tolist(),
+        if self._uses_default_multimodal_transforms:
+            rgb_aug, nir_aug, bboxes_aug, labels_aug = self._apply_default_transforms(
+                rgb_lb=rgb_lb,
+                nir_lb=nir_lb,
+                bboxes=bboxes,
+                labels=labels,
             )
-            rgb_aug = augmented["image"]
-            bboxes_aug = np.array(augmented["bboxes"], dtype=np.float32).reshape(-1, 4) if augmented["bboxes"] else np.zeros((0, 4), dtype=np.float32)
-            labels_aug = np.array(augmented["class_labels"], dtype=np.int64) if augmented["class_labels"] else np.zeros((0,), dtype=np.int64)
         else:
-            augmented = self.transform(image=rgb_lb, bboxes=[], class_labels=[])
-            rgb_aug = augmented["image"]
-            bboxes_aug = np.zeros((0, 4), dtype=np.float32)
-            labels_aug = np.zeros((0,), dtype=np.int64)
-
-        # Apply same spatial transforms to NIR (without bbox params)
-        # We need to apply the same geometric transforms to NIR
-        # Use albumentations ReplayCompose or apply the transform manually
-        # For simplicity, apply a non-bbox version to NIR
-        nir_transform = self._get_spatial_only_transform()
-        if nir_transform is not None and len(bboxes) > 0:
-            # Re-apply with the same random state — use ReplayCompose
-            # For now, apply val transforms to NIR (letterbox already done)
-            pass
-        # NIR gets the same letterbox but no photometric augmentation
-        # (color jitter doesn't apply to single-channel)
-        nir_aug = nir_lb
+            # Backward-compatible custom transform path. Custom callers are
+            # responsible for preserving RGB/NIR geometric alignment.
+            if len(bboxes) > 0:
+                augmented = self.transform(
+                    image=rgb_lb,
+                    bboxes=bboxes.tolist(),
+                    class_labels=labels.tolist(),
+                )
+                rgb_aug = augmented["image"]
+                bboxes_aug = (
+                    np.array(augmented["bboxes"], dtype=np.float32).reshape(-1, 4)
+                    if augmented["bboxes"]
+                    else np.zeros((0, 4), dtype=np.float32)
+                )
+                labels_aug = (
+                    np.array(augmented["class_labels"], dtype=np.int64)
+                    if augmented["class_labels"]
+                    else np.zeros((0,), dtype=np.int64)
+                )
+            else:
+                augmented = self.transform(image=rgb_lb, bboxes=[], class_labels=[])
+                rgb_aug = augmented["image"]
+                bboxes_aug = np.zeros((0, 4), dtype=np.float32)
+                labels_aug = np.zeros((0,), dtype=np.int64)
+            nir_aug = nir_lb
 
         # Normalize RGB (ImageNet stats)
         rgb_tensor = self._normalize_rgb(rgb_aug)
@@ -370,9 +385,55 @@ class YOLODataset(Dataset):
         result = np.clip(result, 0.0, 1.0)
         return result
 
-    def _get_spatial_only_transform(self):
-        """Return None — NIR uses the same letterbox, no additional augmentation needed."""
-        return None
+    def _apply_default_transforms(
+        self,
+        rgb_lb: np.ndarray,
+        nir_lb: np.ndarray,
+        bboxes: np.ndarray,
+        labels: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Apply default transforms while preserving RGB/NIR alignment.
+
+        Training uses one sampled spatial transform for RGB, NIR, and bounding
+        boxes. RGB-only photometric transforms are applied afterwards because
+        they do not change geometry. Validation uses the no-op transform.
+        """
+        bboxes_list = bboxes.tolist() if len(bboxes) > 0 else []
+        labels_list = labels.tolist() if len(labels) > 0 else []
+
+        if self.split == "train" and self.spatial_transform is not None:
+            augmented = self.spatial_transform(
+                image=rgb_lb,
+                nir=nir_lb,
+                bboxes=bboxes_list,
+                class_labels=labels_list,
+            )
+            rgb_aug = augmented["image"]
+            nir_aug = augmented["nir"]
+        else:
+            augmented = self.transform(
+                image=rgb_lb,
+                bboxes=bboxes_list,
+                class_labels=labels_list,
+            )
+            rgb_aug = augmented["image"]
+            nir_aug = nir_lb
+
+        bboxes_aug = (
+            np.array(augmented["bboxes"], dtype=np.float32).reshape(-1, 4)
+            if augmented["bboxes"]
+            else np.zeros((0, 4), dtype=np.float32)
+        )
+        labels_aug = (
+            np.array(augmented["class_labels"], dtype=np.int64)
+            if augmented["class_labels"]
+            else np.zeros((0,), dtype=np.int64)
+        )
+
+        if self.split == "train" and self.rgb_photometric_transform is not None:
+            rgb_aug = self.rgb_photometric_transform(image=rgb_aug)["image"]
+
+        return rgb_aug, nir_aug, bboxes_aug, labels_aug
 
     def _normalize_rgb(self, image: np.ndarray) -> torch.Tensor:
         """Normalize RGB image with ImageNet stats and convert to tensor.
