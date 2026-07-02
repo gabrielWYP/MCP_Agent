@@ -82,6 +82,37 @@ class TestComputeMap:
         # Class 1 has predictions but no GT → AP=0
         assert result["map50"] == pytest.approx(0.0, abs=0.01)
 
+    def test_predictions_do_not_match_ground_truth_from_other_images(self):
+        """Dataset-level AP must match predictions only within the same image."""
+        gt_boxes = [
+            torch.zeros(0, 4),
+            torch.tensor([[0.5, 0.5, 0.2, 0.2]]),
+        ]
+        gt_labels = [
+            torch.zeros(0, dtype=torch.long),
+            torch.tensor([0]),
+        ]
+
+        pred_boxes = [
+            torch.tensor([[0.5, 0.5, 0.2, 0.2]]),
+            torch.zeros(0, 4),
+        ]
+        pred_scores = [
+            torch.tensor([0.99]),
+            torch.zeros(0),
+        ]
+        pred_labels = [
+            torch.tensor([0]),
+            torch.zeros(0, dtype=torch.long),
+        ]
+
+        result = compute_map(
+            pred_boxes, pred_scores, pred_labels,
+            gt_boxes, gt_labels, num_classes=2,
+        )
+
+        assert result["map50"] == pytest.approx(0.0, abs=0.01)
+
     def test_per_class_ap(self):
         """Per-class AP should be reported for each class."""
         gt_boxes = [
