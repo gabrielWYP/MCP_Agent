@@ -106,9 +106,11 @@ annotate_mango_florence.py       convert_nir_labels.py
 | Script / Módulo | Función |
 |-----------------|---------|
 | `scripts/download_oci.py` | Descarga pares RGB+NIR desde bucket OCI |
+| `scripts/prepare_yolo_splits.py` | Crea splits reproducibles y labels YOLO base |
 | `scripts/annotate_mango_florence.py` | Detección de bboxes de mango con Florence-2-large |
 | Label Studio (externo) | Anotación manual de daño en imágenes NIR |
 | `scripts/convert_nir_labels.py` | Conversión NIR→RGB vía matriz de homografía |
+| `scripts/run_training_pipeline.py` | Orquestador del flujo actual por etapas |
 | `src/training/` | Training loop YOLOv8 personalizado |
 | `src/data_pipeline/` | OCI client y descubrimiento de pares RGB/NIR para poblar cache |
 
