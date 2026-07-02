@@ -42,7 +42,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--nir-dir", default="data/cache/mango/nir")
     parser.add_argument("--labels-dir", default="data/annotations/yolo/labels")
     parser.add_argument("--split-manifest", default="data/annotations/yolo/splits.json")
-    parser.add_argument("--label-studio-export", default="data/label_studio_nir/export.json")
+    parser.add_argument("--label-studio-export", default="data/label_studio_nir/Datasetv2_export.json")
     parser.add_argument("--homography", default="notebooks/matriz_homografia_aruco.npy")
     parser.add_argument("--training-config", default="configs/training_mango.yaml")
     parser.add_argument("--florence-model", default="microsoft/Florence-2-large")
@@ -77,6 +77,8 @@ def main() -> int:
                 args.labels_dir,
                 "--manifest",
                 args.split_manifest,
+                "--reviewed-export",
+                args.label_studio_export,
                 "--seed",
                 str(args.seed),
                 "--train-ratio",
