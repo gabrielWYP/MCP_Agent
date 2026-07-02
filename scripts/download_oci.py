@@ -4,7 +4,7 @@ Download RGB+NIR image pairs from OCI to local cache.
 No augmentation, no preprocessing — just listing, pairing, and downloading.
 
 Usage:
-    python3 scripts/download_oci.py [--config config/augmentation.yaml]
+    python3 scripts/download_oci.py [--config config/download_oci.example.yaml]
 """
 import argparse
 import logging
@@ -61,8 +61,8 @@ def main():
     )
     parser.add_argument(
         "--config",
-        default="config/augmentation.yaml",
-        help="Path to pipeline config YAML (default: config/augmentation.yaml)",
+        default="config/download_oci.example.yaml",
+        help="Path to OCI download config YAML (default: config/download_oci.example.yaml)",
     )
     parser.add_argument(
         "--since-date",

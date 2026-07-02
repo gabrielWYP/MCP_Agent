@@ -1,27 +1,18 @@
-"""
-Pipeline configuration with YAML loading and environment variable overrides.
-"""
+"""OCI download configuration with YAML loading and environment overrides."""
 
 import os
 import yaml
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
-
-
-@dataclass
-class NIRStats:
-    """NIR channel normalization statistics."""
-    mean: float = 0.45
-    std: float = 0.22
 
 
 @dataclass
 class PipelineConfig:
-    """
-    Configuration for the data augmentation pipeline.
+    """Configuration for RGB/NIR cache downloads from OCI-compatible storage.
 
-    All fields have sensible defaults and can be overridden via YAML or env vars.
+    Training-specific augmentation, normalization, and homography behavior lives
+    in ``src.training``. This config only covers object listing, pair discovery,
+    and download/cache behavior.
     """
 
     # OCI / S3 settings
@@ -34,19 +25,6 @@ class PipelineConfig:
 
     # Local paths
     cache_dir: str = "data/cache"
-    output_dir: str = "data/augmented"
-    homography_path: Optional[str] = None
-
-    # Image dimensions
-    target_size: tuple[int, int] = (640, 640)
-
-    # Augmentation parameters
-    augmentation_factor: int = 3
-    spatial_intensity: float = 0.4
-    photometric_intensity: float = 0.3
-
-    # NIR normalization
-    nir_stats: NIRStats = field(default_factory=NIRStats)
 
     # Pair discovery settings
     pair_matching: str = "stem"          # "stem" or "timestamp_id"
@@ -57,10 +35,6 @@ class PipelineConfig:
     max_workers: int = 8
     retry_attempts: int = 3
     retry_base_delay: float = 1.0
-
-    # ImageNet RGB normalization (fixed, not configurable)
-    rgb_mean: list[float] = field(default_factory=lambda: [0.485, 0.456, 0.406])
-    rgb_std: list[float] = field(default_factory=lambda: [0.229, 0.224, 0.225])
 
     @classmethod
     def from_yaml(cls, yaml_path: str) -> "PipelineConfig":
@@ -81,39 +55,20 @@ class PipelineConfig:
 
     @classmethod
     def _from_dict(cls, raw: dict) -> "PipelineConfig":
-        """Build PipelineConfig from a raw dict, handling nested nir_stats."""
+        """Build PipelineConfig from a raw dict."""
         kwargs = {}
 
         # Map top-level keys
         simple_keys = [
             "oci_endpoint", "oci_bucket", "oci_prefix", "oci_region",
             "oci_access_key", "oci_secret_key",
-            "cache_dir", "output_dir", "homography_path",
-            "augmentation_factor", "spatial_intensity", "photometric_intensity",
+            "cache_dir",
             "max_workers", "retry_attempts", "retry_base_delay",
-            "rgb_mean", "rgb_std",
             "pair_matching", "min_timestamp", "default_class_name",
         ]
         for key in simple_keys:
             if key in raw:
                 kwargs[key] = raw[key]
-
-        # Handle target_size (may be list in YAML)
-        if "target_size" in raw:
-            ts = raw["target_size"]
-            if isinstance(ts, (list, tuple)) and len(ts) == 2:
-                kwargs["target_size"] = tuple(ts)
-            elif isinstance(ts, int):
-                kwargs["target_size"] = (ts, ts)
-
-        # Handle nir_stats
-        if "nir_stats" in raw:
-            ns = raw["nir_stats"]
-            if isinstance(ns, dict):
-                kwargs["nir_stats"] = NIRStats(
-                    mean=ns.get("mean", 0.45),
-                    std=ns.get("std", 0.22),
-                )
 
         return cls(**kwargs)
 
@@ -126,8 +81,6 @@ class PipelineConfig:
             "S3_ACCESS_KEY": "oci_access_key",
             "S3_SECRET_KEY": "oci_secret_key",
             "CACHE_DIR": "cache_dir",
-            "OUTPUT_DIR": "output_dir",
-            "HOMOGRAPHY_PATH": "homography_path",
             "PAIR_MATCHING": "pair_matching",
             "MIN_TIMESTAMP": "min_timestamp",
             "DEFAULT_CLASS_NAME": "default_class_name",

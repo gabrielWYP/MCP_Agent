@@ -109,9 +109,8 @@ annotate_mango_florence.py       convert_nir_labels.py
 | `scripts/annotate_mango_florence.py` | Detección de bboxes de mango con Florence-2-large |
 | Label Studio (externo) | Anotación manual de daño en imágenes NIR |
 | `scripts/convert_nir_labels.py` | Conversión NIR→RGB vía matriz de homografía |
-| `scripts/annotate_v2.py` | Detección de daño por ROI (umbral NIR sobre bbox mango) |
 | `src/training/` | Training loop YOLOv8 personalizado |
-| `src/data_pipeline/` | OCI client, preprocesamiento, augmentación, vector store |
+| `src/data_pipeline/` | OCI client y descubrimiento de pares RGB/NIR para poblar cache |
 
 ---
 
@@ -163,10 +162,9 @@ openspec/
 ```
 .
 ├── src/
-│   ├── agent/              # LangGraph orchestrator (legacy, en pausa)
+│   ├── agent/              # LangGraph orchestrator (en pausa)
 │   ├── annotation/         # Florence-2, bbox projection, NIR segmentation
-│   ├── data_pipeline/      # OCI client, homography, pair discovery, augmentation
-│   ├── ml_pipeline/        # Training/predict (legacy)
+│   ├── data_pipeline/      # OCI client y pair discovery para cache RGB/NIR
 │   ├── models/
 │   │   ├── master/         # Teacher: DualConvNeXt, Fusion, DualFPN, YOLODetectionHead
 │   │   └── student/        # Student: CSPDarknetNano, PANet, YOLOStudentHead
@@ -176,7 +174,7 @@ openspec/
 │   └── variables/          # Config variables
 ├── scripts/                # Pipeline scripts (download, annotation, conversion)
 ├── tests/
-│   ├── data_pipeline/      # 46 tests (OCI extraction, homography, augmentation)
+│   ├── data_pipeline/      # OCI config y pair discovery
 │   ├── training/           # 30 tests (letterbox, TAL, mAP, training step, e2e)
 │   └── models/student/     # 12 tests (backbone, neck, head, StudentModel integration)
 ├── configs/                # Training configs (training_mango.yaml)
@@ -221,7 +219,7 @@ python -m pytest tests/models/ -v
 # Tests de training loop
 python -m pytest tests/training/ -v
 
-# Tests de data pipeline
+# Tests de descarga/pair discovery
 python -m pytest tests/data_pipeline/ -v
 
 # Todos los tests
