@@ -1,1 +1,0 @@
-from .process import process as predict_process

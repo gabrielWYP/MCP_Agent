@@ -1,17 +1,12 @@
-"""
-Data Augmentation Pipeline for MasterModel.
-
-Bridges OCI object storage to MasterModel-ready dual-stream tensors.
-Pipeline: OCI download -> pair discovery -> preprocess -> augment -> vector store.
-
-Spatial sync strategy: 4-channel temp stack -> albumentations -> split back
-to RGB(3,H,W) + NIR(1,H,W) for MasterModel.forward(rgb, nir).
-"""
+"""OCI cache utilities for RGB/NIR pair discovery and download."""
 
 from src.data_pipeline.config import PipelineConfig
-from src.data_pipeline.pipeline import DataAugmentationPipeline
+from src.data_pipeline.oci_client import OCIManager
+from src.data_pipeline.pair_discovery import PairDiscovery, PairedSample
 
 __all__ = [
     "PipelineConfig",
-    "DataAugmentationPipeline",
+    "OCIManager",
+    "PairDiscovery",
+    "PairedSample",
 ]

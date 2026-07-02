@@ -117,9 +117,8 @@ def run_training_job(state: MLOpsState) -> MLOpsState:
     logger.info("🚀 Node 3: Ejecutando trabajo de entrenamiento...")
     
     try:
-        # TODO: Llamar pipeline real de entrenamiento
-        # from ml_pipeline.training.process import train_model
-        # result = train_model(state["new_data_path"])
+        # TODO: Llamar el entrypoint vigente:
+        # python -m src.training.train --config configs/training_mango.yaml
         
         new_version = state.get("model_version", 2) + 1
         state["model_version"] = new_version
