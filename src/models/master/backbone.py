@@ -25,12 +25,13 @@ from torchvision.models.convnext import ConvNeXt
 SUPPORTED_VARIANTS = {"tiny", "small"}
 
 
-def _build_convnext_tiny_body() -> nn.ModuleList:
+def _build_convnext_tiny_body(pretrained: bool = True) -> nn.ModuleList:
     """
     Extract the 4 stages of ConvNeXt-Tiny (without the stem and classifier).
     Returns them as a ModuleList so we can iterate per-stage.
     """
-    model = convnext_tiny(weights=ConvNeXt_Tiny_Weights.IMAGENET1K_V1)
+    weights = ConvNeXt_Tiny_Weights.IMAGENET1K_V1 if pretrained else None
+    model = convnext_tiny(weights=weights)
     stages = nn.ModuleList([
         model.features[1],   # stage 1  → 96ch,  H/4  x W/4
         nn.Sequential(model.features[2], model.features[3]),   # down + stage 2 → 192ch, H/8  x W/8
@@ -40,12 +41,13 @@ def _build_convnext_tiny_body() -> nn.ModuleList:
     return stages
 
 
-def _build_convnext_small_body() -> nn.ModuleList:
+def _build_convnext_small_body(pretrained: bool = True) -> nn.ModuleList:
     """
     Extract the 4 stages of ConvNeXt-Small (without the stem and classifier).
     Returns them as a ModuleList so we can iterate per-stage.
     """
-    model = convnext_small(weights=ConvNeXt_Small_Weights.IMAGENET1K_V1)
+    weights = ConvNeXt_Small_Weights.IMAGENET1K_V1 if pretrained else None
+    model = convnext_small(weights=weights)
     # model.features is a Sequential with:
     #   [0] stem (Conv2d 4x4 s4 + LayerNorm)
     #   [1] stage 1
@@ -129,15 +131,15 @@ class DualConvNeXtBackbone(nn.Module):
 
         # --- Shared stages ---
         if variant == "tiny":
-            self.shared_stages = _build_convnext_tiny_body()
+            self.shared_stages = _build_convnext_tiny_body(pretrained=pretrained)
         else:
-            self.shared_stages = _build_convnext_small_body()
-
-        # Initialize NIR stem from scratch (RGB stem gets pretrained weights below)
-        self._init_nir_stem()
+            self.shared_stages = _build_convnext_small_body(pretrained=pretrained)
 
         if pretrained:
             self._load_pretrained_rgb_stem()
+            self._load_pretrained_nir_stem()
+        else:
+            self._init_nir_stem()
 
     # ------------------------------------------------------------------
     # Forward
@@ -204,3 +206,23 @@ class DualConvNeXtBackbone(nn.Module):
             "1.norm.bias":   pretrained_model.features[0][1].bias,
         }
         self.rgb_stem.load_state_dict(pretrained_stem_state, strict=False)
+
+    def _load_pretrained_nir_stem(self):
+        """Initialize the 1-channel NIR stem from RGB ImageNet stem weights.
+
+        Averaging pretrained RGB kernels gives the NIR stream low-level edge and
+        texture priors while keeping the stem trainable for 850 nm reflectance.
+        """
+        if self.variant == "tiny":
+            pretrained_model = convnext_tiny(weights=ConvNeXt_Tiny_Weights.IMAGENET1K_V1)
+        else:
+            pretrained_model = convnext_small(weights=ConvNeXt_Small_Weights.IMAGENET1K_V1)
+
+        rgb_weight = pretrained_model.features[0][0].weight
+        pretrained_stem_state = {
+            "0.weight": rgb_weight.mean(dim=1, keepdim=True),
+            "0.bias": pretrained_model.features[0][0].bias,
+            "1.norm.weight": pretrained_model.features[0][1].weight,
+            "1.norm.bias": pretrained_model.features[0][1].bias,
+        }
+        self.nir_stem.load_state_dict(pretrained_stem_state, strict=False)

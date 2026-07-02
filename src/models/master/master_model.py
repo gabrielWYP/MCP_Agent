@@ -177,11 +177,13 @@ class MasterModel(nn.Module):
             freeze_stages: Number of stages to freeze (0-4).
                            0 = freeze nothing, 4 = freeze all stages.
         """
-        # Freeze stems
+        # Freeze RGB stem: it starts from ImageNet and is high-risk to overfit.
         for param in self.backbone.rgb_stem.parameters():
             param.requires_grad = False
+
+        # Keep NIR stem trainable: it is the modality adapter for 850 nm images.
         for param in self.backbone.nir_stem.parameters():
-            param.requires_grad = False
+            param.requires_grad = True
 
         # Freeze shared stages up to freeze_stages
         for i, stage in enumerate(self.backbone.shared_stages):
@@ -190,7 +192,10 @@ class MasterModel(nn.Module):
                     param.requires_grad = False
 
         frozen = freeze_stages
-        print(f"[MasterModel] Frozen: stems + first {frozen} shared stages.")
+        print(
+            f"[MasterModel] Frozen: RGB stem + first {frozen} shared stages. "
+            "NIR stem remains trainable."
+        )
 
     def unfreeze_backbone_stages(self, unfreeze_stages: list[int]):
         """
@@ -205,7 +210,10 @@ class MasterModel(nn.Module):
                 for param in stage.parameters():
                     param.requires_grad = True
 
-        print(f"[MasterModel] Unfrozen stages: {unfreeze_stages}. Stems remain frozen.")
+        print(
+            f"[MasterModel] Unfrozen stages: {unfreeze_stages}. "
+            "RGB stem remains frozen; NIR stem remains trainable."
+        )
 
     def count_parameters(self) -> dict[str, int]:
         """Returns parameter counts per module."""
