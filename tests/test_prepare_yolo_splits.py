@@ -6,6 +6,7 @@ from scripts.prepare_yolo_splits import (
     SplitConfig,
     assign_splits,
     discover_paired_rgb_stems,
+    load_reviewed_rgb_stems,
     write_empty_label_files,
 )
 
@@ -50,3 +51,26 @@ def test_write_empty_label_files_creates_split_dirs(tmp_path: Path) -> None:
     assert (labels_dir / "train" / "mango_rgb_001.txt").exists()
     assert (labels_dir / "val" / "mango_rgb_002.txt").exists()
     assert (labels_dir / "test" / "mango_rgb_003.txt").exists()
+
+
+def test_load_reviewed_rgb_stems_counts_empty_results_as_reviewed(tmp_path: Path) -> None:
+    export_path = tmp_path / "export.json"
+    export_path.write_text(
+        """
+        [
+          {
+            "file_upload": "abc-mango_nir_001.jpg",
+            "annotations": [{"result": []}]
+          },
+          {
+            "data": {"image": "/data/upload/1/def-mango_nir_002.jpg"},
+            "annotations": [{"result": [{"type": "rectanglelabels"}]}]
+          }
+        ]
+        """
+    )
+
+    assert load_reviewed_rgb_stems(export_path) == {
+        "mango_rgb_001",
+        "mango_rgb_002",
+    }

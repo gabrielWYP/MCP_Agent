@@ -55,6 +55,34 @@ def discover_paired_rgb_stems(rgb_dir: Path, nir_dir: Path) -> list[str]:
     return stems
 
 
+def extract_label_studio_image_name(task: dict) -> str:
+    """Extract the original image filename from a Label Studio task."""
+    for candidate in (task.get("file_upload", ""), task.get("data", {}).get("image", "")):
+        if not candidate:
+            continue
+        name = Path(candidate).name
+        return name.split("-", 1)[1] if "-" in name else name
+    return ""
+
+
+def load_reviewed_rgb_stems(export_path: Path) -> set[str]:
+    """Load RGB stems represented in a Label Studio export.
+
+    The export is treated as the source of truth for images that were reviewed
+    by a human. Tasks with an empty ``result`` still count as reviewed negatives.
+    """
+    with export_path.open() as file:
+        tasks = json.load(file)
+
+    stems: set[str] = set()
+    for task in tasks:
+        image_name = extract_label_studio_image_name(task)
+        if not image_name:
+            continue
+        stems.add(Path(image_name).stem.replace("_nir", "_rgb"))
+    return stems
+
+
 def assign_splits(stems: list[str], config: SplitConfig) -> dict[str, list[str]]:
     """Assign stems to train/val/test deterministically."""
     config.validate()
@@ -114,6 +142,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--labels-dir", default="data/annotations/yolo/labels")
     parser.add_argument("--manifest", default="data/annotations/yolo/splits.json")
     parser.add_argument("--label-studio-tasks", default="data/annotations/label_studio_nir/tasks.json")
+    parser.add_argument(
+        "--reviewed-export",
+        default=None,
+        help="Optional Label Studio export JSON used to restrict splits to reviewed images.",
+    )
     parser.add_argument("--train-ratio", type=float, default=0.8)
     parser.add_argument("--val-ratio", type=float, default=0.1)
     parser.add_argument("--test-ratio", type=float, default=0.1)
@@ -129,6 +162,17 @@ def main() -> int:
     labels_dir = Path(args.labels_dir)
 
     stems = discover_paired_rgb_stems(rgb_dir, nir_dir)
+    if args.reviewed_export:
+        reviewed_stems = load_reviewed_rgb_stems(Path(args.reviewed_export))
+        before_count = len(stems)
+        stems = [stem for stem in stems if stem in reviewed_stems]
+        logger.info(
+            "Restricted split candidates using %s: %d -> %d images",
+            args.reviewed_export,
+            before_count,
+            len(stems),
+        )
+
     if not stems:
         logger.error("No paired RGB/NIR images found under %s and %s", rgb_dir, nir_dir)
         return 1
