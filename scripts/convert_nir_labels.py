@@ -74,6 +74,59 @@ def xyxy_to_yolo_cxcywh(
     return (cx, cy, w, h)
 
 
+def yolo_cxcywh_to_xyxy(
+    cx: float,
+    cy: float,
+    width: float,
+    height: float,
+    img_w: int,
+    img_h: int,
+) -> tuple[int, int, int, int]:
+    """Convert normalized YOLO cxcywh format to pixel xyxy coordinates."""
+    x1 = int((cx - width / 2.0) * img_w)
+    y1 = int((cy - height / 2.0) * img_h)
+    x2 = int((cx + width / 2.0) * img_w)
+    y2 = int((cy + height / 2.0) * img_h)
+    return (
+        max(0, x1),
+        max(0, y1),
+        min(img_w, x2),
+        min(img_h, y2),
+    )
+
+
+def parse_mango_bbox_from_yolo_line(
+    line: str,
+    img_w: int,
+    img_h: int,
+) -> tuple[int, int, int, int] | None:
+    """Parse a class-0 YOLO line into a mango bbox in pixel xyxy coordinates."""
+    parts = line.strip().split()
+    if len(parts) < 5 or parts[0] != "0":
+        return None
+    try:
+        cx, cy, width, height = (float(value) for value in parts[1:5])
+    except ValueError:
+        return None
+    return yolo_cxcywh_to_xyxy(cx, cy, width, height, img_w, img_h)
+
+
+def bbox_center_inside(
+    inner_bbox: tuple[int, int, int, int],
+    outer_bbox: tuple[int, int, int, int],
+    margin: int = 0,
+) -> bool:
+    """Return True when the center of ``inner_bbox`` lies inside ``outer_bbox``."""
+    x1, y1, x2, y2 = inner_bbox
+    ox1, oy1, ox2, oy2 = outer_bbox
+    center_x = (x1 + x2) / 2.0
+    center_y = (y1 + y2) / 2.0
+    return (
+        ox1 - margin <= center_x <= ox2 + margin
+        and oy1 - margin <= center_y <= oy2 + margin
+    )
+
+
 def extract_label_studio_image_name(task: dict) -> str:
     """Extract the original NIR image filename from a Label Studio task."""
     candidates = [
@@ -123,6 +176,8 @@ def main():
                         help="Directory with RGB images used for YOLO training")
     parser.add_argument("--nir-dir", default="data/cache/mango/nir",
                         help="Directory with NIR images annotated in Label Studio")
+    parser.add_argument("--mango-margin-px", type=int, default=0,
+                        help="Pixel margin around mango bbox for accepting damage boxes")
     args = parser.parse_args()
 
     # Load homography
@@ -214,23 +269,38 @@ def main():
         source_label_path = splits_dir / split / f"{rgb_stem}.txt"
         label_path = output_dir / split / f"{rgb_stem}.txt"
         mango_line = None
+        mango_bbox = None
         if source_label_path.exists():
             with open(source_label_path) as f:
                 for line in f:
                     if line.startswith("0 "):
                         mango_line = line.strip()
+                        mango_bbox = parse_mango_bbox_from_yolo_line(mango_line, rgb_w, rgb_h)
                         break
+
+        if mango_bbox is None:
+            logger.warning("No valid mango bbox for %s, skipping damage labels", rgb_stem)
+            skipped += 1
+            continue
+
+        valid_damage_bboxes = [
+            bbox
+            for bbox in damage_bboxes_rgb
+            if bbox_center_inside(bbox, mango_bbox, margin=args.mango_margin_px)
+        ]
+        dropped = len(damage_bboxes_rgb) - len(valid_damage_bboxes)
+        if dropped:
+            logger.info("  %s: dropped %d damage bboxes outside mango", rgb_stem, dropped)
 
         label_path.parent.mkdir(parents=True, exist_ok=True)
         with open(label_path, "w") as f:
-            if mango_line:
-                f.write(mango_line + "\n")
-            for x1, y1, x2, y2 in damage_bboxes_rgb:
+            f.write(mango_line + "\n")
+            for x1, y1, x2, y2 in valid_damage_bboxes:
                 cx, cy, w, h = xyxy_to_yolo_cxcywh(x1, y1, x2, y2, rgb_w, rgb_h)
                 f.write(f"1 {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}\n")
 
         updated += 1
-        logger.info(f"  {rgb_stem}: {len(damage_bboxes_rgb)} damage bboxes → {split}")
+        logger.info(f"  {rgb_stem}: {len(valid_damage_bboxes)} damage bboxes → {split}")
 
     print(f"\n{'='*50}")
     print(f"Updated: {updated} labels")
