@@ -63,5 +63,10 @@ data/annotations/
 data/label_studio*/
 checkpoints/
 
+# Pero SÍ versionar exports de Label Studio NIR para reproducir entrenamiento
+!data/label_studio_nir/
+!data/label_studio_nir/*.json
+!data/label_studio_nir/*.xml
+
 # Pero SÍ permitir los zips del dataset
 !data/mango_*.zip
