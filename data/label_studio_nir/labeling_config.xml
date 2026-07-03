@@ -1,0 +1,7 @@
+<View>
+  <Image name="nir" value="$image" zoom="true" brightnessControl="true" contrastControl="true"/>
+
+  <RectangleLabels name="damage" toName="nir">
+    <Label value="damage" background="#FF0000"/>
+  </RectangleLabels>
+</View>
