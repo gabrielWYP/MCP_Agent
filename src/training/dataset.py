@@ -12,11 +12,12 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Callable
+import warnings
 
 import cv2
 import numpy as np
 import torch
-from torch.utils.data import Dataset, WeightedRandomSampler
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 
 from .augmentations import (
     get_rgb_photometric_transforms,
@@ -546,3 +547,77 @@ def build_weighted_sampler(dataset: YOLODataset) -> WeightedRandomSampler:
         num_samples=len(dataset),
         replacement=True,
     )
+
+
+def build_dataloader(
+    dataset: Dataset,
+    batch_size: int,
+    *,
+    num_workers: int = 0,
+    shuffle: bool = False,
+    sampler=None,
+    collate_fn=None,
+    pin_memory: bool = True,
+    drop_last: bool = False,
+    **kwargs,
+) -> DataLoader:
+    """Build a DataLoader with graceful fallback to single-process loading.
+
+    Some environments (WSL, containers with network-mounted /tmp, certain
+    FUSE filesystems) cannot create the Unix sockets that PyTorch's
+    multiprocessing uses to share file descriptors between workers. This
+    manifests as ``OSError: [Errno 95] Operation not supported`` when the
+    DataLoader starts iterating.
+
+    To keep the pipeline robust, we probe the requested ``num_workers`` with
+    a single-batch iterator. If the probe fails, we fall back to
+    ``num_workers=0`` and emit a warning instead of crashing.
+
+    Args:
+        dataset: PyTorch Dataset.
+        batch_size: Batch size.
+        num_workers: Number of worker processes to request.
+        shuffle: Whether to shuffle the dataset.
+        sampler: Optional sampler.
+        collate_fn: Optional collate function.
+        pin_memory: Whether to pin memory.
+        drop_last: Whether to drop the last incomplete batch.
+        **kwargs: Additional DataLoader arguments.
+
+    Returns:
+        A DataLoader configured with ``num_workers`` if supported, otherwise
+        with ``num_workers=0``.
+    """
+    loader_kwargs = {
+        "batch_size": batch_size,
+        "shuffle": shuffle,
+        "sampler": sampler,
+        "collate_fn": collate_fn,
+        "num_workers": num_workers,
+        "pin_memory": pin_memory,
+        "drop_last": drop_last,
+        **kwargs,
+    }
+    loader = DataLoader(dataset, **loader_kwargs)
+
+    if num_workers == 0:
+        return loader
+
+    # Probe that multiprocessing IPC actually works in this environment.
+    # We use a tiny batch to avoid wasting work; if it fails we recreate the
+    # loader with num_workers=0 so training can still proceed (slower).
+    probe_kwargs = {**loader_kwargs, "batch_size": min(batch_size, 1), "drop_last": False}
+    probe = DataLoader(dataset, **probe_kwargs)
+    try:
+        next(iter(probe))
+    except (OSError, RuntimeError) as exc:
+        warnings.warn(
+            f"DataLoader multiprocessing failed ({exc!r}); falling back to "
+            f"num_workers=0. Training will continue in single-process mode, "
+            f"which is slower. If you need workers, run from a native Linux "
+            f"filesystem or set TMPDIR to a directory that supports Unix sockets.",
+            stacklevel=2,
+        )
+        loader_kwargs["num_workers"] = 0
+        loader = DataLoader(dataset, **loader_kwargs)
+    return loader

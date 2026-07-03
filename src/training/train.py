@@ -18,7 +18,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from src.training.config import TrainingConfig
-from src.training.dataset import YOLODataset, collate_fn, build_weighted_sampler
+from src.training.dataset import YOLODataset, build_dataloader, collate_fn, build_weighted_sampler
 from src.training.loop import Trainer
 from src.models.master.master_model import MasterModel
 from src.models.student.student_model import StudentModel
@@ -115,9 +115,9 @@ def main():
 
     print(f"Dataset: {len(train_dataset)} train, {len(val_dataset)} val images")
 
-    # DataLoaders
+    # DataLoaders (with graceful fallback to num_workers=0 if IPC sockets fail)
     train_sampler = build_weighted_sampler(train_dataset)
-    train_loader = torch.utils.data.DataLoader(
+    train_loader = build_dataloader(
         train_dataset,
         batch_size=config.batch_size,
         sampler=train_sampler,
@@ -127,7 +127,7 @@ def main():
         drop_last=True,
     )
 
-    val_loader = torch.utils.data.DataLoader(
+    val_loader = build_dataloader(
         val_dataset,
         batch_size=config.batch_size,
         shuffle=False,
