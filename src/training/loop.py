@@ -76,6 +76,7 @@ class Trainer:
         self.best_map50 = 0.0
         self.patience_counter = 0
         self.global_step = 0
+        self.history_epoch = 0
 
         # TensorBoard
         self.writer = None
@@ -140,9 +141,14 @@ class Trainer:
         return {
             "best_map50": self.best_map50,
             "loss_history": {
+                "epoch": self.loss_history.epoch,
+                "phase": self.loss_history.phase,
                 "cls_loss": self.loss_history.cls_loss,
                 "box_loss": self.loss_history.box_loss,
                 "total_loss": self.loss_history.total_loss,
+                "map50": self.loss_history.map50,
+                "map_50_95": self.loss_history.map_50_95,
+                "extra_losses": self.loss_history.extra_losses,
             },
             "checkpoint": str(self.output_dir / "best_model.pt"),
         }
@@ -217,18 +223,43 @@ class Trainer:
 
             # Log
             map50 = val_metrics.get("map50", 0.0)
+            map_50_95 = val_metrics.get("map_50_95", 0.0)
+            per_class_ap_50 = val_metrics.get("per_class_ap_50", {})
+            per_class_ap_50_95 = val_metrics.get("per_class_ap_50_95", {})
+            ap50_text = ", ".join(
+                f"AP50[c{cls_id}]={ap:.4f}"
+                for cls_id, ap in sorted(per_class_ap_50.items())
+            )
+            extra_loss_text = "".join(
+                f", {name}={value:.4f}"
+                for name, value in sorted(train_metrics.items())
+                if name.endswith("_loss") and name not in {"cls_loss", "box_loss", "total_loss"}
+            )
             print(
                 f"  [P{phase}] Epoch {epoch:02d}/{epochs} | "
                 f"loss={train_metrics['total_loss']:.4f} "
-                f"(cls={train_metrics['cls_loss']:.4f}, box={train_metrics['box_loss']:.4f}) | "
-                f"mAP@0.5={map50:.4f} | {elapsed:.1f}s"
+                f"(cls={train_metrics['cls_loss']:.4f}, box={train_metrics['box_loss']:.4f}{extra_loss_text}) | "
+                f"mAP@0.5={map50:.4f} | mAP@0.5:0.95={map_50_95:.4f} | "
+                f"{ap50_text} | {elapsed:.1f}s"
             )
 
-            # Record loss history
+            # Record epoch history for CSV + plots.
+            self.history_epoch += 1
             self.loss_history.update(
                 cls=train_metrics["cls_loss"],
                 box=train_metrics["box_loss"],
                 total=train_metrics["total_loss"],
+                epoch=self.history_epoch,
+                phase=phase,
+                map50=map50,
+                map_50_95=map_50_95,
+                per_class_ap_50=per_class_ap_50,
+                per_class_ap_50_95=per_class_ap_50_95,
+                extra_losses={
+                    name: value
+                    for name, value in train_metrics.items()
+                    if name.endswith("_loss") and name not in {"cls_loss", "box_loss", "total_loss"}
+                },
             )
 
             # TensorBoard logging
