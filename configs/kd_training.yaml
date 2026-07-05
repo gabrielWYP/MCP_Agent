@@ -17,7 +17,7 @@ distill_levels:
 epochs: 80
 patience: 30
 amp: false
-batch_size: 4
+batch_size: 8
 model_type: student
 
 # --- Model ---
@@ -29,7 +29,7 @@ letterbox_value: 114
 # --- Loss ---
 box_weight: 7.5
 cls_weight: 0.5
-class_weights: [2.7, 0.5]  # [mango, damaged]; keep aligned with teacher training
+class_weights: [1.27, 0.83]  # [mango, damaged]; keep aligned with teacher training
 
 # --- Optimizer ---
 lr: 0.001
