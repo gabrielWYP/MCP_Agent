@@ -42,3 +42,9 @@ pyyaml
 matplotlib
 transformers==4.39.3
 accelerate
+
+# --- Florence-2 large attention (needed by the HF model) ---
+# NOTE: flash-attn requires CUDA build; on Lightning AI it may fail to install.
+# If training environment cannot compile it, use Florence-2-base or keep these commented.
+einops>=0.7.0
+flash-attn>=2.5.0
