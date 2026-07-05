@@ -8,7 +8,12 @@ physically meaningful.
 
 from __future__ import annotations
 
+import logging
+from collections import Counter
+
 import albumentations as A
+
+logger = logging.getLogger(__name__)
 
 
 def _bbox_params(min_visibility: float, min_area: float) -> A.BboxParams:
@@ -147,3 +152,74 @@ def get_val_transforms(image_size: int = 640) -> A.Compose:
         [A.NoOp()],
         bbox_params=_bbox_params(min_visibility=0.1, min_area=1.0),
     )
+
+
+def apply_transforms_with_bbox_tracking(
+    transform: A.Compose,
+    image,
+    bboxes: list[list[float]],
+    class_labels: list[int],
+    *,
+    nir=None,
+    log_level: int = logging.INFO,
+) -> dict:
+    """Apply an Albumentations transform and log per-class bbox drop rates.
+
+    Spatial transforms with ``min_visibility`` / ``min_area`` filtering can
+    silently drop bounding boxes — especially small damage bboxes. This wrapper
+    counts bboxes per class before and after the transform call and logs the
+    difference so training runs surface augmentation-induced data loss.
+
+    Args:
+        transform: An Albumentations Compose (typically from
+            ``get_train_spatial_transforms`` or ``get_train_transforms``).
+        image: The input image (numpy array).
+        bboxes: YOLO-format bounding boxes ``[[x, y, w, h], ...]``.
+        class_labels: Integer class labels aligned with *bboxes*.
+        nir: Optional NIR image for multimodal transforms.
+        log_level: Logging level for the drop summary. Defaults to INFO.
+
+    Returns:
+        The dict returned by ``transform(...)`` (keys: ``image``, ``bboxes``,
+        ``class_labels``, and optionally ``nir``).
+    """
+    # Count bboxes per class BEFORE transform
+    before_counts: Counter[int] = Counter(class_labels)
+
+    # Build transform input kwargs
+    kwargs: dict = {
+        "image": image,
+        "bboxes": bboxes,
+        "class_labels": class_labels,
+    }
+    if nir is not None:
+        kwargs["nir"] = nir
+
+    result = transform(**kwargs)
+
+    # Count bboxes per class AFTER transform
+    after_counts: Counter[int] = Counter(result["class_labels"])
+
+    # Log drop summary
+    mango_before = before_counts.get(0, 0)
+    damage_before = before_counts.get(1, 0)
+    mango_after = after_counts.get(0, 0)
+    damage_after = after_counts.get(1, 0)
+
+    mango_dropped = mango_before - mango_after
+    damage_dropped = damage_before - damage_after
+
+    if mango_dropped > 0 or damage_dropped > 0:
+        logger.log(
+            log_level,
+            "Augmentation bbox drops — before: mango=%d, damage=%d; "
+            "after: mango=%d, damage=%d (dropped: mango=%d, damage=%d)",
+            mango_before,
+            damage_before,
+            mango_after,
+            damage_after,
+            mango_dropped,
+            damage_dropped,
+        )
+
+    return result
