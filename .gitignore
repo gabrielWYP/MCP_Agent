@@ -61,7 +61,7 @@ data/cache/
 data/augmented/
 data/annotations/
 data/label_studio*/
-checkpoints/
+checkpoints/**/checkpoint*.pt
 
 # Pero SÍ versionar exports de Label Studio NIR para reproducir entrenamiento
 !data/label_studio_nir/
@@ -70,3 +70,38 @@ checkpoints/
 
 # Pero SÍ permitir los zips del dataset
 !data/mango_*.zip
+
+# Heavy model checkpoints
+checkpoints/**/*.pt
+
+# Keep lightweight training artifacts
+!checkpoints/**/*.png
+!checkpoints/**/*.csv
+!checkpoints/**/*.json
+
+# Heavy model checkpoints
+checkpoints/**/*.pt
+
+# Keep lightweight training artifacts
+!checkpoints/**/*.png
+!checkpoints/**/*.csv
+!checkpoints/**/*.json
+
+# Heavy model checkpoints
+checkpoints/**/*.pt
+
+# Keep lightweight training artifacts
+!checkpoints/**/*.png
+!checkpoints/**/*.csv
+!checkpoints/**/*.json
+
+# Heavy model checkpoints
+checkpoints/**/*.pt
+
+# Keep lightweight training artifacts
+!checkpoints/**/*.png
+!checkpoints/**/*.csv
+!checkpoints/**/*.json
+
+# Heavy model checkpoints
+checkpoints/**/*.pt

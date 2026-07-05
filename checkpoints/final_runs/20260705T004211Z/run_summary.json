@@ -1,0 +1,59 @@
+{
+  "results": [
+    {
+      "best_map50": 0.21627682074904442,
+      "checkpoint": "checkpoints/final_runs/20260705T004211Z/maestro/best_model_20260705T004211Z_mAP0p2163/best_model.pt",
+      "command": [
+        "/home/zeus/miniconda3/envs/cloudspace/bin/python",
+        "-m",
+        "src.training.train",
+        "--config",
+        "configs/training_mango.yaml",
+        "--model",
+        "master",
+        "--override",
+        "output_dir=checkpoints/final_runs/20260705T004211Z/.partial/maestro"
+      ],
+      "output_dir": "checkpoints/final_runs/20260705T004211Z/maestro/best_model_20260705T004211Z_mAP0p2163",
+      "stage_key": "maestro",
+      "stage_label": "Maestro"
+    },
+    {
+      "best_map50": 0.3939966522157192,
+      "checkpoint": "checkpoints/final_runs/20260705T004211Z/estudiante/best_model_20260705T004211Z_mAP0p3940/best_model.pt",
+      "command": [
+        "/home/zeus/miniconda3/envs/cloudspace/bin/python",
+        "-m",
+        "src.training.train",
+        "--config",
+        "configs/training_student.yaml",
+        "--model",
+        "student",
+        "--override",
+        "output_dir=checkpoints/final_runs/20260705T004211Z/.partial/estudiante"
+      ],
+      "output_dir": "checkpoints/final_runs/20260705T004211Z/estudiante/best_model_20260705T004211Z_mAP0p3940",
+      "stage_key": "estudiante",
+      "stage_label": "Estudiante"
+    },
+    {
+      "best_map50": 0.488459300249815,
+      "checkpoint": "checkpoints/final_runs/20260705T004211Z/destilado/best_model_20260705T004211Z_mAP0p4885/best_model.pt",
+      "command": [
+        "/home/zeus/miniconda3/envs/cloudspace/bin/python",
+        "-m",
+        "src.training.kd_train",
+        "--config",
+        "configs/kd_training.yaml",
+        "--override",
+        "output_dir=checkpoints/final_runs/20260705T004211Z/.partial/destilado",
+        "teacher_checkpoint=checkpoints/final_runs/20260705T004211Z/maestro/best_model_20260705T004211Z_mAP0p2163/best_model.pt"
+      ],
+      "output_dir": "checkpoints/final_runs/20260705T004211Z/destilado/best_model_20260705T004211Z_mAP0p4885",
+      "stage_key": "destilado",
+      "stage_label": "Destilado"
+    }
+  ],
+  "run_dir": "checkpoints/final_runs/20260705T004211Z",
+  "run_id": "20260705T004211Z"
+}
