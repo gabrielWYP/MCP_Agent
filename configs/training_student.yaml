@@ -18,7 +18,7 @@ image_size: 640
 letterbox_value: 114
 
 # Training — single-phase
-batch_size: 4
+batch_size: 8
 epochs: 50
 lr: 0.001
 weight_decay: 0.0005
@@ -26,7 +26,7 @@ weight_decay: 0.0005
 # Loss
 box_weight: 7.5
 cls_weight: 0.5
-class_weights: [2.7, 0.5]
+class_weights: [1.27, 0.83]
 
 # Scheduler
 warmup_epochs: 5
