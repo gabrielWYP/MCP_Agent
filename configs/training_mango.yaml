@@ -16,7 +16,7 @@ image_size: 640
 letterbox_value: 114
 
 # Training — Phase 1 warmup + Phase 2 backbone unfreeze
-batch_size: 4
+batch_size: 8
 epochs_phase1: 80
 epochs_phase2: 0          # Skip Phase 2 — unfreezing hurts with small dataset
 lr_phase1: 0.0005
@@ -26,7 +26,7 @@ weight_decay: 0.0005
 # Loss
 box_weight: 7.5
 cls_weight: 0.5
-class_weights: [2.7, 0.5]  # [mango, damaged]; instance-balanced from current train labels
+class_weights: [1.27, 0.83]  # [mango, damaged]; instance-balanced from current train labels
 
 # Scheduler
 warmup_epochs: 5
