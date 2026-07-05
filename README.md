@@ -111,8 +111,49 @@ annotate_mango_florence.py       convert_nir_labels.py
 | Label Studio (externo) | Anotación manual de daño en imágenes NIR |
 | `scripts/convert_nir_labels.py` | Conversión NIR→RGB vía matriz de homografía |
 | `scripts/run_training_pipeline.py` | Orquestador del flujo actual por etapas |
+| `scripts/run_final_training_pipeline.py` | Entrena maestro, estudiante baseline y estudiante destilado con carpetas versionadas por timestamp y mAP |
 | `src/training/` | Training loop YOLOv8 personalizado |
 | `src/data_pipeline/` | OCI client y descubrimiento de pares RGB/NIR para poblar cache |
+
+### Pipeline final de entrenamiento
+
+```bash
+.venv/bin/python scripts/run_final_training_pipeline.py
+```
+
+Por defecto genera una ejecución autocontenida en `checkpoints/final_runs/<timestamp>/` con tres ramas:
+
+- `maestro/best_model_<timestamp>_mAP<score>/`
+- `estudiante/best_model_<timestamp>_mAP<score>/`
+- `destilado/best_model_<timestamp>_mAP<score>/`
+
+Cada carpeta conserva `best_model.pt`, checkpoints intermedios, `metrics_history.csv`, `training_curves.png`, `loss_curves.png`, `map_curves.png`, AP por clase y logs. La raíz de la ejecución incluye `run_summary.json` y `final_metrics_summary.png` para comparar inmediatamente el mejor mAP@0.5 de las tres etapas.
+
+Los entrenamientos independientes también pueden usar la misma estructura con `--versioned-run`:
+
+```bash
+RUN_ID=20260704T000000Z
+
+.venv/bin/python -m src.training.train \
+  --config configs/training_mango.yaml \
+  --model master \
+  --versioned-run \
+  --run-timestamp "$RUN_ID"
+
+.venv/bin/python -m src.training.train \
+  --config configs/training_student.yaml \
+  --model student \
+  --versioned-run \
+  --run-timestamp "$RUN_ID"
+
+.venv/bin/python -m src.training.kd_train \
+  --config configs/kd_training.yaml \
+  --override teacher_checkpoint=checkpoints/final_runs/$RUN_ID/maestro/best_model_${RUN_ID}_mAP<score>/best_model.pt \
+  --versioned-run \
+  --run-timestamp "$RUN_ID"
+```
+
+Si no se pasa `--run-timestamp`, cada comando crea su propio timestamp. Para agrupar maestro, estudiante y destilado bajo la misma raíz, reutiliza el mismo `RUN_ID`.
 
 ---
 

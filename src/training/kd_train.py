@@ -20,6 +20,12 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from src.training.kd_config import KDConfig
 from src.training.dataset import YOLODataset, collate_fn, build_weighted_sampler
 from src.training.kd_trainer import KDTrainer
+from src.training.run_artifacts import (
+    build_versioned_stage_plan,
+    collect_stage_results,
+    finalize_stage,
+    write_run_summary,
+)
 from src.models.student.student_model import StudentModel
 
 
@@ -36,6 +42,21 @@ def parse_args() -> argparse.Namespace:
         nargs="*",
         default=[],
         help="Override config values: key=value pairs.",
+    )
+    parser.add_argument(
+        "--versioned-run",
+        action="store_true",
+        help="Write this run using the timestamped final_runs artifact layout.",
+    )
+    parser.add_argument(
+        "--run-root",
+        default="checkpoints/final_runs",
+        help="Root directory for --versioned-run outputs.",
+    )
+    parser.add_argument(
+        "--run-timestamp",
+        default=None,
+        help="Optional timestamp/run ID for --versioned-run.",
     )
     return parser.parse_args()
 
@@ -58,6 +79,20 @@ def main():
             elif isinstance(current, float):
                 value = float(value)
             setattr(config, key, value)
+
+    versioned_plan = None
+    if args.versioned_run:
+        versioned_plan = build_versioned_stage_plan(
+            output_root=args.run_root,
+            stage_key="destilado",
+            run_id=args.run_timestamp,
+        )
+        if versioned_plan.tmp_dir.exists():
+            raise FileExistsError(f"Partial run directory already exists: {versioned_plan.tmp_dir}")
+        config.output_dir = str(versioned_plan.tmp_dir)
+        print(f"Versioned run: {versioned_plan.run_dir}")
+        print(f"  Stage: {versioned_plan.stage_key}")
+        print(f"  Temporary output: {versioned_plan.tmp_dir}")
 
     # Set seed
     torch.manual_seed(config.seed)
@@ -135,10 +170,24 @@ def main():
 
     results = trainer.fit()
 
+    final_checkpoint = results["checkpoint"]
+    if versioned_plan is not None:
+        stage_result = finalize_stage(
+            tmp_dir=versioned_plan.tmp_dir,
+            final_parent=versioned_plan.final_parent,
+            run_id=versioned_plan.run_id,
+            command=[sys.executable, *sys.argv],
+            stage_key=versioned_plan.stage_key,
+            stage_label=versioned_plan.stage_label,
+        )
+        run_results = collect_stage_results(versioned_plan.run_dir)
+        write_run_summary(versioned_plan.run_dir, versioned_plan.run_id, run_results)
+        final_checkpoint = stage_result.checkpoint
+
     print(f"\n{'='*60}")
     print(f"KD Training complete!")
     print(f"  Best mAP@0.5: {results['best_map50']:.4f}")
-    print(f"  Checkpoint: {results['checkpoint']}")
+    print(f"  Checkpoint: {final_checkpoint}")
     print(f"{'='*60}")
 
 
