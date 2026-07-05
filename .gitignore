@@ -102,3 +102,6 @@ checkpoints/**/*.pt
 !checkpoints/**/*.png
 !checkpoints/**/*.csv
 !checkpoints/**/*.json
+
+# Heavy model checkpoints
+checkpoints/**/*.pt
