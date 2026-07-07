@@ -20,6 +20,7 @@ import torch
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 
 from .augmentations import (
+    apply_transforms_with_bbox_tracking,
     get_rgb_photometric_transforms,
     get_train_spatial_transforms,
     get_train_transforms,
@@ -302,7 +303,8 @@ class YOLODataset(Dataset):
             # Backward-compatible custom transform path. Custom callers are
             # responsible for preserving RGB/NIR geometric alignment.
             if len(bboxes) > 0:
-                augmented = self.transform(
+                augmented = apply_transforms_with_bbox_tracking(
+                    transform=self.transform,
                     image=rgb_lb,
                     bboxes=bboxes.tolist(),
                     class_labels=labels.tolist(),
@@ -319,7 +321,12 @@ class YOLODataset(Dataset):
                     else np.zeros((0,), dtype=np.int64)
                 )
             else:
-                augmented = self.transform(image=rgb_lb, bboxes=[], class_labels=[])
+                augmented = apply_transforms_with_bbox_tracking(
+                    transform=self.transform,
+                    image=rgb_lb,
+                    bboxes=[],
+                    class_labels=[],
+                )
                 rgb_aug = augmented["image"]
                 bboxes_aug = np.zeros((0, 4), dtype=np.float32)
                 labels_aug = np.zeros((0,), dtype=np.int64)
@@ -403,16 +410,18 @@ class YOLODataset(Dataset):
         labels_list = labels.tolist() if len(labels) > 0 else []
 
         if self.split == "train" and self.spatial_transform is not None:
-            augmented = self.spatial_transform(
+            augmented = apply_transforms_with_bbox_tracking(
+                transform=self.spatial_transform,
                 image=rgb_lb,
-                nir=nir_lb,
                 bboxes=bboxes_list,
                 class_labels=labels_list,
+                nir=nir_lb,
             )
             rgb_aug = augmented["image"]
             nir_aug = augmented["nir"]
         else:
-            augmented = self.transform(
+            augmented = apply_transforms_with_bbox_tracking(
+                transform=self.transform,
                 image=rgb_lb,
                 bboxes=bboxes_list,
                 class_labels=labels_list,

@@ -7,6 +7,7 @@ or pycocotools dependency required.
 
 from __future__ import annotations
 
+import csv
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -20,16 +21,60 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class LossHistory:
-    """Track per-epoch loss values for plotting and analysis."""
+    """Track per-epoch losses and validation metrics for analysis.
 
+    The trainer owns this object and updates it once per epoch. It is kept
+    intentionally dependency-light so the same history can be used by master,
+    student, and KD training runs.
+    """
+
+    epoch: list[int] = field(default_factory=list)
+    phase: list[int] = field(default_factory=list)
     cls_loss: list[float] = field(default_factory=list)
     box_loss: list[float] = field(default_factory=list)
     total_loss: list[float] = field(default_factory=list)
+    map50: list[float] = field(default_factory=list)
+    map_50_95: list[float] = field(default_factory=list)
+    per_class_ap_50: list[dict[int, float]] = field(default_factory=list)
+    per_class_ap_50_95: list[dict[int, float]] = field(default_factory=list)
+    extra_losses: dict[str, list[float]] = field(default_factory=dict)
 
-    def update(self, cls: float, box: float, total: float):
+    def update(
+        self,
+        cls: float,
+        box: float,
+        total: float,
+        *,
+        epoch: int | None = None,
+        phase: int | None = None,
+        map50: float = 0.0,
+        map_50_95: float = 0.0,
+        per_class_ap_50: dict[int, float] | None = None,
+        per_class_ap_50_95: dict[int, float] | None = None,
+        extra_losses: dict[str, float] | None = None,
+    ) -> None:
+        """Append one epoch of train and validation metrics."""
+        self.epoch.append(epoch if epoch is not None else len(self.total_loss) + 1)
+        self.phase.append(phase if phase is not None else 1)
         self.cls_loss.append(cls)
         self.box_loss.append(box)
         self.total_loss.append(total)
+        self.map50.append(map50)
+        self.map_50_95.append(map_50_95)
+        self.per_class_ap_50.append(per_class_ap_50 or {})
+        self.per_class_ap_50_95.append(per_class_ap_50_95 or {})
+
+        extra_losses = extra_losses or {}
+        for key in set(self.extra_losses) | set(extra_losses):
+            values = self.extra_losses.setdefault(key, [float("nan")] * (len(self.total_loss) - 1))
+            values.append(float(extra_losses.get(key, float("nan"))))
+
+    def class_ids(self) -> list[int]:
+        """Return sorted class IDs present in tracked AP dictionaries."""
+        ids: set[int] = set()
+        for per_epoch in self.per_class_ap_50 + self.per_class_ap_50_95:
+            ids.update(int(class_id) for class_id in per_epoch)
+        return sorted(ids)
 
 
 def _cxcywh_to_xyxy(boxes: torch.Tensor) -> torch.Tensor:
@@ -201,18 +246,131 @@ def compute_map(
     }
 
 
-def generate_training_curves(history: LossHistory, output_dir: Path) -> None:
-    """Generate training_curves.png from LossHistory.
+def _write_metrics_csv(history: LossHistory, output_dir: Path) -> None:
+    """Persist epoch metrics as a CSV file for notebooks and thesis tables."""
+    class_ids = history.class_ids()
+    fieldnames = [
+        "epoch",
+        "phase",
+        "cls_loss",
+        "box_loss",
+        "total_loss",
+        *history.extra_losses.keys(),
+        "map50",
+        "map_50_95",
+        *[f"ap50_class_{class_id}" for class_id in class_ids],
+        *[f"ap50_95_class_{class_id}" for class_id in class_ids],
+    ]
 
-    Plots 3 subplots (cls_loss, box_loss, total_loss) over epoch indices
-    and saves the result as training_curves.png in output_dir.
+    output_dir.mkdir(parents=True, exist_ok=True)
+    with (output_dir / "metrics_history.csv").open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for idx, epoch in enumerate(history.epoch):
+            row = {
+                "epoch": epoch,
+                "phase": history.phase[idx],
+                "cls_loss": history.cls_loss[idx],
+                "box_loss": history.box_loss[idx],
+                "total_loss": history.total_loss[idx],
+                "map50": history.map50[idx],
+                "map_50_95": history.map_50_95[idx],
+            }
+            for name, values in history.extra_losses.items():
+                row[name] = values[idx]
+            for class_id in class_ids:
+                row[f"ap50_class_{class_id}"] = history.per_class_ap_50[idx].get(class_id, 0.0)
+                row[f"ap50_95_class_{class_id}"] = history.per_class_ap_50_95[idx].get(class_id, 0.0)
+            writer.writerow(row)
+
+
+def _plot_losses(history: LossHistory, output_dir: Path) -> None:
+    import matplotlib.pyplot as plt
+
+    epochs = history.epoch
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.plot(epochs, history.total_loss, label="total_loss", linewidth=2)
+    ax.plot(epochs, history.cls_loss, label="cls_loss", linewidth=2)
+    ax.plot(epochs, history.box_loss, label="box_loss", linewidth=2)
+    for name, values in history.extra_losses.items():
+        ax.plot(epochs, values, label=name, linewidth=2)
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Loss")
+    ax.set_title("Training losses")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(output_dir / "loss_curves.png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _plot_map(history: LossHistory, output_dir: Path) -> None:
+    import matplotlib.pyplot as plt
+
+    epochs = history.epoch
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.plot(epochs, history.map50, label="mAP@0.5", linewidth=2)
+    ax.plot(epochs, history.map_50_95, label="mAP@0.5:0.95", linewidth=2)
+    if history.map50:
+        best_idx = int(np.argmax(history.map50))
+        ax.scatter(
+            [epochs[best_idx]],
+            [history.map50[best_idx]],
+            zorder=3,
+            label=f"best mAP@0.5 epoch {epochs[best_idx]}: {history.map50[best_idx]:.4f}",
+        )
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("mAP")
+    ax.set_title("Validation mAP")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(output_dir / "map_curves.png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _plot_per_class_ap(history: LossHistory, output_dir: Path, key: str) -> None:
+    import matplotlib.pyplot as plt
+
+    class_ids = history.class_ids()
+    if not class_ids:
+        return
+
+    source = history.per_class_ap_50 if key == "ap50" else history.per_class_ap_50_95
+    title = "Per-class AP@0.5" if key == "ap50" else "Per-class AP@0.5:0.95"
+    filename = "per_class_ap50.png" if key == "ap50" else "per_class_ap50_95.png"
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    for class_id in class_ids:
+        values = [per_epoch.get(class_id, 0.0) for per_epoch in source]
+        ax.plot(history.epoch, values, label=f"class_{class_id}", linewidth=2)
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("AP")
+    ax.set_title(title)
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(output_dir / filename, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+def generate_training_curves(history: LossHistory, output_dir: Path) -> None:
+    """Generate CSV and PNG training reports from LossHistory.
+
+    Outputs:
+        - metrics_history.csv
+        - training_curves.png (backward-compatible summary)
+        - loss_curves.png
+        - map_curves.png
+        - per_class_ap50.png
+        - per_class_ap50_95.png
 
     Args:
-        history: LossHistory with per-epoch loss data.
-        output_dir: Directory to save the PNG file.
+        history: LossHistory with per-epoch loss and validation data.
+        output_dir: Directory to save generated artifacts.
     """
     if not history.total_loss:
-        logger.warning("No loss data to plot — skipping training_curves.png")
+        logger.warning("No metric data to plot - skipping training curves")
         return
 
     try:
@@ -220,41 +378,71 @@ def generate_training_curves(history: LossHistory, output_dir: Path) -> None:
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
     except ImportError:
-        logger.warning("matplotlib unavailable, skipping training_curves.png")
+        logger.warning("matplotlib unavailable, writing CSV only")
+        _write_metrics_csv(history, Path(output_dir))
         return
 
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    _write_metrics_csv(history, output_dir)
+
     try:
-        epochs = range(1, len(history.total_loss) + 1)
+        _plot_losses(history, output_dir)
+        _plot_map(history, output_dir)
+        _plot_per_class_ap(history, output_dir, "ap50")
+        _plot_per_class_ap(history, output_dir, "ap50_95")
 
-        fig, axes = plt.subplots(3, 1, figsize=(8, 10), sharex=True)
+        epochs = history.epoch
+        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
 
-        axes[0].plot(epochs, history.cls_loss, "b-", label="cls_loss")
-        axes[0].set_ylabel("Loss")
-        axes[0].set_title("Classification Loss")
-        axes[0].legend()
-        axes[0].grid(True, alpha=0.3)
+        axes[0, 0].plot(epochs, history.total_loss, label="total_loss", linewidth=2)
+        axes[0, 0].plot(epochs, history.cls_loss, label="cls_loss", linewidth=2)
+        axes[0, 0].plot(epochs, history.box_loss, label="box_loss", linewidth=2)
+        for name, values in history.extra_losses.items():
+            axes[0, 0].plot(epochs, values, label=name, linewidth=2)
+        axes[0, 0].set_title("Training losses")
+        axes[0, 0].set_ylabel("Loss")
+        axes[0, 0].grid(True, alpha=0.3)
+        axes[0, 0].legend()
 
-        axes[1].plot(epochs, history.box_loss, "r-", label="box_loss")
-        axes[1].set_ylabel("Loss")
-        axes[1].set_title("Box Regression Loss")
-        axes[1].legend()
-        axes[1].grid(True, alpha=0.3)
+        axes[0, 1].plot(epochs, history.map50, label="mAP@0.5", linewidth=2)
+        axes[0, 1].plot(epochs, history.map_50_95, label="mAP@0.5:0.95", linewidth=2)
+        axes[0, 1].set_title("Validation mAP")
+        axes[0, 1].set_ylabel("mAP")
+        axes[0, 1].grid(True, alpha=0.3)
+        axes[0, 1].legend()
 
-        axes[2].plot(epochs, history.total_loss, "g-", label="total_loss")
-        axes[2].set_xlabel("Epoch")
-        axes[2].set_ylabel("Loss")
-        axes[2].set_title("Total Loss")
-        axes[2].legend()
-        axes[2].grid(True, alpha=0.3)
+        class_ids = history.class_ids()
+        for class_id in class_ids:
+            axes[1, 0].plot(
+                epochs,
+                [per_epoch.get(class_id, 0.0) for per_epoch in history.per_class_ap_50],
+                label=f"class_{class_id}",
+                linewidth=2,
+            )
+            axes[1, 1].plot(
+                epochs,
+                [per_epoch.get(class_id, 0.0) for per_epoch in history.per_class_ap_50_95],
+                label=f"class_{class_id}",
+                linewidth=2,
+            )
+        axes[1, 0].set_title("Per-class AP@0.5")
+        axes[1, 0].set_xlabel("Epoch")
+        axes[1, 0].set_ylabel("AP")
+        axes[1, 0].grid(True, alpha=0.3)
+        axes[1, 0].legend()
+
+        axes[1, 1].set_title("Per-class AP@0.5:0.95")
+        axes[1, 1].set_xlabel("Epoch")
+        axes[1, 1].set_ylabel("AP")
+        axes[1, 1].grid(True, alpha=0.3)
+        axes[1, 1].legend()
 
         plt.tight_layout()
-
-        output_dir = Path(output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
         fig.savefig(output_dir / "training_curves.png", dpi=150, bbox_inches="tight")
         plt.close(fig)
 
-        logger.info("Training curves saved to %s", output_dir / "training_curves.png")
+        logger.info("Training metrics saved to %s", output_dir)
 
     except (RuntimeError, ValueError) as e:
-        logger.warning("Could not generate training_curves.png: %s", e)
+        logger.warning("Could not generate training curves: %s", e)

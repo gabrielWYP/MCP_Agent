@@ -17,7 +17,7 @@ distill_levels:
 epochs: 80
 patience: 30
 amp: false
-batch_size: 4
+batch_size: 8
 model_type: student
 
 # --- Model ---
@@ -29,7 +29,9 @@ letterbox_value: 114
 # --- Loss ---
 box_weight: 7.5
 cls_weight: 0.5
-class_weights: [2.7, 0.5]  # [mango, damaged]; keep aligned with teacher training
+# Class weights: [mango, damage]. Damage is harder to detect (small bboxes, lower contrast),
+# so it receives higher loss weight. Values are experimental and should be tuned by validation mAP.
+class_weights: [0.5, 1.5]
 
 # --- Optimizer ---
 lr: 0.001

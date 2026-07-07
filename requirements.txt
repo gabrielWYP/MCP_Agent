@@ -38,3 +38,13 @@ albumentations==2.0.8  # Augmentaciones avanzadas (RGB+NIR 4-channel sync)
 Pillow>=10.0.0
 scikit-learn>=1.3.0   # Métricas: F1, confusion matrix, classification report
 tqdm>=4.65.0          # Progress bars en entrenamiento
+pyyaml
+matplotlib
+transformers==4.39.3
+accelerate
+
+# --- Florence-2 large attention (needed by the HF model) ---
+# NOTE: flash-attn requires CUDA build; on Lightning AI it may fail to install.
+# If training environment cannot compile it, use Florence-2-base or keep these commented.
+einops>=0.7.0
+flash-attn>=2.5.0

@@ -26,7 +26,9 @@ weight_decay: 0.0005
 # Loss
 box_weight: 7.5
 cls_weight: 0.5
-class_weights: [1.1, 0.92]  # [mango, damaged]; inverse freq from current train labels (158 mango, 190 damaged)
+# Class weights: [mango, damage]. Damage is harder to detect (small bboxes, lower contrast),
+# so it receives higher loss weight. Values are experimental and should be tuned by validation mAP.
+class_weights: [0.5, 1.5]
 
 # Scheduler
 warmup_epochs: 5
