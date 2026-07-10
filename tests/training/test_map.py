@@ -151,3 +151,19 @@ class TestComputeMap:
         )
 
         assert result["map_50_95"] <= result["map50"] + 0.01
+
+    def test_operating_point_reports_precision_recall_f1_and_counts(self):
+        gt_boxes = [torch.tensor([[0.5, 0.5, 0.2, 0.2]])]
+        gt_labels = [torch.tensor([1])]
+        pred_boxes = [torch.tensor([[0.5, 0.5, 0.2, 0.2], [0.1, 0.1, 0.1, 0.1]])]
+        pred_scores = [torch.tensor([0.9, 0.8])]
+        pred_labels = [torch.tensor([1, 1])]
+
+        result = compute_map(
+            pred_boxes, pred_scores, pred_labels, gt_boxes, gt_labels, num_classes=2
+        )
+
+        assert result["per_class_precision"][1] == pytest.approx(0.5)
+        assert result["per_class_recall"][1] == pytest.approx(1.0)
+        assert result["per_class_f1"][1] == pytest.approx(2 / 3)
+        assert result["per_class_counts"][1] == {"tp": 1, "fp": 1, "fn": 0}

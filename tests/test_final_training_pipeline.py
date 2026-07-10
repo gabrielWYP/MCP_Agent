@@ -8,6 +8,9 @@ from src.training.run_artifacts import (
     build_versioned_stage_plan,
     final_stage_name,
     finalize_stage,
+    prepare_atomic_run,
+    publish_atomic_run,
+    release_atomic_run,
 )
 
 
@@ -45,3 +48,31 @@ def test_build_versioned_stage_plan_reuses_timestamp(tmp_path: Path) -> None:
     assert plan.stage_label == "Destilado"
     assert plan.tmp_dir == tmp_path / "20260704T000000Z" / ".partial" / "destilado"
     assert plan.final_parent == tmp_path / "20260704T000000Z" / "destilado"
+
+
+def test_atomic_run_is_hidden_until_published(tmp_path: Path) -> None:
+    plan = prepare_atomic_run(tmp_path, "20260704T000000Z")
+    try:
+        (plan.staging_dir / "run_summary.json").write_text("{}", encoding="utf-8")
+
+        assert plan.staging_dir.exists()
+        assert not plan.run_dir.exists()
+
+        publish_atomic_run(plan)
+
+        assert plan.run_dir.exists()
+        assert (plan.run_dir / "run_summary.json").exists()
+        assert not plan.staging_dir.exists()
+    finally:
+        release_atomic_run(plan)
+
+
+def test_atomic_run_rejects_concurrent_run_id(tmp_path: Path) -> None:
+    first = prepare_atomic_run(tmp_path, "20260704T000000Z")
+    try:
+        import pytest
+
+        with pytest.raises(FileExistsError, match="already active"):
+            prepare_atomic_run(tmp_path, "20260704T000000Z")
+    finally:
+        release_atomic_run(first)

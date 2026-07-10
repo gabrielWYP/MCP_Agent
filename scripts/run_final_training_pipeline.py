@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import argparse
 import logging
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -35,6 +34,9 @@ from src.training.run_artifacts import (
     StageResult,
     finalize_stage,
     generate_run_summary_image,
+    prepare_atomic_run,
+    publish_atomic_run,
+    release_atomic_run,
     utc_timestamp,
     write_json,
 )
@@ -74,7 +76,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--timestamp",
         default=None,
-        help="Optional run timestamp. Defaults to UTC YYYYmmddTHHMMSSZ.",
+        help="Optional run ID. Defaults to a UTC timestamp with microseconds.",
     )
     parser.add_argument(
         "--skip-master",
@@ -147,97 +149,103 @@ def main() -> int:
     args = parse_args()
     run_id = args.timestamp or utc_timestamp()
     run_dir = Path(args.output_root) / run_id
-    tmp_root = run_dir / ".partial"
-
-    if run_dir.exists() and not args.dry_run:
-        raise FileExistsError(f"Run directory already exists: {run_dir}")
+    run_plan = None
+    working_dir = run_dir
+    if not args.dry_run:
+        run_plan = prepare_atomic_run(args.output_root, run_id)
+        working_dir = run_plan.staging_dir
 
     logger.info("Final run id: %s", run_id)
     logger.info("Final run directory: %s", run_dir)
+    if run_plan is not None:
+        logger.info("Private staging directory: %s", working_dir)
 
     results: list[StageResult] = []
     teacher_checkpoint = args.teacher_checkpoint
 
-    if not args.skip_master:
-        tmp_dir = tmp_root / "maestro"
-        command = run_training_stage(
-            python=args.python,
-            module="src.training.train",
-            config_path=args.master_config,
-            output_dir=tmp_dir,
-            dry_run=args.dry_run,
-            model="master",
-        )
-        master = finalize_stage(
-            tmp_dir=tmp_dir,
-            final_parent=run_dir / "maestro",
-            run_id=run_id,
-            command=command,
-            stage_key="maestro",
-            stage_label="Maestro",
-            dry_run=args.dry_run,
-        )
-        results.append(master)
-        teacher_checkpoint = master.checkpoint
-    elif not teacher_checkpoint:
-        raise ValueError("--teacher-checkpoint is required when --skip-master is set")
-
-    if not args.skip_student:
-        tmp_dir = tmp_root / "estudiante"
-        command = run_training_stage(
-            python=args.python,
-            module="src.training.train",
-            config_path=args.student_config,
-            output_dir=tmp_dir,
-            dry_run=args.dry_run,
-            model="student",
-        )
-        results.append(
-            finalize_stage(
+    try:
+        if not args.skip_master:
+            tmp_dir = working_dir / "maestro" / ".partial"
+            command = run_training_stage(
+                python=args.python,
+                module="src.training.train",
+                config_path=args.master_config,
+                output_dir=tmp_dir,
+                dry_run=args.dry_run,
+                model="master",
+            )
+            master = finalize_stage(
                 tmp_dir=tmp_dir,
-                final_parent=run_dir / "estudiante",
+                final_parent=working_dir / "maestro",
                 run_id=run_id,
                 command=command,
-                stage_key="estudiante",
-                stage_label="Estudiante",
+                stage_key="maestro",
+                stage_label="Maestro",
                 dry_run=args.dry_run,
             )
-        )
+            results.append(master)
+            teacher_checkpoint = master.checkpoint
+        elif not teacher_checkpoint:
+            raise ValueError("--teacher-checkpoint is required when --skip-master is set")
 
-    if not args.skip_kd:
-        tmp_dir = tmp_root / "destilado"
-        command = run_training_stage(
-            python=args.python,
-            module="src.training.kd_train",
-            config_path=args.kd_config,
-            output_dir=tmp_dir,
-            dry_run=args.dry_run,
-            overrides=[f"teacher_checkpoint={teacher_checkpoint}"],
-        )
-        results.append(
-            finalize_stage(
-                tmp_dir=tmp_dir,
-                final_parent=run_dir / "destilado",
-                run_id=run_id,
-                command=command,
-                stage_key="destilado",
-                stage_label="Destilado",
+        if not args.skip_student:
+            tmp_dir = working_dir / "estudiante" / ".partial"
+            command = run_training_stage(
+                python=args.python,
+                module="src.training.train",
+                config_path=args.student_config,
+                output_dir=tmp_dir,
                 dry_run=args.dry_run,
+                model="student",
             )
-        )
+            results.append(
+                finalize_stage(
+                    tmp_dir=tmp_dir,
+                    final_parent=working_dir / "estudiante",
+                    run_id=run_id,
+                    command=command,
+                    stage_key="estudiante",
+                    stage_label="Estudiante",
+                    dry_run=args.dry_run,
+                )
+            )
 
-    summary = {
-        "run_id": run_id,
-        "run_dir": str(run_dir),
-        "results": [result.__dict__ for result in results],
-    }
-    if not args.dry_run:
-        if tmp_root.exists():
-            shutil.rmtree(tmp_root)
-        write_json(run_dir / "run_summary.json", summary)
-        generate_run_summary_image(run_dir, results)
-    else:
-        logger.info("Dry-run summary: %s", summary)
+        if not args.skip_kd:
+            tmp_dir = working_dir / "destilado" / ".partial"
+            command = run_training_stage(
+                python=args.python,
+                module="src.training.kd_train",
+                config_path=args.kd_config,
+                output_dir=tmp_dir,
+                dry_run=args.dry_run,
+                overrides=[f"teacher_checkpoint={teacher_checkpoint}"],
+            )
+            results.append(
+                finalize_stage(
+                    tmp_dir=tmp_dir,
+                    final_parent=working_dir / "destilado",
+                    run_id=run_id,
+                    command=command,
+                    stage_key="destilado",
+                    stage_label="Destilado",
+                    dry_run=args.dry_run,
+                )
+            )
+
+        summary = {
+            "run_id": run_id,
+            "run_dir": str(run_dir),
+            "results": [result.__dict__ for result in results],
+        }
+        if not args.dry_run:
+            write_json(working_dir / "run_summary.json", summary)
+            generate_run_summary_image(working_dir, results)
+            publish_atomic_run(run_plan)
+        else:
+            logger.info("Dry-run summary: %s", summary)
+    finally:
+        if run_plan is not None:
+            release_atomic_run(run_plan)
 
     logger.info("Final training pipeline complete.")
     return 0
