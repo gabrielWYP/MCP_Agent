@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shutil
+import tempfile
+import uuid
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -45,9 +48,19 @@ class VersionedStagePlan:
     final_parent: Path
 
 
+@dataclass(frozen=True)
+class AtomicRunPlan:
+    """Private staging location and lock for an all-or-nothing pipeline run."""
+
+    run_id: str
+    run_dir: Path
+    staging_dir: Path
+    lock_dir: Path
+
+
 def utc_timestamp() -> str:
     """Return a filesystem-safe UTC timestamp."""
-    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
 
 
 def final_stage_name(run_id: str, best_map50: float) -> str:
@@ -57,12 +70,65 @@ def final_stage_name(run_id: str, best_map50: float) -> str:
 
 
 def write_json(path: Path, payload: dict[str, Any]) -> None:
-    """Write a deterministic JSON document."""
+    """Atomically write a deterministic JSON document."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(payload, indent=2, sort_keys=True),
+    with tempfile.NamedTemporaryFile(
+        mode="w",
         encoding="utf-8",
-    )
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        delete=False,
+    ) as tmp:
+        tmp.write(json.dumps(payload, indent=2, sort_keys=True))
+        tmp_path = Path(tmp.name)
+    os.replace(tmp_path, path)
+
+
+def prepare_atomic_run(output_root: str | Path, run_id: str) -> AtomicRunPlan:
+    """Reserve a run ID and create a private staging directory.
+
+    The lock is created with ``mkdir``, which is atomic on a shared local
+    filesystem. This prevents two processes using the same explicit timestamp
+    from writing into the same run. Nothing under ``final_runs/<run_id>`` is
+    visible until :func:`publish_atomic_run` succeeds.
+    """
+    root = Path(output_root)
+    run_dir = root / run_id
+    lock_dir = root / ".locks" / run_id
+    root.mkdir(parents=True, exist_ok=True)
+    lock_dir.parent.mkdir(parents=True, exist_ok=True)
+    if run_dir.exists():
+        raise FileExistsError(f"Run directory already exists: {run_dir}")
+    try:
+        lock_dir.mkdir()
+    except FileExistsError as error:
+        raise FileExistsError(f"Run ID is already active: {run_id}") from error
+
+    staging_dir = root / ".partial" / f"{run_id}-{uuid.uuid4().hex}"
+    try:
+        staging_dir.mkdir(parents=True)
+    except Exception:
+        lock_dir.rmdir()
+        raise
+    return AtomicRunPlan(run_id, run_dir, staging_dir, lock_dir)
+
+
+def publish_atomic_run(plan: AtomicRunPlan) -> None:
+    """Atomically publish a fully completed staged run directory."""
+    if plan.run_dir.exists():
+        raise FileExistsError(f"Run directory already exists: {plan.run_dir}")
+    if not plan.staging_dir.exists():
+        raise FileNotFoundError(f"Missing staged run directory: {plan.staging_dir}")
+    os.rename(plan.staging_dir, plan.run_dir)
+
+
+def release_atomic_run(plan: AtomicRunPlan) -> None:
+    """Release a run reservation without deleting failed-run evidence."""
+    try:
+        plan.lock_dir.rmdir()
+    except FileNotFoundError:
+        pass
 
 
 def load_best_map50(checkpoint_path: Path) -> float:

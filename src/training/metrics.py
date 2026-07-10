@@ -37,6 +37,10 @@ class LossHistory:
     map_50_95: list[float] = field(default_factory=list)
     per_class_ap_50: list[dict[int, float]] = field(default_factory=list)
     per_class_ap_50_95: list[dict[int, float]] = field(default_factory=list)
+    per_class_precision: list[dict[int, float]] = field(default_factory=list)
+    per_class_recall: list[dict[int, float]] = field(default_factory=list)
+    per_class_f1: list[dict[int, float]] = field(default_factory=list)
+    per_class_counts: list[dict[int, dict[str, int]]] = field(default_factory=list)
     extra_losses: dict[str, list[float]] = field(default_factory=dict)
 
     def update(
@@ -51,6 +55,10 @@ class LossHistory:
         map_50_95: float = 0.0,
         per_class_ap_50: dict[int, float] | None = None,
         per_class_ap_50_95: dict[int, float] | None = None,
+        per_class_precision: dict[int, float] | None = None,
+        per_class_recall: dict[int, float] | None = None,
+        per_class_f1: dict[int, float] | None = None,
+        per_class_counts: dict[int, dict[str, int]] | None = None,
         extra_losses: dict[str, float] | None = None,
     ) -> None:
         """Append one epoch of train and validation metrics."""
@@ -63,6 +71,10 @@ class LossHistory:
         self.map_50_95.append(map_50_95)
         self.per_class_ap_50.append(per_class_ap_50 or {})
         self.per_class_ap_50_95.append(per_class_ap_50_95 or {})
+        self.per_class_precision.append(per_class_precision or {})
+        self.per_class_recall.append(per_class_recall or {})
+        self.per_class_f1.append(per_class_f1 or {})
+        self.per_class_counts.append(per_class_counts or {})
 
         extra_losses = extra_losses or {}
         for key in set(self.extra_losses) | set(extra_losses):
@@ -72,7 +84,13 @@ class LossHistory:
     def class_ids(self) -> list[int]:
         """Return sorted class IDs present in tracked AP dictionaries."""
         ids: set[int] = set()
-        for per_epoch in self.per_class_ap_50 + self.per_class_ap_50_95:
+        for per_epoch in (
+            self.per_class_ap_50
+            + self.per_class_ap_50_95
+            + self.per_class_precision
+            + self.per_class_recall
+            + self.per_class_f1
+        ):
             ids.update(int(class_id) for class_id in per_epoch)
         return sorted(ids)
 
@@ -182,6 +200,54 @@ def _compute_ap_at_iou(
     return float(mAP), per_class_ap
 
 
+def _compute_operating_point(
+    pred_boxes: list[torch.Tensor],
+    pred_scores: list[torch.Tensor],
+    pred_labels: list[torch.Tensor],
+    gt_boxes: list[torch.Tensor],
+    gt_labels: list[torch.Tensor],
+    iou_threshold: float,
+    score_threshold: float,
+    num_classes: int,
+) -> tuple[dict[int, float], dict[int, float], dict[int, float], dict[int, dict[str, int]]]:
+    """Compute classwise precision, recall, F1 and TP/FP/FN at one threshold."""
+    precision: dict[int, float] = {}
+    recall: dict[int, float] = {}
+    f1: dict[int, float] = {}
+    counts: dict[int, dict[str, int]] = {}
+
+    for cls_id in range(num_classes):
+        tp = fp = fn = 0
+        for boxes_i, scores_i, labels_i, gt_boxes_i, gt_labels_i in zip(
+            pred_boxes, pred_scores, pred_labels, gt_boxes, gt_labels
+        ):
+            pred_mask = (labels_i == cls_id) & (scores_i >= score_threshold)
+            predictions = list(zip(scores_i[pred_mask], boxes_i[pred_mask]))
+            predictions.sort(key=lambda item: float(item[0]), reverse=True)
+            targets = gt_boxes_i[gt_labels_i == cls_id]
+            matched: set[int] = set()
+            for _, box in predictions:
+                if len(targets) == 0:
+                    fp += 1
+                    continue
+                ious = box_iou(box.unsqueeze(0), targets).squeeze(0)
+                best_iou, best_idx = ious.max(dim=0)
+                if best_iou >= iou_threshold and int(best_idx) not in matched:
+                    tp += 1
+                    matched.add(int(best_idx))
+                else:
+                    fp += 1
+            fn += len(targets) - len(matched)
+
+        p = tp / (tp + fp) if tp + fp else 0.0
+        r = tp / (tp + fn) if tp + fn else 0.0
+        precision[cls_id] = p
+        recall[cls_id] = r
+        f1[cls_id] = 2 * p * r / (p + r) if p + r else 0.0
+        counts[cls_id] = {"tp": tp, "fp": fp, "fn": fn}
+    return precision, recall, f1, counts
+
+
 def compute_map(
     pred_boxes: list[torch.Tensor],
     pred_scores: list[torch.Tensor],
@@ -203,7 +269,8 @@ def compute_map(
         iou_threshold: IoU threshold for mAP@IoU computation.
 
     Returns:
-        Dict with keys: map50, map_50_95, per_class_ap_50, per_class_ap_50_95.
+        Dict with mAP, AP, and classwise precision/recall/F1 at IoU=0.5
+        and the decoder's confidence threshold (0.25).
     """
     pred_boxes_xyxy = [
         _cxcywh_to_xyxy(boxes) if len(boxes) > 0 else boxes
@@ -238,11 +305,26 @@ def compute_map(
     for c in per_class_95:
         per_class_95[c] /= len(thresholds)
 
+    precision, recall, f1, counts = _compute_operating_point(
+        pred_boxes_xyxy,
+        pred_scores,
+        pred_labels,
+        gt_boxes_xyxy,
+        gt_labels,
+        iou_threshold=iou_threshold,
+        score_threshold=0.25,
+        num_classes=num_classes,
+    )
+
     return {
         "map50": map50,
         "map_50_95": map_50_95,
         "per_class_ap_50": per_class_50,
         "per_class_ap_50_95": per_class_95,
+        "per_class_precision": precision,
+        "per_class_recall": recall,
+        "per_class_f1": f1,
+        "per_class_counts": counts,
     }
 
 
@@ -260,6 +342,12 @@ def _write_metrics_csv(history: LossHistory, output_dir: Path) -> None:
         "map_50_95",
         *[f"ap50_class_{class_id}" for class_id in class_ids],
         *[f"ap50_95_class_{class_id}" for class_id in class_ids],
+        *[f"precision_class_{class_id}" for class_id in class_ids],
+        *[f"recall_class_{class_id}" for class_id in class_ids],
+        *[f"f1_class_{class_id}" for class_id in class_ids],
+        *[f"tp_class_{class_id}" for class_id in class_ids],
+        *[f"fp_class_{class_id}" for class_id in class_ids],
+        *[f"fn_class_{class_id}" for class_id in class_ids],
     ]
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -281,6 +369,13 @@ def _write_metrics_csv(history: LossHistory, output_dir: Path) -> None:
             for class_id in class_ids:
                 row[f"ap50_class_{class_id}"] = history.per_class_ap_50[idx].get(class_id, 0.0)
                 row[f"ap50_95_class_{class_id}"] = history.per_class_ap_50_95[idx].get(class_id, 0.0)
+                row[f"precision_class_{class_id}"] = history.per_class_precision[idx].get(class_id, 0.0)
+                row[f"recall_class_{class_id}"] = history.per_class_recall[idx].get(class_id, 0.0)
+                row[f"f1_class_{class_id}"] = history.per_class_f1[idx].get(class_id, 0.0)
+                counts = history.per_class_counts[idx].get(class_id, {})
+                row[f"tp_class_{class_id}"] = counts.get("tp", 0)
+                row[f"fp_class_{class_id}"] = counts.get("fp", 0)
+                row[f"fn_class_{class_id}"] = counts.get("fn", 0)
             writer.writerow(row)
 
 
@@ -354,6 +449,30 @@ def _plot_per_class_ap(history: LossHistory, output_dir: Path, key: str) -> None
     plt.close(fig)
 
 
+def _plot_detection_quality(history: LossHistory, output_dir: Path) -> None:
+    """Plot operating-point quality for each class at IoU=0.5."""
+    import matplotlib.pyplot as plt
+
+    class_ids = history.class_ids()
+    if not class_ids:
+        return
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4.5), sharex=True, sharey=True)
+    for class_id in class_ids:
+        axes[0].plot(history.epoch, [x.get(class_id, 0.0) for x in history.per_class_precision], label=f"class_{class_id}")
+        axes[1].plot(history.epoch, [x.get(class_id, 0.0) for x in history.per_class_recall], label=f"class_{class_id}")
+        axes[2].plot(history.epoch, [x.get(class_id, 0.0) for x in history.per_class_f1], label=f"class_{class_id}")
+    for axis, title in zip(axes, ("Precision@0.5", "Recall@0.5", "F1@0.5")):
+        axis.set_title(title)
+        axis.set_xlabel("Epoch")
+        axis.set_ylim(0.0, 1.0)
+        axis.grid(True, alpha=0.3)
+        axis.legend()
+    axes[0].set_ylabel("Score")
+    fig.tight_layout()
+    fig.savefig(output_dir / "detection_quality_curves.png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
 def generate_training_curves(history: LossHistory, output_dir: Path) -> None:
     """Generate CSV and PNG training reports from LossHistory.
 
@@ -364,6 +483,7 @@ def generate_training_curves(history: LossHistory, output_dir: Path) -> None:
         - map_curves.png
         - per_class_ap50.png
         - per_class_ap50_95.png
+        - detection_quality_curves.png
 
     Args:
         history: LossHistory with per-epoch loss and validation data.
@@ -391,6 +511,7 @@ def generate_training_curves(history: LossHistory, output_dir: Path) -> None:
         _plot_map(history, output_dir)
         _plot_per_class_ap(history, output_dir, "ap50")
         _plot_per_class_ap(history, output_dir, "ap50_95")
+        _plot_detection_quality(history, output_dir)
 
         epochs = history.epoch
         fig, axes = plt.subplots(2, 2, figsize=(14, 10))
@@ -430,13 +551,15 @@ def generate_training_curves(history: LossHistory, output_dir: Path) -> None:
         axes[1, 0].set_xlabel("Epoch")
         axes[1, 0].set_ylabel("AP")
         axes[1, 0].grid(True, alpha=0.3)
-        axes[1, 0].legend()
+        if class_ids:
+            axes[1, 0].legend()
 
         axes[1, 1].set_title("Per-class AP@0.5:0.95")
         axes[1, 1].set_xlabel("Epoch")
         axes[1, 1].set_ylabel("AP")
         axes[1, 1].grid(True, alpha=0.3)
-        axes[1, 1].legend()
+        if class_ids:
+            axes[1, 1].legend()
 
         plt.tight_layout()
         fig.savefig(output_dir / "training_curves.png", dpi=150, bbox_inches="tight")

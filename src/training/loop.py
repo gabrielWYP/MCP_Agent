@@ -226,6 +226,10 @@ class Trainer:
             map_50_95 = val_metrics.get("map_50_95", 0.0)
             per_class_ap_50 = val_metrics.get("per_class_ap_50", {})
             per_class_ap_50_95 = val_metrics.get("per_class_ap_50_95", {})
+            per_class_precision = val_metrics.get("per_class_precision", {})
+            per_class_recall = val_metrics.get("per_class_recall", {})
+            per_class_f1 = val_metrics.get("per_class_f1", {})
+            per_class_counts = val_metrics.get("per_class_counts", {})
             ap50_text = ", ".join(
                 f"AP50[c{cls_id}]={ap:.4f}"
                 for cls_id, ap in sorted(per_class_ap_50.items())
@@ -255,6 +259,10 @@ class Trainer:
                 map_50_95=map_50_95,
                 per_class_ap_50=per_class_ap_50,
                 per_class_ap_50_95=per_class_ap_50_95,
+                per_class_precision=per_class_precision,
+                per_class_recall=per_class_recall,
+                per_class_f1=per_class_f1,
+                per_class_counts=per_class_counts,
                 extra_losses={
                     name: value
                     for name, value in train_metrics.items()
