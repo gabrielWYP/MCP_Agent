@@ -1,0 +1,18 @@
+{
+  "best_map50": 0.2200487107038498,
+  "checkpoint": "checkpoints/final_runs/20260705T215557Z/maestro/best_model_20260705T215557Z_mAP0p2200/best_model.pt",
+  "command": [
+    "/home/zeus/miniconda3/envs/cloudspace/bin/python",
+    "-m",
+    "src.training.train",
+    "--config",
+    "configs/training_mango.yaml",
+    "--model",
+    "master",
+    "--override",
+    "output_dir=checkpoints/final_runs/20260705T215557Z/.partial/maestro"
+  ],
+  "output_dir": "checkpoints/final_runs/20260705T215557Z/maestro/best_model_20260705T215557Z_mAP0p2200",
+  "stage_key": "maestro",
+  "stage_label": "Maestro"
+}

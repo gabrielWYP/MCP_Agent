@@ -1,0 +1,18 @@
+{
+  "best_map50": 0.31921184062957764,
+  "checkpoint": "checkpoints/final_runs/.partial/20260710T204144308622Z-6e0fc7c5fd974eaf889bbf41c9a51eb8/estudiante/best_model_20260710T204144308622Z_mAP0p3192/best_model.pt",
+  "command": [
+    "/home/zeus/miniconda3/envs/cloudspace/bin/python",
+    "-m",
+    "src.training.train",
+    "--config",
+    "configs/training_student.yaml",
+    "--model",
+    "student",
+    "--override",
+    "output_dir=checkpoints/final_runs/.partial/20260710T204144308622Z-6e0fc7c5fd974eaf889bbf41c9a51eb8/.stage_tmp/estudiante"
+  ],
+  "output_dir": "checkpoints/final_runs/.partial/20260710T204144308622Z-6e0fc7c5fd974eaf889bbf41c9a51eb8/estudiante/best_model_20260710T204144308622Z_mAP0p3192",
+  "stage_key": "estudiante",
+  "stage_label": "Estudiante"
+}

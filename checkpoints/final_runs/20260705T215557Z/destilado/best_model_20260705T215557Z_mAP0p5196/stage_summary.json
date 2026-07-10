@@ -1,0 +1,17 @@
+{
+  "best_map50": 0.5196070410311222,
+  "checkpoint": "checkpoints/final_runs/20260705T215557Z/destilado/best_model_20260705T215557Z_mAP0p5196/best_model.pt",
+  "command": [
+    "/home/zeus/miniconda3/envs/cloudspace/bin/python",
+    "-m",
+    "src.training.kd_train",
+    "--config",
+    "configs/kd_training.yaml",
+    "--override",
+    "output_dir=checkpoints/final_runs/20260705T215557Z/.partial/destilado",
+    "teacher_checkpoint=checkpoints/final_runs/20260705T215557Z/maestro/best_model_20260705T215557Z_mAP0p2200/best_model.pt"
+  ],
+  "output_dir": "checkpoints/final_runs/20260705T215557Z/destilado/best_model_20260705T215557Z_mAP0p5196",
+  "stage_key": "destilado",
+  "stage_label": "Destilado"
+}
