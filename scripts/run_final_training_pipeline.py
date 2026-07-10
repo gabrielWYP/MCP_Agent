@@ -165,7 +165,7 @@ def main() -> int:
 
     try:
         if not args.skip_master:
-            tmp_dir = working_dir / "maestro" / ".partial"
+            tmp_dir = working_dir / ".stage_tmp" / "maestro"
             command = run_training_stage(
                 python=args.python,
                 module="src.training.train",
@@ -189,7 +189,7 @@ def main() -> int:
             raise ValueError("--teacher-checkpoint is required when --skip-master is set")
 
         if not args.skip_student:
-            tmp_dir = working_dir / "estudiante" / ".partial"
+            tmp_dir = working_dir / ".stage_tmp" / "estudiante"
             command = run_training_stage(
                 python=args.python,
                 module="src.training.train",
@@ -211,7 +211,7 @@ def main() -> int:
             )
 
         if not args.skip_kd:
-            tmp_dir = working_dir / "destilado" / ".partial"
+            tmp_dir = working_dir / ".stage_tmp" / "destilado"
             command = run_training_stage(
                 python=args.python,
                 module="src.training.kd_train",
