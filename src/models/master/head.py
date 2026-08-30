@@ -15,11 +15,14 @@ Clases:
     0: mango
     1: danado
 
-Para distilación directa con YOLO Nano:
+Para distilación con YOLO Nano (estudiante, fijo en 3 niveles [8, 16, 32]):
     - Mismo formato de output: (B, 6, H_i, W_i) por nivel
-    - Mismos strides: [8, 16, 32]
-    - Mismos niveles: P3, P4, P5
-    - Features intermedios expuestos para feature-level KD
+    - El maestro (`MasterModel`) es configurable via `head_strides`
+      (default [4, 8, 16, 32], fusion-redesign D-3); KD selecciona por
+      stride los 3 niveles que coinciden con el estudiante — ver
+      `src/training/kd_trainer.py` y `src/training/strides.py`.
+    - Features intermedios expuestos para feature-level KD, computados una
+      sola vez por nivel (fusion-redesign W5 — antes se recomputaban)
 
 Referencias:
     - YOLOv8: https://github.com/ultralytics/ultralytics
@@ -80,7 +83,9 @@ class DecoupledHead(nn.Module):
         bias_value = -math.log((1.0 - prior_prob) / prior_prob)
         nn.init.constant_(self.cls_pred.bias, bias_value)
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self, x: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Args:
             x: (B, in_channels, H, W) — feature map de un nivel FPN
@@ -88,10 +93,16 @@ class DecoupledHead(nn.Module):
         Returns:
             cls_out: (B, num_classes, H, W)
             reg_out: (B, 4, H, W)
+            cls_feat: (B, in_channels, H, W) — cls_stem output, reused by the
+                caller for distillation (fusion-redesign W5) instead of
+                recomputing `cls_stem` a second time.
+            reg_feat: (B, in_channels, H, W) — reg_stem output, same reuse.
         """
-        cls_out = self.cls_pred(self.cls_stem(x))
-        reg_out = self.reg_pred(self.reg_stem(x))
-        return cls_out, reg_out
+        cls_feat = self.cls_stem(x)
+        reg_feat = self.reg_stem(x)
+        cls_out = self.cls_pred(cls_feat)
+        reg_out = self.reg_pred(reg_feat)
+        return cls_out, reg_out, cls_feat, reg_feat
 
 
 class YOLODetectionHead(nn.Module):
@@ -103,7 +114,10 @@ class YOLODetectionHead(nn.Module):
     Args:
         fpn_channels (int): Canales de cada nivel FPN (default 256).
         num_classes (int): Clases de deteccion (default 2).
-        strides (list[int]): Strides de cada nivel FPN (default [8, 16, 32]).
+        strides (list[int]): Strides de cada nivel FPN. Requerido, sin
+            default (fusion-redesign D-D) — un argumento olvidado produce un
+            `TypeError` en el call site en vez de un `[8, 16, 32]` silencioso
+            y potencialmente incorrecto para un pyramid de 4 niveles.
 
     Forward returns:
         dict con:
@@ -118,11 +132,12 @@ class YOLODetectionHead(nn.Module):
         self,
         fpn_channels: int = 256,
         num_classes: int = NUM_CLASSES,
-        strides: list[int] = None,
+        *,
+        strides: list[int],
     ):
         super().__init__()
         self.num_classes = num_classes
-        self.strides = strides or [8, 16, 32]
+        self.strides = list(strides)
         self.num_levels = len(self.strides)
 
         # Un decoupled head por nivel FPN
@@ -152,7 +167,13 @@ class YOLODetectionHead(nn.Module):
         for i, head in enumerate(self.heads):
             feat = pyramid[i]  # (B, 256, H_i, W_i)
 
-            cls_out, reg_out = head(feat)
+            # fusion-redesign W5: DecoupledHead.forward returns the stem
+            # features it already computed, so they are reused directly for
+            # distillation instead of calling head.cls_stem(feat) /
+            # head.reg_stem(feat) again — this used to run each stem twice
+            # per level, per forward, doubling head activation memory (the
+            # duplicate copy retained by autograd during training).
+            cls_out, reg_out, cls_feat, reg_feat = head(feat)
             # Concatenar: (B, nc + 4, H_i, W_i)
             pred = torch.cat([cls_out, reg_out], dim=1)
 
@@ -160,9 +181,8 @@ class YOLODetectionHead(nn.Module):
             all_reg.append(reg_out)
             all_preds.append(pred)
 
-            # Features para distilación a nivel de stem (antes del pred)
-            distill_cls_feats.append(head.cls_stem(feat))
-            distill_reg_feats.append(head.reg_stem(feat))
+            distill_cls_feats.append(cls_feat)
+            distill_reg_feats.append(reg_feat)
 
         return {
             "preds":            all_preds,        # [(B, 6, H3, W3), (B, 6, H4, W4), (B, 6, H5, W5)]

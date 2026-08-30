@@ -78,8 +78,27 @@ class ProjectionLayers(nn.Module):
         Returns:
             list de tensors proyectados, mismos shapes espaciales pero
             con canales del estudiante.
+
+        Raises:
+            AssertionError: if `len(teacher_features) != self.num_levels`.
+                fusion-redesign design.md §5 flagged the un-guarded `zip`
+                below as a silent-truncation hazard once the teacher's
+                pyramid/head level count became configurable (4 levels by
+                default, vs this class's fixed 3-level presets) — a 4-vs-3
+                mismatch would otherwise distill P2/P3/P4 into student
+                P3/P4/P5 with no error. This explicit length check, with a
+                message identifying both counts, makes that impossible; the
+                caller (`KDTrainer`) is responsible for slicing the teacher's
+                features down to the matching levels by stride before
+                calling this (`src/training/strides.select_by_strides`).
         """
-        assert len(teacher_features) == self.num_levels
+        assert len(teacher_features) == self.num_levels, (
+            f"ProjectionLayers expected {self.num_levels} teacher feature "
+            f"level(s), got {len(teacher_features)}. A length mismatch here "
+            "would otherwise silently misalign levels via zip() — the "
+            "caller must select the matching levels by stride before "
+            "calling forward()."
+        )
         return [
             proj(feat)
             for proj, feat in zip(self.projections, teacher_features)
