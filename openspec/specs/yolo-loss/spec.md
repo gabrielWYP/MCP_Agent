@@ -2,7 +2,13 @@
 
 ## Purpose
 
-YOLOv8-style loss module for MasterModel. Implements Task-Aligned Assigner (TAL) for dynamic prediction-ground-truth matching, class-weighted BCE for classification (addressing 1:5.9 class imbalance), and CIoU regression loss. Operates on the model's multi-level output format.
+YOLOv8-style loss module for MasterModel. Implements Task-Aligned Assigner (TAL) for dynamic prediction-ground-truth matching, class-weighted BCE for classification, and CIoU regression loss. Operates on the model's multi-level output format.
+
+Class counts were re-measured during the damage-map-audit change: mango 208,
+damage 335 (1:1.61 ratio) — not the previously assumed 24/129 (1:5.9). See the
+Classification Loss requirement below for why `class_weights` is nonetheless
+held at `[0.5, 1.5]` rather than the inverse-frequency value for the duration
+of that change's experiment ladder.
 
 ## Requirements
 
@@ -32,15 +38,27 @@ The loss module MUST implement a Task-Aligned Assigner that dynamically matches 
 
 ### Requirement: Classification Loss
 
-The loss module MUST compute BCEWithLogitsLoss on class predictions for all assigned cells. Class weights SHALL be applied to address the 1:5.9 sano-to-danado imbalance. The weight for class sano (0) SHALL be higher than danado (1) to compensate for underrepresentation.
+The loss module MUST compute BCEWithLogitsLoss on class predictions for all assigned cells. Class weights MUST be sourced from one authoritative value, `[0.5, 1.5]` (mango=class 0, damage=class 1), matching `configs/*.yaml` and the `TrainingConfig` dataclass default. Damage (class 1) SHALL carry the higher weight.
 
-#### Scenario: Weighted BCE with class imbalance
+(`[0.5, 1.5]` is held constant for the duration of the damage-map-audit experiment
+ladder as an experimental-design requirement — every existing checkpoint was
+trained under it, and changing it mid-experiment would introduce a second
+variable and destroy attribution of any class-1 AP change to the assigner fix.
+It is deliberately NOT the inverse-frequency value: measured over the current
+dataset, mango has 208 instances and damage has 335 — a 1:1.61 ratio, not the
+previously assumed 1:5.9 — so inverse-frequency weighting on current data
+would be `[1.305, 0.810]` (≈ the `[1.27, 0.83]` recorded in
+`openspec/changes/pipeline-orchestration-docs/explore.md`). Revisiting
+`class_weights` on inverse-frequency grounds is a valid follow-up, but only
+AFTER the current validation completes — never during it. See
+`openspec/changes/damage-map-audit/proposal.md` Q2 for the full rationale.)
 
-- GIVEN ground truth with 24 sano and 129 danado boxes across the dataset
-- WHEN classification loss is computed
-- THEN sano (class 0) SHALL have weight ≈ 2.7 (inverse frequency ratio, normalized)
-- AND danado (class 1) SHALL have weight ≈ 0.5
-- AND BCE loss SHALL be weighted by these per-class factors
+#### Scenario: Authoritative class weights applied
+
+- GIVEN `TrainingConfig` constructed without an explicit `class_weights` override
+- WHEN the loss module reads `class_weights`
+- THEN it SHALL default to `[0.5, 1.5]`
+- AND damage (class 1) weight SHALL exceed mango (class 0) weight
 
 #### Scenario: Negative sample classification
 

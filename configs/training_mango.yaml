@@ -53,3 +53,24 @@ nir_std: 0.0546
 
 # Reproducibility
 seed: 42
+
+# Split manifest — YOLODataset raises if a split's label directory diverges
+# from this file (fail-fast guard against the leaked-split defect fixed in
+# damage-map-audit W0). Run `scripts/prepare_yolo_splits.py --reconcile` first.
+split_manifest: "data/annotations/yolo/splits.json"
+
+# Decode (src/training/decode.py::decode_detections). Defaults below fix the
+# eval-metric defect (missing NMS, argmax-only decode) — see
+# openspec/changes/damage-map-audit/specs/training-loop/spec.md.
+conf_threshold: 0.25
+nms_iou_threshold: 0.5
+nms_enabled: true
+decode_per_class: true
+max_detections: 300
+
+# Task-Aligned Assigner (src/training/loss.py). `assigner_center_radius: 0.0`
+# ships as the DEFAULT (legacy strict containment) so pre-fix behavior stays
+# measurable — see openspec/changes/damage-map-audit/design.md D9.
+assigner_center_radius: 0.0
+assigner_level_ranges: [64, 128]
+assigner_collect_stats: false
