@@ -107,16 +107,17 @@ class StudentModel(nn.Module):
     def unfreeze_backbone_stages(
         self,
         unfreeze_stages: list[int],
-        unfreeze_rgb_stem: bool = False,
+        unfreeze_stem: bool = False,
     ) -> None:
         """No-op for single-phase student training (API compatibility).
 
         This method exists so that Trainer can call unfreeze_backbone_stages()
         polymorphically on both MasterModel and StudentModel. Since student
         training is single-phase with all parameters trainable from epoch 1,
-        no unfreezing is performed. `unfreeze_rgb_stem` mirrors MasterModel's
-        signature (E6 production fix) and is accepted but ignored — the
-        student has no separate RGB stem to unfreeze.
+        no unfreezing is performed. `unfreeze_stem` mirrors MasterModel's
+        signature (renamed from `unfreeze_rgb_stem`, fusion-redesign D-4 —
+        there is only one stem now) and is accepted but ignored — the
+        student has no separate stem to unfreeze here.
         """
         pass
 
