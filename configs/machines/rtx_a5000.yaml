@@ -1,0 +1,14 @@
+# Machine profile: RTX A5000 (24 GB, Ampere).
+#
+# HOW the run executes only — see gtx1660s.yaml for the whitelist rules.
+# With effective_batch=8, batch_size=8 gives grad_accum_steps=1.
+#
+# This is the only profile expected to run precision: bf16 (H-BF16,
+# fusion-redesign design.md §6) — override with
+# --override precision=bf16 for that specific probe; the default here stays
+# fp32 so this profile alone remains usable for every other rung too.
+device: cuda
+batch_size: 8
+num_workers: 4
+pin_memory: true
+precision: fp32

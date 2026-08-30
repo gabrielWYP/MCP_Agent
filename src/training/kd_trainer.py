@@ -17,7 +17,6 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
-from torch.amp import autocast
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 
@@ -25,6 +24,7 @@ from .config import TrainingConfig
 from .kd_config import KDConfig
 from .kd_loss import KDLoss
 from .loop import Trainer
+from .precision import autocast_ctx
 from src.models.master.master_model import MasterModel
 from src.models.master.distill_projections import (
     backbone_projections,
@@ -120,8 +120,32 @@ class KDTrainer(Trainer):
         Teacher forward under no_grad → project features → student forward →
         det_loss + kd_weight * kd_loss → backward → grad clip → step.
 
+        D-G (fusion-redesign), mirrored from `Trainer._train_epoch`: this
+        method used to catch OOM and NaN/Inf, print a warning, and
+        `continue` — before the batch counter incremented — then floor the
+        loss divisor at `max(n_batches, 1)`. An epoch where every batch
+        failed therefore completed with finite-looking averaged losses,
+        indistinguishable from a clean run, with zero coverage in `tests/`
+        to catch it. Same policy as `loop.py`, so a reader does not have to
+        learn two sets of rules:
+
+        - `oom_skipped`: tolerated on epoch 1 only (allocator warm-up);
+          raises immediately from epoch 2 onward.
+        - `nan_skipped`: always counted, never itself fatal.
+        - `steps_taken`: optimizer steps actually executed; zero in any
+          epoch is always fatal, regardless of cause.
+
+        Divergence from `loop.py`, stated explicitly: `KDTrainer` has no
+        gradient accumulation (`grad_accum_steps` is not part of its
+        structure and adding it is out of scope for this fix), so
+        `steps_taken` here is simply "successful micro-batches" — one
+        optimizer step per successful batch, as it always was for this
+        trainer. There is no separate micro-batch/effective-step split to
+        preserve, unlike the base `Trainer`.
+
         Returns:
-            Dict with avg cls_loss, box_loss, kd_loss, total_loss.
+            Dict with avg cls_loss, box_loss, kd_loss, total_loss, and the
+            oom_skipped/nan_skipped/steps_taken counters.
         """
         self.model.train()
         self.teacher.eval()  # Ensure teacher stays in eval mode
@@ -130,7 +154,9 @@ class KDTrainer(Trainer):
         total_box = 0.0
         total_kd = 0.0
         total_loss = 0.0
-        n_batches = 0
+        steps_taken = 0
+        oom_skipped = 0
+        nan_skipped = 0
 
         for batch in self.train_loader:
             rgb = batch["rgb"].to(self.device)
@@ -141,7 +167,7 @@ class KDTrainer(Trainer):
             optimizer.zero_grad(set_to_none=True)
 
             try:
-                with autocast("cuda", enabled=self.config.amp):
+                with autocast_ctx(self.device.type, self.config.precision):
                     # --- Teacher forward (no grad) ---
                     with torch.no_grad():
                         t_out = self.teacher(rgb, nir)
@@ -185,12 +211,16 @@ class KDTrainer(Trainer):
                     # --- Total loss ---
                     loss = det_loss + self.config.kd_weight * kd_loss
 
-                # NaN / Inf guard: skip batch if loss explodes
+                # NaN / Inf guard: skip batch if loss explodes. Always
+                # counted — see D-G docstring above for why this must not
+                # also be silent.
                 if torch.isnan(loss) or torch.isinf(loss):
-                    print(f"  [NaN] Skipping batch (loss={loss.item():.2f})")
+                    nan_skipped += 1
+                    print(f"  [NaN] Skipping batch (loss={loss.item():.2f}), "
+                          f"nan_skipped={nan_skipped}")
                     continue
 
-                if self.config.amp:
+                if self.config.precision == "fp16":
                     self.scaler.scale(loss).backward()
                     self.scaler.unscale_(optimizer)
                 else:
@@ -199,7 +229,7 @@ class KDTrainer(Trainer):
                 # Gradient clipping
                 nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip)
 
-                if self.config.amp:
+                if self.config.precision == "fp16":
                     self.scaler.step(optimizer)
                     self.scaler.update()
                 else:
@@ -207,8 +237,22 @@ class KDTrainer(Trainer):
 
             except RuntimeError as e:
                 if "out of memory" in str(e).lower():
-                    print(f"  [OOM] Skipping batch, clearing CUDA cache.")
+                    oom_skipped += 1
                     torch.cuda.empty_cache()
+                    if epoch >= 2:
+                        raise RuntimeError(
+                            f"[OOM] Batch skipped on epoch {epoch} (phase {phase}); "
+                            "OOM tolerance is limited to epoch 1 (allocator "
+                            "warm-up). A run that keeps OOM-ing past epoch 1 is "
+                            "not a valid training run — reduce batch_size "
+                            "instead of retrying. "
+                            f"oom_skipped={oom_skipped}, nan_skipped={nan_skipped}, "
+                            f"steps_taken={steps_taken}."
+                        ) from e
+                    print(
+                        f"  [OOM] Skipping batch (epoch 1 warm-up tolerance), "
+                        f"clearing CUDA cache. oom_skipped={oom_skipped}"
+                    )
                     continue
                 raise
 
@@ -216,13 +260,24 @@ class KDTrainer(Trainer):
             total_box += det_dict["box_loss"]
             total_kd += kd_loss.item()
             total_loss += loss.item()
-            n_batches += 1
+            steps_taken += 1
             self.global_step += 1
 
-        n_batches = max(n_batches, 1)
+        if steps_taken == 0:
+            raise RuntimeError(
+                f"KD training epoch {epoch} (phase {phase}) took zero optimizer "
+                f"steps (oom_skipped={oom_skipped}, nan_skipped={nan_skipped}). "
+                "A run with zero steps produced no gradient update and must "
+                "not be reported as a completed epoch — see "
+                "openspec/changes/fusion-redesign/design.md D-G."
+            )
+
         return {
-            "cls_loss": total_cls / n_batches,
-            "box_loss": total_box / n_batches,
-            "kd_loss": total_kd / n_batches,
-            "total_loss": total_loss / n_batches,
+            "cls_loss": total_cls / steps_taken,
+            "box_loss": total_box / steps_taken,
+            "kd_loss": total_kd / steps_taken,
+            "total_loss": total_loss / steps_taken,
+            "oom_skipped": float(oom_skipped),
+            "nan_skipped": float(nan_skipped),
+            "steps_taken": float(steps_taken),
         }

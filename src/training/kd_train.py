@@ -103,7 +103,7 @@ def main():
     print(f"  Teacher: {config.teacher_checkpoint}")
     print(f"  Student: num_classes={config.num_classes}, backbone={config.backbone_variant}")
     print(f"  Epochs: {config.epochs}, patience: {config.patience}")
-    print(f"  Batch size: {config.batch_size}, AMP: {config.amp}")
+    print(f"  Batch size: {config.batch_size}, Precision: {config.precision}")
     print(f"  KD weight: {config.kd_weight}, temperature: {config.kd_temperature}")
     print(f"  Distill levels: {config.distill_levels}")
 
@@ -144,7 +144,7 @@ def main():
         sampler=train_sampler,
         collate_fn=collate_fn,
         num_workers=config.num_workers,
-        pin_memory=True,
+        pin_memory=config.pin_memory,
         drop_last=True,
     )
 
@@ -154,7 +154,7 @@ def main():
         shuffle=False,
         collate_fn=collate_fn,
         num_workers=config.num_workers,
-        pin_memory=True,
+        pin_memory=config.pin_memory,
     )
 
     # Create student model

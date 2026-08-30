@@ -76,7 +76,7 @@ class TestE2ETraining:
             lr_phase2=1e-4,
             warmup_epochs=1,
             patience=10,
-            amp=False,  # CPU test
+            precision="fp32",  # CPU test
             num_workers=0,
         )
 

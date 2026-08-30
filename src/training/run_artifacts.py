@@ -26,7 +26,14 @@ STAGE_LABELS: dict[str, str] = {
 
 @dataclass(frozen=True)
 class StageResult:
-    """Metadata for one completed training stage."""
+    """Metadata for one completed training stage.
+
+    The four hardware-portability fields (W9, fusion-redesign D-H) are
+    optional and default to `None` so existing `stage_summary.json` files
+    without them still load via `StageResult(**data)`. `experiment_sha256`
+    and `effective_batch` together are the comparability rule: two runs are
+    comparable only if both match.
+    """
 
     stage_key: str
     stage_label: str
@@ -34,6 +41,10 @@ class StageResult:
     checkpoint: str
     best_map50: float
     command: list[str]
+    experiment_sha256: str | None = None
+    effective_batch: int | None = None
+    precision: str | None = None
+    device: str | None = None
 
 
 @dataclass(frozen=True)
@@ -188,6 +199,10 @@ def finalize_stage(
     stage_key: str,
     stage_label: str,
     dry_run: bool = False,
+    experiment_sha256: str | None = None,
+    effective_batch: int | None = None,
+    precision: str | None = None,
+    device: str | None = None,
 ) -> StageResult:
     """Move a successful temporary stage directory into its final location."""
     if dry_run:
@@ -199,6 +214,10 @@ def finalize_stage(
             checkpoint=str(planned_dir / "best_model.pt"),
             best_map50=0.0,
             command=command,
+            experiment_sha256=experiment_sha256,
+            effective_batch=effective_batch,
+            precision=precision,
+            device=device,
         )
 
     checkpoint_path = tmp_dir / "best_model.pt"
@@ -220,6 +239,10 @@ def finalize_stage(
         checkpoint=str(final_dir / "best_model.pt"),
         best_map50=best_map50,
         command=command,
+        experiment_sha256=experiment_sha256,
+        effective_batch=effective_batch,
+        precision=precision,
+        device=device,
     )
     write_json(final_dir / "stage_summary.json", asdict(result))
     return result

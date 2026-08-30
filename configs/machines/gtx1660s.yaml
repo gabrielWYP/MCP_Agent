@@ -1,0 +1,15 @@
+# Machine profile: GTX 1660 SUPER (6.44 GB, Turing, cc7.5).
+#
+# HOW the run executes — device/batch_size/num_workers/pin_memory/precision
+# only. May not set any other key (fusion-redesign D-H whitelist). Use
+# alongside an experiment config: --config <experiment.yaml> --machine
+# configs/machines/gtx1660s.yaml.
+#
+# effective_batch is an experiment-file field, not set here. With
+# effective_batch=8, batch_size=2 gives grad_accum_steps=4.
+device: cuda
+batch_size: 2
+num_workers: 2
+pin_memory: true
+# Turing does not support bf16; precision must stay fp32 or fp16 on this card.
+precision: fp32
