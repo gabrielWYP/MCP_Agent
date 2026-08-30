@@ -126,12 +126,13 @@ class TestGenerateAnchors:
         feat_sizes = [(80, 80), (40, 40), (20, 20)]
         strides = [8, 16, 32]
 
-        anchors, num_per_level = _generate_anchors(
+        anchors, anchor_strides, num_per_level = _generate_anchors(
             feat_sizes, strides, torch.device("cpu")
         )
 
         expected = 80 * 80 + 40 * 40 + 20 * 20  # 6400 + 1600 + 400 = 8400
         assert anchors.shape == (expected, 2)
+        assert anchor_strides.shape == (expected,)
         assert sum(num_per_level) == expected
 
     def test_anchor_spacing(self):
@@ -139,8 +140,21 @@ class TestGenerateAnchors:
         feat_sizes = [(4, 4)]
         strides = [8]
 
-        anchors, _ = _generate_anchors(feat_sizes, strides, torch.device("cpu"))
+        anchors, anchor_strides, _ = _generate_anchors(feat_sizes, strides, torch.device("cpu"))
 
         # First anchor should be at (4, 4) — center of first cell
         assert anchors[0, 0] == pytest.approx(4.0)
         assert anchors[0, 1] == pytest.approx(4.0)
+
+    def test_anchor_strides_match_level(self):
+        """Task 2.1: per-anchor stride must match the FPN level it came from."""
+        feat_sizes = [(2, 2), (1, 1)]
+        strides = [8, 32]
+
+        anchors, anchor_strides, num_per_level = _generate_anchors(
+            feat_sizes, strides, torch.device("cpu")
+        )
+
+        assert num_per_level == [4, 1]
+        assert torch.all(anchor_strides[:4] == 8.0)
+        assert torch.all(anchor_strides[4:] == 32.0)

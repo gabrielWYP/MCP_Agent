@@ -12,7 +12,9 @@ References:
 
 from __future__ import annotations
 
+import csv
 import math
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -26,16 +28,57 @@ class TaskAlignedAssigner:
     Computes alignment metric = cls_score^alpha * iou^beta, selects top-k
     positive anchors per ground truth box.
 
+    Spatial admissibility (D6/A1) is applied as a mask on the alignment
+    metric BEFORE top-k selection: an anchor is admissible if its center is
+    inside the GT box, OR within `center_radius * stride` of the GT center
+    (center_radius=0.0, the default, reduces to strict containment — D9
+    legacy behavior). An optional per-level size-bin mask (D8/A3) can further
+    restrict candidates to the FPN level(s) appropriate for the GT's size.
+    Masking before top-k (rather than filtering the already-selected top-k
+    afterward, the pre-fix behavior) means top-k always returns the best
+    *usable* candidates instead of wasting budget on inadmissible ones.
+
+    The "keep at least 1 anchor per GT" fallback (D7/A2) runs AFTER these
+    masks, ranked by anchor centers (not predicted-box centers, the pre-fix
+    coordinate-source bug), so a GT is never silently dropped and the
+    fallback's anchors can never be subsequently discarded by the filter that
+    used to run after it.
+
     Args:
         topk: Number of candidate anchors per GT.
         alpha: Exponent for classification score in alignment metric.
         beta: Exponent for IoU in alignment metric.
+        center_radius: Center-sampling tolerance in stride units. 0.0 (default)
+            = legacy strict anchor-center-inside-GT containment (D9).
+        level_ranges: Open-ended FCOS-style size bins in pixels, e.g.
+            `[64, 128]` -> max(w,h)<64 admits level 0 only, <128 admits level
+            1 only, else level 2 only. `None` disables level restriction.
+        collect_stats: Non-destructive instrumentation (A4) — when True,
+            accumulates per-class, per-level positive-anchor counts in
+            `self.last_stats` without altering any assignment output. Off by
+            default. Call `reset_stats()` before a fresh instrumentation pass.
     """
 
-    def __init__(self, topk: int = 13, alpha: float = 1.0, beta: float = 6.0):
+    def __init__(
+        self,
+        topk: int = 13,
+        alpha: float = 1.0,
+        beta: float = 6.0,
+        center_radius: float = 0.0,
+        level_ranges: list[float] | None = None,
+        collect_stats: bool = False,
+    ):
         self.topk = topk
         self.alpha = alpha
         self.beta = beta
+        self.center_radius = center_radius
+        self.level_ranges = level_ranges
+        self.collect_stats = collect_stats
+        self.last_stats: dict[tuple[int, int], int] = {}
+
+    def reset_stats(self) -> None:
+        """Clear accumulated instrumentation counts (A4)."""
+        self.last_stats = {}
 
     @torch.no_grad()
     def __call__(
@@ -46,6 +89,8 @@ class TaskAlignedAssigner:
         gt_bboxes: list[torch.Tensor],
         anchors: torch.Tensor,
         strides: list[int],
+        anchor_strides: torch.Tensor | None = None,
+        num_per_level: list[int] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Assign predictions to ground truth targets.
 
@@ -55,7 +100,15 @@ class TaskAlignedAssigner:
             gt_labels: List of (N_i,) GT class labels per image.
             gt_bboxes: List of (N_i, 4) GT bboxes per image in cxcywh format.
             anchors: (num_anchors, 2) anchor center points in pixel coords.
-            strides: List of stride values per FPN level.
+            strides: List of stride values per FPN level (retained for
+                backward-compat call signatures; `anchor_strides` is the
+                per-anchor source of truth when provided).
+            anchor_strides: (num_anchors,) stride value per anchor, from
+                `_generate_anchors`. If omitted, every anchor is assumed to
+                use `strides[0]` (single-level backward-compat fallback).
+            num_per_level: Anchor count per FPN level, from `_generate_anchors`.
+                Required for the per-level mask (D8) and instrumentation (A4);
+                omit to skip both (e.g. single-level synthetic test inputs).
 
         Returns:
             target_classes: (B, num_anchors) assigned class IDs (-1 for negative).
@@ -70,6 +123,15 @@ class TaskAlignedAssigner:
         target_bboxes = torch.zeros((B, num_anchors, 4), device=device)
         target_scores = torch.zeros((B, num_anchors), device=device)
         fg_mask = torch.zeros((B, num_anchors), dtype=torch.bool, device=device)
+
+        if anchor_strides is None:
+            anchor_strides = torch.full((num_anchors,), float(strides[0]), device=device)
+
+        level_ids = (
+            self._anchor_level_ids(num_per_level, num_anchors, device)
+            if num_per_level is not None
+            else None
+        )
 
         for b in range(B):
             n_gt = len(gt_labels[b])
@@ -93,65 +155,125 @@ class TaskAlignedAssigner:
             # Alignment metric: score^alpha * iou^beta
             alignment = (gt_cls_scores ** self.alpha) * (ious ** self.beta)  # (num_anchors, N_gt)
 
-            # Select top-k anchors per GT
-            topk = min(self.topk, num_anchors)
-            topk_vals, topk_idx = alignment.topk(topk, dim=0)  # (topk, N_gt)
-
             for gt_i in range(n_gt):
-                # Positive anchors for this GT
-                pos_idx = topk_idx[:, gt_i]  # (topk,)
-                pos_scores = topk_vals[:, gt_i]  # (topk,)
+                # D6: spatial admissibility mask, applied BEFORE top-k.
+                admissible = self._spatial_admissibility(
+                    anchors, anchor_strides, gt_box[gt_i], self.center_radius
+                )
 
-                # Keep at least 1 anchor per GT, even if alignment is 0
-                if pos_scores.max() <= 0:
-                    # Fallback: use closest anchor by center distance
-                    gt_cx = gt_box[gt_i, 0].item()
-                    gt_cy = gt_box[gt_i, 1].item()
-                    anchor_cx = pred_bboxes[b, :, 0]
-                    anchor_cy = pred_bboxes[b, :, 1]
-                    dist = (anchor_cx - gt_cx)**2 + (anchor_cy - gt_cy)**2
+                level_mask = None
+                if level_ids is not None and self.level_ranges:
+                    gt_w, gt_h = gt_box[gt_i, 2].item(), gt_box[gt_i, 3].item()
+                    level_mask = self._level_admissibility(level_ids, gt_w, gt_h, self.level_ranges)
+                    admissible = admissible & level_mask
+
+                gt_alignment = alignment[:, gt_i].clone()
+                gt_alignment[~admissible] = 0.0  # mask inadmissible anchors before top-k
+
+                topk = min(self.topk, num_anchors)
+                topk_vals, topk_idx = gt_alignment.topk(topk)
+
+                valid = topk_vals > 0
+                pos_idx = topk_idx[valid]
+                pos_scores = topk_vals[valid]
+
+                # D7: fallback runs AFTER the spatial/level filter (not before,
+                # the pre-fix ordering that let the filter erase it), and ranks
+                # by anchor centers — not predicted-box centers, the pre-fix
+                # coordinate-source bug (predicted boxes move during training;
+                # the filter above tests fixed anchor grid centers).
+                if len(pos_idx) == 0:
+                    gt_cxcy = gt_box[gt_i, :2]
+                    dist = (anchors[:, 0] - gt_cxcy[0]) ** 2 + (anchors[:, 1] - gt_cxcy[1]) ** 2
+                    if level_mask is not None and level_mask.any():
+                        dist = dist.clone()
+                        dist[~level_mask] = float("inf")
                     _, fallback_idx = dist.topk(min(3, num_anchors), largest=False)
                     pos_idx = fallback_idx
                     pos_scores = torch.ones(len(fallback_idx), device=device) * 0.01
-                else:
-                    # Filter out zero-score anchors
-                    valid = pos_scores > 0
-                    pos_idx = pos_idx[valid]
-                    pos_scores = pos_scores[valid]
 
                 if len(pos_idx) == 0:
                     continue
 
-                # Check if anchor center is inside GT box (spatial constraint)
-                anchor_centers = anchors[pos_idx]  # (K, 2)
-                gt_cxcy = gt_box[gt_i, :2]  # (2,)
-                gt_wh = gt_box[gt_i, 2:]  # (2,)
-                gt_min = gt_cxcy - gt_wh / 2
-                gt_max = gt_cxcy + gt_wh / 2
-
-                inside = (
-                    (anchor_centers[:, 0] >= gt_min[0]) &
-                    (anchor_centers[:, 0] <= gt_max[0]) &
-                    (anchor_centers[:, 1] >= gt_min[1]) &
-                    (anchor_centers[:, 1] <= gt_max[1])
-                )
-
-                pos_idx = pos_idx[inside]
-                pos_scores = pos_scores[inside]
-
-                if len(pos_idx) == 0:
-                    continue
-
-                # Handle conflicts: if an anchor is assigned to multiple GTs,
-                # keep the one with highest alignment score
-                for idx, score in zip(pos_idx, pos_scores):
+                # Conflict resolution: if an anchor is assigned to multiple
+                # GTs, keep the one with the highest alignment score.
+                for idx, score in zip(pos_idx.tolist(), pos_scores.tolist()):
                     if target_scores[b, idx] < score or target_classes[b, idx] == -1:
                         target_classes[b, idx] = gt_cls[gt_i]
                         target_bboxes[b, idx] = gt_box[gt_i]
                         target_scores[b, idx] = score
                         fg_mask[b, idx] = True
 
+                if self.collect_stats and level_ids is not None:
+                    cls_id = int(gt_cls[gt_i].item())
+                    for idx in pos_idx.tolist():
+                        key = (cls_id, int(level_ids[idx].item()))
+                        self.last_stats[key] = self.last_stats.get(key, 0) + 1
+
         return target_classes, target_bboxes, target_scores, fg_mask
+
+    @staticmethod
+    def _spatial_admissibility(
+        anchors: torch.Tensor,
+        anchor_strides: torch.Tensor,
+        gt_box: torch.Tensor,
+        center_radius: float,
+    ) -> torch.Tensor:
+        """D6: anchor admissible if inside the GT box OR within
+        `center_radius * stride` of the GT center. `center_radius<=0`
+        reduces to strict containment (D9 legacy default)."""
+        gt_cxcy = gt_box[:2]
+        gt_wh = gt_box[2:]
+        gt_min = gt_cxcy - gt_wh / 2
+        gt_max = gt_cxcy + gt_wh / 2
+
+        inside = (
+            (anchors[:, 0] >= gt_min[0]) &
+            (anchors[:, 0] <= gt_max[0]) &
+            (anchors[:, 1] >= gt_min[1]) &
+            (anchors[:, 1] <= gt_max[1])
+        )
+
+        if center_radius <= 0:
+            return inside
+
+        radius_px = center_radius * anchor_strides
+        dist = ((anchors[:, 0] - gt_cxcy[0]) ** 2 + (anchors[:, 1] - gt_cxcy[1]) ** 2).sqrt()
+        return inside | (dist <= radius_px)
+
+    @staticmethod
+    def _level_admissibility(
+        level_ids: torch.Tensor,
+        gt_w: float,
+        gt_h: float,
+        level_ranges: list[float],
+    ) -> torch.Tensor:
+        """D8: open-ended FCOS-style size bins.
+
+        `level_ranges=[64, 128]`: max(w,h)<64 -> level 0 (P3/stride8) only,
+        <128 -> level 1 (P4/stride16) only, else -> level 2 (P5/stride32) only.
+        """
+        size = max(gt_w, gt_h)
+        target_level = len(level_ranges)
+        for i, bound in enumerate(level_ranges):
+            if size < bound:
+                target_level = i
+                break
+        return level_ids == target_level
+
+    @staticmethod
+    def _anchor_level_ids(
+        num_per_level: list[int],
+        num_anchors: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Map each anchor index to its FPN level index (0=P3, 1=P4, 2=P5, ...)."""
+        ids = torch.zeros(num_anchors, dtype=torch.long, device=device)
+        offset = 0
+        for level_idx, count in enumerate(num_per_level):
+            ids[offset:offset + count] = level_idx
+            offset += count
+        return ids
 
     @staticmethod
     def _cxcywh_to_xyxy(boxes: torch.Tensor) -> torch.Tensor:
@@ -168,8 +290,8 @@ def _generate_anchors(
     feat_sizes: list[tuple[int, int]],
     strides: list[int],
     device: torch.device,
-) -> tuple[torch.Tensor, list[int]]:
-    """Generate anchor center points for all FPN levels.
+) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
+    """Generate anchor center points (and per-anchor strides) for all FPN levels.
 
     Args:
         feat_sizes: List of (H_i, W_i) per FPN level.
@@ -178,9 +300,13 @@ def _generate_anchors(
 
     Returns:
         anchors: (num_anchors, 2) center points in pixel coords.
+        anchor_strides: (num_anchors,) stride value for each anchor — needed
+            by the assigner's center-sampling radius (D6/A1), which is
+            expressed in stride units per anchor.
         num_per_level: Number of anchors per level.
     """
     all_anchors = []
+    all_strides = []
     num_per_level = []
 
     for (h, w), stride in zip(feat_sizes, strides):
@@ -189,10 +315,12 @@ def _generate_anchors(
         grid_y, grid_x = torch.meshgrid(y, x, indexing="ij")
         centers = torch.stack([grid_x.flatten(), grid_y.flatten()], dim=1)
         all_anchors.append(centers)
+        all_strides.append(torch.full((h * w,), float(stride), device=device))
         num_per_level.append(h * w)
 
     anchors = torch.cat(all_anchors, dim=0)
-    return anchors, num_per_level
+    anchor_strides = torch.cat(all_strides, dim=0)
+    return anchors, anchor_strides, num_per_level
 
 
 class YOLOv8Loss(nn.Module):
@@ -207,6 +335,11 @@ class YOLOv8Loss(nn.Module):
         class_weights: Per-class weights for classification loss.
         focal_gamma: Focal loss gamma (0 = standard BCE, 2.0 default).
         strides: FPN level strides.
+        assigner_center_radius: Center-sampling tolerance in stride units
+            passed to `TaskAlignedAssigner` (0.0 = legacy strict containment, D9).
+        assigner_level_ranges: Per-level GT-size admissibility bins (D8).
+        assigner_collect_stats: Enable non-destructive per-class/per-level
+            positive-anchor instrumentation (A4).
     """
 
     def __init__(
@@ -217,6 +350,9 @@ class YOLOv8Loss(nn.Module):
         class_weights: list[float] | None = None,
         focal_gamma: float = 2.0,
         strides: list[int] | None = None,
+        assigner_center_radius: float = 0.0,
+        assigner_level_ranges: list[float] | None = None,
+        assigner_collect_stats: bool = False,
     ):
         super().__init__()
         self.num_classes = num_classes
@@ -231,7 +367,35 @@ class YOLOv8Loss(nn.Module):
             "class_weights", torch.tensor(class_weights, dtype=torch.float32)
         )
 
-        self.assigner = TaskAlignedAssigner(topk=13, alpha=1.0, beta=6.0)
+        self.assigner = TaskAlignedAssigner(
+            topk=13,
+            alpha=1.0,
+            beta=6.0,
+            center_radius=assigner_center_radius,
+            level_ranges=assigner_level_ranges,
+            collect_stats=assigner_collect_stats,
+        )
+
+    def get_assigner_stats(self) -> dict[tuple[int, int], int]:
+        """Return accumulated per-(class, level) positive-anchor counts (A4)."""
+        return dict(self.assigner.last_stats)
+
+    def reset_assigner_stats(self) -> None:
+        """Clear accumulated assigner instrumentation counts (A4)."""
+        self.assigner.reset_stats()
+
+    def write_assigner_stats_csv(self, path: str | Path) -> None:
+        """Write accumulated per-class, per-level positive-anchor counts to CSV (A4).
+
+        Used by `scripts/evaluate_checkpoint.py --assigner-stats` (E2/A0).
+        """
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["class_id", "level", "positive_anchor_count"])
+            for (cls_id, level), count in sorted(self.assigner.last_stats.items()):
+                writer.writerow([cls_id, level, count])
 
     def forward(
         self,
@@ -280,7 +444,7 @@ class YOLOv8Loss(nn.Module):
         pred_reg = torch.cat(all_reg, dim=1)  # (B, A, 4)
 
         # Generate anchors
-        anchors, _ = _generate_anchors(feat_sizes, self.strides, device)
+        anchors, anchor_strides, num_per_level = _generate_anchors(feat_sizes, self.strides, device)
 
         # Convert reg predictions from deltas to absolute bboxes
         # pred_reg is (cx, cy, w, h) in pixel space relative to anchors
@@ -310,7 +474,8 @@ class YOLOv8Loss(nn.Module):
         # TAL assignment
         pred_scores = pred_cls.sigmoid()
         target_classes, target_bboxes, target_scores, fg_mask = self.assigner(
-            pred_scores, pred_bboxes, gt_labels_list, gt_bboxes_pixel, anchors, self.strides
+            pred_scores, pred_bboxes, gt_labels_list, gt_bboxes_pixel, anchors, self.strides,
+            anchor_strides=anchor_strides, num_per_level=num_per_level,
         )
 
         # Build target_cls: one-hot for positives (binary), zero for negatives
