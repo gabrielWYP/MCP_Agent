@@ -54,6 +54,7 @@ from src.models.master.master_model import MasterModel
 from src.models.student.student_model import StudentModel
 from src.training.config import TrainingConfig
 from src.training.dataset import letterbox
+from src.training.decode import decode_detections
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -122,6 +123,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--conf-threshold", type=float, default=0.25,
         help="Confidence threshold for predictions (default: 0.25).",
+    )
+    parser.add_argument(
+        "--nms-iou-threshold", type=float, default=0.5,
+        help="IoU threshold for per-class NMS (default: 0.5).",
+    )
+    parser.add_argument(
+        "--nms-enabled", action=argparse.BooleanOptionalAction, default=True,
+        help="Apply per-class NMS (default: True). Use --no-nms-enabled to disable.",
+    )
+    parser.add_argument(
+        "--decode-per-class", action=argparse.BooleanOptionalAction, default=True,
+        help=(
+            "Emit one candidate per qualifying class per anchor instead of only "
+            "the argmax class (default: True). Use --no-decode-per-class for the "
+            "legacy argmax-only decode."
+        ),
     )
     parser.add_argument(
         "--output-dir", type=str, default="visualizations/damage_preds",
@@ -290,80 +307,52 @@ def decode_predictions(
     num_classes: int,
     image_size: int,
     conf_threshold: float,
+    nms_iou_threshold: float = 0.5,
+    nms_enabled: bool = True,
+    per_class_candidates: bool = True,
+    max_detections: int = 300,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Decode raw model output into filtered boxes, scores, and labels.
 
-    Applies sigmoid to classification logits, decodes anchor-free bbox
-    deltas, and filters by confidence threshold.
+    Thin wrapper over `src.training.decode.decode_detections` — the same
+    function `Trainer._decode_predictions` uses — so this script and the
+    trainer can never silently diverge again (design.md D3; training-loop
+    spec "Decode Consistency Across Consumers"). PR #10 previously kept an
+    independent, unclamped `reg.exp()` decode here; that duplication is now
+    removed in favor of one shared implementation.
 
     Args:
         output: Model forward output dict with 'cls_preds' and 'preds'.
         num_classes: Number of detection classes.
-        image_size: Input image size (for normalization).
-        conf_threshold: Minimum confidence to keep a prediction.
+        image_size: Input image size (unused for output scaling here — this
+            script draws in letterbox pixel space, not normalized [0, 1]).
+        conf_threshold: Minimum confidence to keep a candidate.
+        nms_iou_threshold: IoU threshold for per-class NMS.
+        nms_enabled: Whether to apply per-class NMS (E1 lever).
+        per_class_candidates: Whether to emit one candidate per qualifying
+            class per anchor instead of only the argmax class (E3 lever).
+        max_detections: Hard cap on returned detections.
 
     Returns:
         boxes: (P, 4) cxcywh in letterbox pixel coordinates.
         scores: (P,) confidence scores.
         labels: (P,) integer class IDs.
     """
-    preds = output["preds"]       # list of (B, nc+4, H, W)
-    cls_preds = output["cls_preds"]  # list of (B, nc, H, W)
-
-    all_boxes = []
-    all_scores = []
-    all_labels = []
-
-    for pred, cls_pred, stride in zip(preds, cls_preds, STRIDES):
-        # pred: (1, nc+4, H, W), cls_pred: (1, nc, H, W)
-        H, W = pred.shape[2], pred.shape[3]
-
-        p = pred[0]      # (nc+4, H, W)
-        c = cls_pred[0]  # (nc, H, W)
-
-        # Classification scores (sigmoid)
-        scores = c.sigmoid()  # (nc, H, W)
-        max_scores, max_labels = scores.max(dim=0)  # (H, W)
-
-        # Regression deltas
-        reg = p[num_classes:]  # (4, H, W)
-
-        # Filter by confidence
-        mask = max_scores > conf_threshold
-        if not mask.any():
-            continue
-
-        ys, xs = mask.nonzero(as_tuple=True)
-
-        # Decode bboxes (anchor-free)
-        dx = reg[0, ys, xs]
-        dy = reg[1, ys, xs]
-        w = reg[2, ys, xs].exp()
-        h = reg[3, ys, xs].exp()
-
-        # Anchor centers → pixel coordinates in letterbox space
-        anchor_x = (xs.float() + 0.5) * stride
-        anchor_y = (ys.float() + 0.5) * stride
-
-        cx = anchor_x + dx
-        cy = anchor_y + dy
-
-        boxes = torch.stack([cx, cy, w, h], dim=1)  # (K, 4) pixel coords
-
-        all_boxes.append(boxes)
-        all_scores.append(max_scores[mask])
-        all_labels.append(max_labels[mask])
-
-    if all_boxes:
-        boxes = torch.cat(all_boxes).cpu().numpy()
-        scores = torch.cat(all_scores).cpu().numpy()
-        labels = torch.cat(all_labels).cpu().numpy()
-    else:
-        boxes = np.zeros((0, 4), dtype=np.float32)
-        scores = np.zeros((0,), dtype=np.float32)
-        labels = np.zeros((0,), dtype=np.int64)
-
-    return boxes, scores, labels
+    boxes, scores, labels = decode_detections(
+        output["preds"],
+        output["cls_preds"],
+        batch_idx=0,
+        num_classes=num_classes,
+        image_size=image_size,
+        strides=tuple(STRIDES),
+        conf_threshold=conf_threshold,
+        nms_iou_threshold=nms_iou_threshold,
+        nms_enabled=nms_enabled,
+        per_class_candidates=per_class_candidates,
+        max_detections=max_detections,
+        normalize=False,  # this script draws in letterbox pixel space
+    )
+    return boxes.cpu().numpy(), scores.cpu().numpy(), labels.cpu().numpy()
 
 
 # ---------------------------------------------------------------------------
@@ -656,7 +645,13 @@ def main() -> int:
 
             # Decode predictions (in letterbox pixel coordinates)
             pred_boxes, pred_scores, pred_labels = decode_predictions(
-                output, config.num_classes, config.image_size, args.conf_threshold
+                output,
+                config.num_classes,
+                config.image_size,
+                args.conf_threshold,
+                nms_iou_threshold=args.nms_iou_threshold,
+                nms_enabled=args.nms_enabled,
+                per_class_candidates=args.decode_per_class,
             )
 
             # Load ground truth

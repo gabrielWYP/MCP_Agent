@@ -26,6 +26,7 @@ from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, LambdaLR
 from torch.utils.data import DataLoader
 
 from .config import TrainingConfig
+from .decode import decode_detections
 from .loss import YOLOv8Loss
 from .metrics import compute_map, generate_training_curves, LossHistory
 
@@ -36,7 +37,9 @@ class Trainer:
     Args:
         model: MasterModel instance.
         config: TrainingConfig with all hyperparameters.
-        train_loader: Training data loader.
+        train_loader: Training data loader. Optional — only required for
+            `fit()`; `evaluate()` (D10) has no dependency on it, so eval-only
+            entrypoints (`scripts/evaluate_checkpoint.py`) can omit it.
         val_loader: Validation data loader.
     """
 
@@ -44,7 +47,7 @@ class Trainer:
         self,
         model: nn.Module,
         config: TrainingConfig,
-        train_loader: DataLoader,
+        train_loader: DataLoader | None,
         val_loader: DataLoader,
     ):
         self.model = model
@@ -62,6 +65,10 @@ class Trainer:
             cls_weight=config.cls_weight,
             class_weights=config.class_weights,
             focal_gamma=getattr(config, 'focal_gamma', 2.0),
+            strides=[8, 16, 32],
+            assigner_center_radius=getattr(config, "assigner_center_radius", 0.0),
+            assigner_level_ranges=getattr(config, "assigner_level_ranges", None),
+            assigner_collect_stats=getattr(config, "assigner_collect_stats", False),
         ).to(self.device)
 
         # AMP
@@ -174,10 +181,14 @@ class Trainer:
         print(f"Phase {phase}: {epochs} epochs | LR={lr}")
         print(f"{'─'*50}")
 
-        # Freeze/unfreeze backbone
+        # Freeze/unfreeze backbone. `unfreeze_rgb_stem=True` is the E6/Q10
+        # production fix: `freeze_backbone()` unconditionally freezes the RGB
+        # stem, so without this flag a Phase 2 "unfreeze" call never actually
+        # let it adapt — plausible root cause of the maestro underperforming
+        # its own student (design.md Out of Scope; proposal.md Round 3 Q10).
         self.model.freeze_backbone(freeze_stages=freeze_stages)
         if unfreeze_stages is not None:
-            self.model.unfreeze_backbone_stages(unfreeze_stages)
+            self.model.unfreeze_backbone_stages(unfreeze_stages, unfreeze_rgb_stem=True)
 
         # Count trainable params
         trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
@@ -283,6 +294,22 @@ class Trainer:
                 for cls_id, ap in val_metrics.get("per_class_ap_50", {}).items():
                     self.writer.add_scalar(f"Phase{phase}/val/ap50_class{cls_id}", ap, epoch)
 
+                # E6 instrumentation (Q10): verify the Phase 2 RGB-stem
+                # unfreeze fix actually fires, independent of its effect on mAP.
+                if self.config.model_type == "master":
+                    rgb_stem_trainable = any(
+                        p.requires_grad for p in self.model.backbone.rgb_stem.parameters()
+                    )
+                    self.writer.add_scalar(
+                        f"Phase{phase}/rgb_stem_requires_grad", float(rgb_stem_trainable), epoch
+                    )
+                    if "rgb_stem_grad_norm" in train_metrics:
+                        self.writer.add_scalar(
+                            f"Phase{phase}/rgb_stem_grad_norm",
+                            train_metrics["rgb_stem_grad_norm"],
+                            epoch,
+                        )
+
             # Checkpoint: best mAP (use >= to save on first epoch even if mAP=0)
             if map50 >= self.best_map50:
                 self.best_map50 = map50
@@ -312,6 +339,7 @@ class Trainer:
         total_box = 0.0
         total_loss = 0.0
         n_batches = 0
+        rgb_stem_grad_norms: list[float] = []
 
         for batch in self.train_loader:
             rgb = batch["rgb"].to(self.device)
@@ -343,6 +371,14 @@ class Trainer:
                 else:
                     loss.backward()
 
+                # E6 instrumentation: capture the RGB stem's gradient norm
+                # right after backward(), before clipping/step touch it —
+                # proves whether the Phase 2 unfreeze fix actually let
+                # gradients flow into the stem (design.md Q10). No-op cost
+                # for the student model / Phase 1 (norm is 0.0 when frozen).
+                if self.config.model_type == "master":
+                    rgb_stem_grad_norms.append(self._rgb_stem_grad_norm())
+
                 # Gradient clipping
                 nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip)
 
@@ -366,18 +402,54 @@ class Trainer:
             self.global_step += 1
 
         n_batches = max(n_batches, 1)
-        return {
+        result = {
             "cls_loss": total_cls / n_batches,
             "box_loss": total_box / n_batches,
             "total_loss": total_loss / n_batches,
         }
+        if rgb_stem_grad_norms:
+            result["rgb_stem_grad_norm"] = sum(rgb_stem_grad_norms) / len(rgb_stem_grad_norms)
+        return result
+
+    def _rgb_stem_grad_norm(self) -> float:
+        """L2 norm of the RGB stem's gradients (E6 instrumentation, Q10).
+
+        Returns 0.0 when the stem is frozen (no gradients) or has no
+        gradients yet. Used to verify the Phase 2 unfreeze fix actually
+        fires, independent of whether it changes the mAP outcome — an
+        unfreeze that silently did not fire is a failed run, not a refuted
+        hypothesis (design.md E6 bar).
+        """
+        total_sq = 0.0
+        for param in self.model.backbone.rgb_stem.parameters():
+            if param.grad is not None:
+                total_sq += param.grad.detach().float().norm(2).item() ** 2
+        return total_sq ** 0.5
 
     @torch.no_grad()
     def _validate(self, epoch: int, phase: int) -> dict:
         """Run validation and compute mAP metrics.
 
+        Thin wrapper over `evaluate()` — `epoch`/`phase` are accepted for the
+        training-loop call site's logging context but are not needed by
+        evaluation itself (D10).
+
         Returns:
             Dict with map50, map_50_95, per_class_ap_50, per_class_ap_50_95.
+        """
+        return self.evaluate()
+
+    @torch.no_grad()
+    def evaluate(self) -> dict:
+        """Run evaluation over `val_loader` and compute mAP metrics.
+
+        Public, eval-only entrypoint with no dependency on a training loop or
+        `train_loader` (D10). Used by both the training loop's periodic
+        validation and `scripts/evaluate_checkpoint.py`.
+
+        Returns:
+            Dict with map50, map_50_95, per_class_ap_50, per_class_ap_50_95,
+            per_class precision/recall/f1, and per_class_counts.
         """
         self.model.eval()
 
@@ -403,8 +475,6 @@ class Trainer:
 
             B = rgb.shape[0]
             for b in range(B):
-                # Simple decoding: take max-score class per spatial location
-                # For mAP, we need per-image predictions
                 pred_boxes_b, pred_scores_b, pred_labels_b = self._decode_predictions(
                     preds, cls_preds, b
                 )
@@ -426,9 +496,39 @@ class Trainer:
             gt_boxes=all_gt_boxes,
             gt_labels=all_gt_labels,
             num_classes=self.config.num_classes,
+            score_threshold=self.config.conf_threshold,
         )
 
         return metrics
+
+    @staticmethod
+    def _decode_predictions_static(
+        preds: list[torch.Tensor],
+        cls_preds: list[torch.Tensor],
+        batch_idx: int,
+        config: TrainingConfig,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Config-driven decode, usable without a full `Trainer` instance.
+
+        Thin wrapper over `decode.decode_detections` (D3) — the single
+        source of truth for decode semantics shared with
+        `scripts/visualize_damage_predictions.py`.
+        """
+        boxes, scores, labels = decode_detections(
+            preds,
+            cls_preds,
+            batch_idx=batch_idx,
+            num_classes=config.num_classes,
+            image_size=config.image_size,
+            strides=(8, 16, 32),
+            conf_threshold=config.conf_threshold,
+            nms_iou_threshold=config.nms_iou_threshold,
+            nms_enabled=config.nms_enabled,
+            per_class_candidates=config.decode_per_class,
+            max_detections=config.max_detections,
+            normalize=True,
+        )
+        return boxes.cpu(), scores.cpu(), labels.cpu()
 
     def _decode_predictions(
         self,
@@ -443,76 +543,7 @@ class Trainer:
             pred_scores: (P,) confidence scores.
             pred_labels: (P,) class IDs.
         """
-        all_boxes = []
-        all_scores = []
-        all_labels = []
-
-        strides = [8, 16, 32]
-
-        for level, (pred, cls_pred, stride) in enumerate(zip(preds, cls_preds, strides)):
-            # pred: (B, nc+4, H, W), cls_pred: (B, nc, H, W)
-            H, W = pred.shape[2], pred.shape[3]
-            nc = self.config.num_classes
-
-            # Extract for this batch item
-            p = pred[batch_idx]  # (nc+4, H, W)
-            c = cls_pred[batch_idx]  # (nc, H, W)
-
-            # Class scores (sigmoid)
-            scores = c.sigmoid()  # (nc, H, W)
-            max_scores, max_labels = scores.max(dim=0)  # (H, W)
-
-            # Bbox deltas
-            reg = p[nc:]  # (4, H, W)
-
-            # Filter by confidence threshold
-            threshold = 0.25
-            mask = max_scores > threshold
-
-            if not mask.any():
-                continue
-
-            # Get positions
-            ys, xs = mask.nonzero(as_tuple=True)
-
-            # Decode bboxes
-            dx = reg[0, ys, xs]
-            dy = reg[1, ys, xs]
-            w = reg[2, ys, xs].exp()
-            h = reg[3, ys, xs].exp()
-
-            # Anchor centers
-            anchor_x = (xs.float() + 0.5) * stride
-            anchor_y = (ys.float() + 0.5) * stride
-
-            cx = anchor_x + dx
-            cy = anchor_y + dy
-
-            # Normalize to [0, 1] (assuming image_size)
-            img_size = self.config.image_size
-            boxes = torch.stack([
-                cx / img_size,
-                cy / img_size,
-                w / img_size,
-                h / img_size,
-            ], dim=1)  # (K, 4) cxcywh normalized
-
-            all_boxes.append(boxes)
-            all_scores.append(max_scores[mask])
-            all_labels.append(max_labels[mask])
-
-        if all_boxes:
-            return (
-                torch.cat(all_boxes).cpu(),
-                torch.cat(all_scores).cpu(),
-                torch.cat(all_labels).cpu(),
-            )
-        else:
-            return (
-                torch.zeros(0, 4),
-                torch.zeros(0),
-                torch.zeros(0, dtype=torch.long),
-            )
+        return self._decode_predictions_static(preds, cls_preds, batch_idx, self.config)
 
     def _save_checkpoint(
         self,
