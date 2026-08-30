@@ -95,57 +95,64 @@ Chain strategy: stacked-to-main
 
 ## Phase 6 — PR2: W1 backbone + stem inflation
 
-- [ ] 6.1 RED: `torch.allclose` — `W_new[:, :3] == W_imagenet*0.75`, `W_new[:, 3] == mean(W_imagenet,dim=1)*0.75`, bias/LN copied verbatim, against a freshly loaded `convnext_tiny`.
-- [ ] 6.2 GREEN: `src/models/master/backbone.py` — `EarlyFusionBackbone(pretrained, variant, in_channels=4)` replacing `DualConvNeXtBackbone`; `_load_pretrained_stem()` implementing D-B.
-- [ ] 6.3 RED (H-B): NIR-only input perturbation — count params with non-zero grad; bar ≥27M.
-- [ ] 6.4 GREEN: verify H-B bar against the built backbone.
-- [ ] 6.5 Zero-cost rung H-A: `scripts/stem_init_audit.py --init {inflation,zero,copy}`; CONFIRM = inflation within 2× reference across-image std at every stage and closer than naive copy; REFUTE = fall back to zero-init, record why.
+- [x] 6.1 RED: `torch.allclose` — `W_new[:, :3] == W_imagenet*0.75`, `W_new[:, 3] == mean(W_imagenet,dim=1)*0.75`, bias/LN copied verbatim, against a freshly loaded `convnext_tiny`. (`tests/models/master/test_backbone.py::TestStemInflation`)
+- [x] 6.2 GREEN: `src/models/master/backbone.py` — `EarlyFusionBackbone(pretrained, variant, in_channels=4)` replacing `DualConvNeXtBackbone`; `_load_pretrained_stem()` implementing D-B. `in_channels=3` (verbatim copy) also supported for the H-D control arm.
+- [x] 6.3 RED (H-B): NIR-only input perturbation — count params with non-zero grad; bar ≥27M. (`test_backbone.py::TestNIRCapacity`)
+- [x] 6.4 GREEN: verify H-B bar against the built backbone. **Measured: 26,618,208 params reachable at a 64px probe (below the 27M bar — receptive field too small to reach every stage-4 channel), 27,820,128 (the entire backbone) at a 640px probe.** Test uses 640px + `eval()` (stochastic depth in `train()` mode makes the exact reachable-parameter count non-deterministic per forward pass).
+- [x] 6.5 Zero-cost rung H-A: `scripts/stem_init_audit.py --init {inflation,zero,copy}`; CONFIRM = inflation within 2× reference across-image std at every stage and closer than naive copy; REFUTE = fall back to zero-init, record why. **Run for real** on 16 real images from `data/cache/mango/rgb` (synthetic Gaussian noise batches made the across-image std band uninformatively narrow — every noise image has nearly identical statistics — so the script prefers real data when available). **Result: CONFIRM.** Inflation stayed within the 2× band at all 4 stages; summed |deviation| from the RGB-only reference was 0.0037 for inflation vs 0.1054 for naive copy (≈28× closer) and 0.1417 for zero-init.
 
 ## Phase 7 — PR2: W2 neck + strides resolver (D-D)
 
-- [ ] 7.1 RED: `FPNNeck` emits exactly the levels named by `strides`, finest-first, 256ch, for `[4,8,16,32]` and `[8,16,32]`.
-- [ ] 7.2 GREEN: `src/models/master/neck.py` — delete `DualFPN` (`:106-173`); add `FPNNeck` wrapping unchanged `SingleFPN`; rewrite module docstring.
-- [ ] 7.3 RED: `_generate_anchors` at `[4,8,16,32]`, 640² → 34,000 anchors, per-level `[25600,6400,1600,400]`.
-- [ ] 7.4 RED: `_level_admissibility` with `[32,64,128]` maps a 30px box to level 0.
-- [ ] 7.5 RED: config invariant — `len(assigner_level_ranges) != len(head_strides)-1` raises (`config.py:138-144`).
-- [ ] 7.6 GREEN: create `src/training/strides.py` (`STRIDE_TO_LEVEL`, `resolve_head_strides`, `resolve_from_checkpoint`, `validate_strides`); wire into `config.py` `__post_init__`.
-- [ ] 7.7 GREEN: remove defaults on `YOLOv8Loss(strides=...)` (`loss.py:352,362`) and `decode_detections(strides=...)` (`decode.py:40`) so a forgotten argument is a `TypeError`.
-- [ ] 7.8 Zero-cost rung H-C: static assert no `adaptive_avg_pool2d` between backbone and head; finest emitted cell ≤8px.
+- [x] 7.1 RED: `FPNNeck` emits exactly the levels named by `strides`, finest-first, 256ch, for `[4,8,16,32]` and `[8,16,32]`. (`tests/models/master/test_neck.py`)
+- [x] 7.2 GREEN: `src/models/master/neck.py` — delete `DualFPN` (`:106-173`); add `FPNNeck` wrapping unchanged `SingleFPN`; rewrite module docstring.
+- [x] 7.3 RED: `_generate_anchors` at `[4,8,16,32]`, 640² → 34,000 anchors, per-level `[25600,6400,1600,400]`. (`tests/training/test_tal.py::TestGenerateAnchors::test_four_level_anchor_count_at_640`) `_generate_anchors` itself needed no code change, as design.md predicted.
+- [x] 7.4 RED: `_level_admissibility` with `[32,64,128]` maps a 30px box to level 0. (`tests/training/test_tal.py::TestLevelAdmissibility`)
+- [x] 7.5 RED: config invariant — `len(assigner_level_ranges) != len(head_strides)-1` raises. (`tests/training/test_strides.py::TestConfigInvariantEnforced`) Enforced in `TrainingConfig.__post_init__` only for `model_type="master"` — the student is out of scope (D-2) and always uses its own fixed 3-level strides regardless of these two fields.
+- [x] 7.6 GREEN: create `src/training/strides.py` (`STRIDE_TO_LEVEL`, `resolve_head_strides`, `resolve_from_checkpoint`, `validate_strides`); wire into `config.py` `__post_init__`. Also added `resolve_active_strides` (branches on `model_type`), `select_by_strides` (KD's stride-indexed slicing, §5), `STUDENT_STRIDES`/`ALL_STRIDES`/`DEFAULT_HEAD_STRIDES` constants — the single canonical source the repo-guard test (10.1) exempts.
+- [x] 7.7 GREEN: remove defaults on `YOLOv8Loss(strides=...)` (now keyword-only, required) and `decode_detections(strides=...)` (now required) so a forgotten argument is a `TypeError`. Also made `YOLODetectionHead(strides=...)` keyword-only/required for the same reason (not one of the original 8 sites, but the same class of literal-default hazard). **Consequence**: `tests/training/test_training_step.py`'s `criterion` fixture and `src/models/master/test_arch.py`/`sanity_check.py` (already being rewritten under 8.5) needed an explicit `strides=` argument added.
+- [x] 7.8 Zero-cost rung H-C: static assert no `adaptive_avg_pool2d` between backbone and head; finest emitted cell ≤8px. (`tests/models/master/test_master_model.py::TestNoPoolingBetweenBackboneAndHead`)
 
 ## Phase 8 — PR2: W3/W4 fusion deletion + `MasterModel` rewire
 
-- [ ] 8.1 RED: `MasterModel(head_strides=[4,8,16,32])` fwd+bwd on CPU at 128²; output dict has exactly 7 keys; every emitted level receives a non-`None` grad (D3 regression test).
-- [ ] 8.2 GREEN: delete `src/models/master/fusion.py` in full (`StageAttentionFusion`, `CrossModalFusion`).
-- [ ] 8.3 GREEN: `src/models/master/master_model.py` — rewire `forward`; rename `distill_backbone_rgb`→`distill_backbone`, drop `distill_backbone_fused`; `freeze_backbone`/`unfreeze_backbone_stages` lose `rgb_stem`/`nir_stem` asymmetry.
-- [ ] 8.4 GREEN: `src/models/master/__init__.py` — remove re-exports of the three deleted classes.
-- [ ] 8.5 GREEN: `src/models/master/test_arch.py`, `sanity_check.py`, `README.md` — remove dual-stream imports/instantiation and references.
-- [ ] 8.6 GREEN: delete `scripts/visualize_attention.py`, `scripts/attention_comparison.py`.
-- [ ] 8.7 RED: rewrite `tests/models/master/test_freeze_policy.py` against `stem`/`stages` names (no `rgb_stem`/`nir_stem`).
-- [ ] 8.8 RED: synthetic v1 checkpoint dict raises the `arch_version` error before `load_state_dict`.
-- [ ] 8.9 GREEN: `_save_checkpoint` (`loop.py:557-564`) writes `arch_version: 2`; `evaluate_checkpoint.py:120-131`, `visualize_damage_predictions.py` check it first.
-- [ ] 8.10 Zero-cost rung V0: `scripts/measure_vram.py --variant {master_v1,new_3lvl_preW5,new_3lvl,new_4lvl}`, batches 1/2/4; CONFIRM 4-level peak ≤6.0GB; REFUTE >6.0GB → apply the D-7 ladder in fixed order, re-measure, and freeze the taken step before any training rung.
+- [x] 8.1 RED: `MasterModel(head_strides=[4,8,16,32])` fwd+bwd on CPU at 128²; output dict has exactly 7 keys; every emitted level receives a non-`None` grad (D3 regression test). (`tests/models/master/test_master_model.py`)
+- [x] 8.2 GREEN: delete `src/models/master/fusion.py` in full (`StageAttentionFusion`, `CrossModalFusion`).
+- [x] 8.3 GREEN: `src/models/master/master_model.py` — rewire `forward`; rename `distill_backbone_rgb`→`distill_backbone`, drop `distill_backbone_fused`; `freeze_backbone`/`unfreeze_backbone_stages` lose `rgb_stem`/`nir_stem` asymmetry (renamed `unfreeze_rgb_stem`→`unfreeze_stem`). **Found and fixed, in-scope consequence**: `StudentModel.unfreeze_backbone_stages`'s no-op stub parameter was also renamed `unfreeze_rgb_stem`→`unfreeze_stem` — its own docstring states it exists so `Trainer` can call it "polymorphically on both MasterModel and StudentModel"; leaving it stale would silently break that polymorphism the first time a schedule change reached the student path with the new keyword.
+- [x] 8.4 GREEN: `src/models/master/__init__.py` — remove re-exports of the three deleted classes; export `EarlyFusionBackbone`/`FPNNeck`/`SingleFPN` instead.
+- [x] 8.5 GREEN: `src/models/master/test_arch.py`, `sanity_check.py`, `README.md` — remove dual-stream imports/instantiation and references; rewritten for the single-stream architecture with shape/key assertions.
+- [x] 8.6 GREEN: delete `scripts/visualize_attention.py`, `scripts/attention_comparison.py`.
+- [x] 8.7 RED: rewrite `tests/models/master/test_freeze_policy.py` against `stem`/`stages` names (no `rgb_stem`/`nir_stem`).
+- [x] 8.8 RED: synthetic v1 checkpoint dict raises the `arch_version` error before `load_state_dict`. (`tests/test_checkpoint_arch_version.py`)
+- [x] 8.9 GREEN: `_save_checkpoint` writes `arch_version: 2` (`CHECKPOINT_ARCH_VERSION` in `loop.py`); `evaluate_checkpoint.py::_load_model`, `visualize_damage_predictions.py::load_model` check it first and also resolve `head_strides` from the checkpoint via `resolve_from_checkpoint`.
+- [x] 8.10 Zero-cost rung V0: `scripts/measure_vram.py --variants new_3lvl new_4lvl`, batches 1/2/4; CONFIRM 4-level peak ≤6.0GB. **Run for real on the maintainer's GTX 1660 SUPER.** `master_v1`/`new_3lvl_preW5` are not separately measurable — the pre-redesign dual-stream code and the pre-W5 duplicate head-stem computation were both deleted outright (not toggles) rather than gated behind a flag; `master_v1` was already measured in `proposal.md` Round 2. **Measured (fp32, one fwd+bwd+step, real GPU):**
+
+  | Config | batch 1 | batch 2 | batch 4 |
+  |---|---:|---:|---:|
+  | `new_3lvl` (`[8,16,32]`) | 1.124 GB | 2.102 GB | — |
+  | `new_4lvl` (target, `[4,8,16,32]`) | 1.420 GB | 2.655 GB | 5.135 GB |
+
+  **CONFIRM.** 2.655 GB at the configured `batch_size=2` — well under the 6.0 GB bar, and within 2% of design.md §4's hand-computed projection (≈2.6 GB). The batch-4 measurement (5.135 GB) also matches the design's ≈5.1 GB projection closely. No D-7 fallback rung is needed.
 
 ## Phase 9 — PR2: W5 head dedup + W7 KD/projections
 
-- [ ] 9.1 RED: post-fix head output `torch.allclose` with pre-fix output; `cls_stem`/`reg_stem` called exactly once per level (forward-hook counter).
-- [ ] 9.2 GREEN: `head.py` `DecoupledHead.forward` returns `(cls_pred, reg_pred, cls_feat, reg_feat)`; `YOLODetectionHead.forward` (`:155,164-165`) reuses them instead of recomputing.
-- [ ] 9.3 GREEN: `kd_trainer.py:151` — teacher key `distill_backbone` (was `distill_backbone_rgb`).
-- [ ] 9.4 RED: `ProjectionLayers.forward` raises on a length mismatch instead of silently truncating the `zip`.
-- [ ] 9.5 GREEN: `distill_projections.py:71-86` — explicit length assertion; `kd_trainer.py` slices the teacher pyramid/head features to the student's strides by index.
+- [x] 9.1 RED: post-fix head output `torch.allclose` with pre-fix output; `cls_stem`/`reg_stem` called exactly once per level (forward-hook counter). (`tests/models/master/test_head.py::TestStemComputedOncePerLevel`)
+- [x] 9.2 GREEN: `head.py` `DecoupledHead.forward` returns `(cls_pred, reg_pred, cls_feat, reg_feat)`; `YOLODetectionHead.forward` reuses them instead of recomputing.
+- [x] 9.3 GREEN: `kd_trainer.py` — teacher key `distill_backbone` (was `distill_backbone_rgb`).
+- [x] 9.4 RED: `ProjectionLayers.forward` raises on a length mismatch instead of silently truncating the `zip`. **Finding, stated honestly**: verified against the current codebase, `forward` already asserted `len(teacher_features) == self.num_levels` **before** the `zip` — it was already loud (`AssertionError`), not silently truncating, contrary to design.md §5's premise (likely written against an earlier code revision). Strengthened the assert with a message identifying both counts and added `tests/models/master/test_distill_projections.py` locking in the pass/fail paths, including the exact 4-vs-3 scenario design.md describes.
+- [x] 9.5 GREEN: `distill_projections.py` — explicit length-assertion message; `kd_trainer.py` slices the teacher pyramid/head features to the student's strides by stride value (`select_by_strides`), not by position, so the correct (non-crashing) path is also correct. `KDConfig.head_strides` (inherited from `TrainingConfig`) now describes the teacher's architecture; `_load_teacher` passes it to `MasterModel(head_strides=...)`. Added `tests/training/test_kd_level_slicing.py` proving the projections receive the P3/P4/P5-shaped features, not P2/P3/P4.
 
 ## Phase 10 — PR2: evaluation-path fixes and repo guard
 
-- [ ] 10.1 RED: repo-guard test scans `src/` and `scripts/` for `[8, 16, 32]` / `(8, 16, 32)` literals and fails on a match.
-- [ ] 10.2 GREEN: delete the 8 literal sites (`loss.py:362`, `loop.py:68,523`, `decode.py:40`, `master_model.py:94`, `evaluate_checkpoint.py:149`, `visualize_damage_predictions.py:73,347`); source strides from config or `resolve_from_checkpoint`.
-- [ ] 10.3 Run `pytest tests/test_stride_literals.py -v`.
-- [ ] 10.4 Config/data: create `configs/experiment/fusion.yaml` (byte-identical across machines per D-H whitelist); update `configs/training_mango.yaml` (`batch_size` 8→2, `amp`→`precision`, pointer comment, no schedule change).
-- [ ] 10.5 GREEN: `src/training/loop.py` `end_to_end` schedule (D-F) — two-group AdamW (`backbone.stages.*` at `lr*0.1`; `stem`+`neck`+`head` at `lr`); generalize `_rgb_stem_grad_norm` into `_module_grad_norms()` logging every backbone stage, neck, head to `LossHistory.extra_losses`/TensorBoard.
+- [x] 10.1 RED: repo-guard test scans `src/` and `scripts/` for `[8, 16, 32]` / `(8, 16, 32)` literals and fails on a match. (`tests/test_stride_literals.py`) Implemented via `ast` (List/Tuple literal nodes evaluating to `(8,16,32)`), not a text-line scan — a text scan would also flag every comment/docstring explaining this exact guard, including in this file and every fusion-redesign docstring citing the old literal, making the guard unmaintainable. `src/training/strides.py` is the one exempted file (the canonical `STUDENT_STRIDES` definition).
+- [x] 10.2 GREEN: delete the 8 literal sites (`loss.py`, `loop.py` ×2, `decode.py`, `master_model.py`, `evaluate_checkpoint.py`, `visualize_damage_predictions.py` ×2) plus 4 more the guard caught during implementation (`head.py`'s own `strides or [8,16,32]` default, `kd_trainer.py`'s and `visualize_damage_predictions.py`'s local `STUDENT_STRIDES` re-declarations, `scripts/measure_vram.py`'s variant table) — all now source strides from config, `resolve_from_checkpoint`, or import the one canonical `STUDENT_STRIDES`.
+- [x] 10.3 Run `pytest tests/test_stride_literals.py -v` — green (see full-suite run below).
+- [x] 10.4 Config/data: create `configs/experiment/fusion.yaml` (byte-identical across machines per D-H whitelist); update `configs/training_mango.yaml` (`batch_size` 8→2, `head_strides: [8,16,32]` + `schedule: two_phase` added explicitly — required once `TrainingConfig`'s defaults changed to the 4-level/end-to-end architecture, otherwise this file would either fail the new `assigner_level_ranges` invariant or silently switch schedules).
+- [x] 10.5 GREEN: `src/training/loop.py` `end_to_end` schedule (D-F) — two-group AdamW (`backbone.stages.*` at `lr*backbone_lr_mult`; `stem`+`neck`+`head` at `lr`) via `Trainer._discriminative_param_groups`; generalized `_rgb_stem_grad_norm` into `_module_grad_norms()` logging every backbone stage, the stem, the neck, and every head level to `LossHistory.extra_losses`/TensorBoard (`grad_norm_*` keys). `schedule="two_phase"` preserved and selectable (rollback path); `TrainingConfig.total_epochs` and `Trainer.fit()` branch on it. (`tests/training/test_end_to_end_schedule.py`)
 
 ## Phase 11 — PR2: integration and close-out
 
-- [ ] 11.1 Full suite: `./.venv/bin/python -m pytest` — all tests green, including updated `tests/test_final_training_pipeline.py`, `tests/test_training_loop.py`.
-- [ ] 11.2 Confirm `openspec/specs/{multimodal-early-fusion,testing-teacher-arch,training-loop,kd-training}` wording matches shipped code (already drafted; reconcile any drift).
-- [ ] 11.3 Open PR 2 against `main`, based on PR 1's merge commit; merge before Phase 12 training rungs run.
+- [x] 11.1 Full suite: `./.venv/bin/python -m pytest` — **267/267 passed in ~65.5s** (190 baseline + 77 new tests, across 11 new/rewritten test files plus additions to `tests/training/test_tal.py` and one line changed in `tests/training/test_training_step.py`). `tests/test_final_training_pipeline.py` needed no change (does not reference `MasterModel`/strides). `tests/test_training_loop.py` needed no change — its `total_epochs`/`model_type` tests happen to hold under the new default by inspection, not luck: `epochs_phase1=30+epochs_phase2=20=50` coincides with the default `epochs=50` the new `schedule="end_to_end"` branch reads instead.
+- [x] 11.2 Confirm `openspec/changes/fusion-redesign/specs/{multimodal-early-fusion,testing-teacher-arch,training-loop,kd-training}` (delta specs — merging into `openspec/specs/` is `sdd-archive`'s job per the OpenSpec convention, not `sdd-apply`'s) wording matches shipped code. Reviewed all four against the final implementation; no drift found requiring an edit — the specs were written precisely enough that implementation followed them directly.
+- [ ] 11.3 Open PR 2 against `main`, based on PR 1's merge commit; merge before Phase 12 training rungs run. **Not performed by sdd-apply** — PR creation/merge is a delivery-workflow action outside this executor's role; branch `feat/early-fusion-architecture` (cut from PR1's merge commit `6ce6697`) is ready for the orchestrator/maintainer to open the PR.
 
 ## Phase 12 — Training rungs and validation report (post-merge; not gated on further code review)
 
