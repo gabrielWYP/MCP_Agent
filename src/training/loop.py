@@ -1,16 +1,25 @@
 """
-Two-phase training loop for MasterModel fine-tuning.
+Training loop for MasterModel/StudentModel fine-tuning.
 
-Phase 1: Freeze backbone (stages 1-4), train fusion + neck + head.
-Phase 2: Unfreeze stages 3-4, train with lower LR.
+MasterModel (fusion-redesign D-4): default schedule is `end_to_end` —
+every backbone stage, the stem, the neck and the head train from epoch 0,
+with pretrained backbone stages at `backbone_lr_mult` times the neck/head
+learning rate (discriminative LR). The previous `two_phase` schedule
+(Phase 1: frozen backbone; Phase 2: partial unfreeze) is preserved and
+selectable via `config.schedule = "two_phase"` for configs that explicitly
+opt back into it (e.g. `training_mango.yaml`).
+
+StudentModel: unchanged single-phase schedule.
 
 Features:
-    - AMP (automatic mixed precision)
-    - Gradient clipping (max_norm=10.0)
+    - Explicit fp32 | fp16 | bf16 precision selection (D-I)
+    - Gradient accumulation with a fixed effective batch (D-H)
+    - Fatal (counted, not silently skipped) OOM/NaN batch-skip guards (D-G)
+    - Gradient clipping
     - CosineAnnealingWarmRestarts with linear warmup
-    - Early stopping on val mAP@0.5 (patience=15)
+    - Early stopping on val mAP@0.5
     - Best checkpoint + periodic checkpointing
-    - TensorBoard logging
+    - TensorBoard logging, including per-module gradient norms (D-F)
 """
 
 from __future__ import annotations
@@ -30,6 +39,17 @@ from .loss import YOLOv8Loss
 from .machine import derive_grad_accum_steps
 from .metrics import compute_map, generate_training_curves, LossHistory
 from .precision import autocast_ctx, make_scaler
+from .strides import resolve_active_strides
+
+# Checkpoint schema version (fusion-redesign D-C). Every state_dict key
+# changes under the redesign (`backbone.rgb_stem.*` / `backbone.nir_stem.*` /
+# `backbone.shared_stages.*` -> `backbone.stem.*` / `backbone.stages.*`;
+# `fusion.*` disappears; `neck.fpn_rgb.*` / `neck.fpn_nir.*` /
+# `neck.fusion_convs.*` -> `neck.fpn.*`), so a v1 checkpoint is unloadable
+# into the v2 MasterModel. This tag converts a 200-line missing/unexpected-key
+# dump into one actionable sentence — see `scripts/evaluate_checkpoint.py`
+# and `scripts/visualize_damage_predictions.py`.
+CHECKPOINT_ARCH_VERSION = 2
 
 
 class Trainer:
@@ -73,14 +93,17 @@ class Trainer:
             config.effective_batch, config.batch_size
         )
 
-        # Loss
+        # Loss. `strides` is resolved from config rather than hardcoded
+        # (fusion-redesign D-D) — `[8, 16, 32]` for model_type="student"
+        # (out of scope, unchanged), `config.head_strides` for "master"
+        # (default `[4, 8, 16, 32]`, includes the reconnected P2 level).
         self.criterion = YOLOv8Loss(
             num_classes=config.num_classes,
             box_weight=config.box_weight,
             cls_weight=config.cls_weight,
             class_weights=config.class_weights,
             focal_gamma=getattr(config, 'focal_gamma', 2.0),
-            strides=[8, 16, 32],
+            strides=resolve_active_strides(config),
             assigner_center_radius=getattr(config, "assigner_center_radius", 0.0),
             assigner_level_ranges=getattr(config, "assigner_level_ranges", None),
             assigner_collect_stats=getattr(config, "assigner_collect_stats", False),
@@ -115,18 +138,35 @@ class Trainer:
             print("[Trainer] TensorBoard not available, skipping logging.")
 
     def fit(self) -> dict:
-        """Run training (single-phase for student, two-phase for master).
+        """Run training.
+
+        StudentModel: single-phase, unchanged.
+        MasterModel, `schedule="end_to_end"` (fusion-redesign D-4, default):
+            one phase, `freeze_stages=0` from epoch 0, discriminative LR
+            (pretrained backbone stages at `backbone_lr_mult` times the
+            neck/head rate).
+        MasterModel, `schedule="two_phase"` (legacy, opt-in): Phase 1 frozen
+            backbone, Phase 2 partial unfreeze — preserved for configs that
+            explicitly request it (e.g. `training_mango.yaml`).
 
         Returns:
             Dict with final metrics and checkpoint paths.
         """
         model_label = "StudentModel" if self.config.model_type == "student" else "MasterModel"
+        is_end_to_end_master = (
+            self.config.model_type == "master" and self.config.schedule == "end_to_end"
+        )
 
         print(f"\n{'='*60}")
         print(f"Training {model_label} on {self.device}")
 
         if self.config.model_type == "student":
             print(f"Single-phase: {self.config.epochs} epochs, lr={self.config.lr}")
+        elif is_end_to_end_master:
+            print(
+                f"End-to-end: {self.config.epochs} epochs, lr={self.config.lr}, "
+                f"backbone_lr_mult={self.config.backbone_lr_mult}"
+            )
         else:
             print(f"Phase 1: {self.config.epochs_phase1} epochs (frozen backbone)")
             print(f"Phase 2: {self.config.epochs_phase2} epochs (unfreeze stages 3-4)")
@@ -141,8 +181,18 @@ class Trainer:
                 lr=self.config.lr,
                 freeze_stages=0,
             )
+        elif is_end_to_end_master:
+            # End-to-end MasterModel training (D-4): freeze_stages=0 from
+            # epoch 0, discriminative LR via a two-group optimizer.
+            self._train_phase(
+                phase=1,
+                epochs=self.config.epochs,
+                lr=self.config.lr,
+                freeze_stages=0,
+                discriminative=True,
+            )
         else:
-            # Two-phase master training
+            # Legacy two-phase master training (opt-in via schedule="two_phase")
             if self.config.epochs_phase1 > 0:
                 self._train_phase(
                     phase=1,
@@ -188,39 +238,54 @@ class Trainer:
         lr: float,
         freeze_stages: int = 0,
         unfreeze_stages: list[int] | None = None,
+        discriminative: bool = False,
     ):
         """Run training for one phase.
 
         Args:
             phase: Phase number (1 or 2).
             epochs: Number of epochs.
-            lr: Learning rate for this phase.
+            lr: Learning rate for this phase (base rate — see
+                `discriminative`).
             freeze_stages: Number of backbone stages to freeze.
-            unfreeze_stages: Specific stages to unfreeze (Phase 2).
+            unfreeze_stages: Specific stages to unfreeze (legacy two-phase
+                schedule's Phase 2).
+            discriminative: If True, build a two-group AdamW (D-4/D-F):
+                pretrained backbone-stage parameters at
+                `config.backbone_lr_mult * lr`; stem, neck and head at `lr`.
+                Used by the end-to-end MasterModel schedule. Ignored (single
+                group at `lr`) otherwise.
         """
         print(f"\n{'─'*50}")
         print(f"Phase {phase}: {epochs} epochs | LR={lr}")
         print(f"{'─'*50}")
 
-        # Freeze/unfreeze backbone. `unfreeze_rgb_stem=True` is the E6/Q10
-        # production fix: `freeze_backbone()` unconditionally freezes the RGB
-        # stem, so without this flag a Phase 2 "unfreeze" call never actually
-        # let it adapt — plausible root cause of the maestro underperforming
-        # its own student (design.md Out of Scope; proposal.md Round 3 Q10).
+        # Freeze/unfreeze backbone. `unfreeze_stem=True` (renamed from
+        # `unfreeze_rgb_stem`, fusion-redesign D-4 — there is only one stem
+        # now) is the E6/Q10 production fix: `freeze_backbone()`
+        # unconditionally freezes the stem whenever freeze_stages > 0, so
+        # without this flag a Phase 2 "unfreeze" call never actually lets it
+        # adapt (design.md Out of Scope; proposal.md Round 3 Q10).
         self.model.freeze_backbone(freeze_stages=freeze_stages)
         if unfreeze_stages is not None:
-            self.model.unfreeze_backbone_stages(unfreeze_stages, unfreeze_rgb_stem=True)
+            self.model.unfreeze_backbone_stages(unfreeze_stages, unfreeze_stem=True)
 
         # Count trainable params
         trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         print(f"Trainable parameters: {trainable:,}")
 
-        # Optimizer (only trainable params)
-        optimizer = AdamW(
-            filter(lambda p: p.requires_grad, self.model.parameters()),
-            lr=lr,
-            weight_decay=self.config.weight_decay,
-        )
+        # Optimizer
+        if discriminative:
+            optimizer = AdamW(
+                self._discriminative_param_groups(lr),
+                weight_decay=self.config.weight_decay,
+            )
+        else:
+            optimizer = AdamW(
+                filter(lambda p: p.requires_grad, self.model.parameters()),
+                lr=lr,
+                weight_decay=self.config.weight_decay,
+            )
 
         # Scheduler: warmup + cosine annealing
         warmup_epochs = self.config.warmup_epochs
@@ -307,6 +372,13 @@ class Trainer:
                     "oom_skipped": train_metrics["oom_skipped"],
                     "nan_skipped": train_metrics["nan_skipped"],
                     "steps_taken": train_metrics["steps_taken"],
+                    # D-F per-module gradient norms (generalised from the
+                    # previous single-module rgb_stem_grad_norm).
+                    **{
+                        name: value
+                        for name, value in train_metrics.items()
+                        if name.startswith("grad_norm_")
+                    },
                 },
             )
 
@@ -328,21 +400,21 @@ class Trainer:
                 for cls_id, ap in val_metrics.get("per_class_ap_50", {}).items():
                     self.writer.add_scalar(f"Phase{phase}/val/ap50_class{cls_id}", ap, epoch)
 
-                # E6 instrumentation (Q10): verify the Phase 2 RGB-stem
-                # unfreeze fix actually fires, independent of its effect on mAP.
+                # D-F instrumentation: verify the schedule actually reaches
+                # every module, independent of its effect on mAP — the same
+                # bit-exact-LayerNorm failure mode (D2/D3) that motivated
+                # H-F's init-distance check, made visible during training
+                # rather than only discoverable after it.
                 if self.config.model_type == "master":
-                    rgb_stem_trainable = any(
-                        p.requires_grad for p in self.model.backbone.rgb_stem.parameters()
+                    stem_trainable = any(
+                        p.requires_grad for p in self.model.backbone.stem.parameters()
                     )
                     self.writer.add_scalar(
-                        f"Phase{phase}/rgb_stem_requires_grad", float(rgb_stem_trainable), epoch
+                        f"Phase{phase}/backbone_stem_requires_grad", float(stem_trainable), epoch
                     )
-                    if "rgb_stem_grad_norm" in train_metrics:
-                        self.writer.add_scalar(
-                            f"Phase{phase}/rgb_stem_grad_norm",
-                            train_metrics["rgb_stem_grad_norm"],
-                            epoch,
-                        )
+                    for name, value in train_metrics.items():
+                        if name.startswith("grad_norm_"):
+                            self.writer.add_scalar(f"Phase{phase}/{name}", value, epoch)
 
             # Checkpoint: best mAP (use >= to save on first epoch even if mAP=0)
             if map50 >= self.best_map50:
@@ -363,6 +435,66 @@ class Trainer:
             if self.patience_counter >= self.config.patience:
                 print(f"  Early stopping at epoch {epoch} (patience={self.config.patience})")
                 break
+
+    def _discriminative_param_groups(self, lr: float) -> list[dict]:
+        """Two-group AdamW parameter groups for end-to-end MasterModel
+        training (fusion-redesign D-4/D-F).
+
+        Pretrained backbone-stage parameters (`backbone.stages.*`) train at
+        `backbone_lr_mult * lr`. Everything else that is new or must adapt
+        to the redesign — the stem (`backbone.stem.*`), the neck, and the
+        head — trains at the full `lr`. The stem is deliberately in the
+        "new" group, not the pretrained one: it is 4-channel and out of
+        ImageNet distribution by construction (the same D-1 argument
+        applied consistently), even though 3 of its 4 channels start from
+        pretrained weights.
+
+        Only `requires_grad=True` parameters are included, so this is safe
+        to call under `freeze_stages=0` (every parameter trainable, the
+        end-to-end default) or any other freeze configuration.
+        """
+        backbone_stage_params = [
+            p for p in self.model.backbone.stages.parameters() if p.requires_grad
+        ]
+        new_params = [
+            p
+            for module in (self.model.backbone.stem, self.model.neck, self.model.head)
+            for p in module.parameters()
+            if p.requires_grad
+        ]
+        return [
+            {"params": backbone_stage_params, "lr": lr * self.config.backbone_lr_mult},
+            {"params": new_params, "lr": lr},
+        ]
+
+    def _module_grad_norms(self) -> dict[str, float]:
+        """L2 gradient norm per trainable module (fusion-redesign D-F).
+
+        Generalises the previous `_rgb_stem_grad_norm` (single-module,
+        dual-stream-specific instrumentation) into per-module coverage of
+        every backbone stage, the stem, the neck, and each head level — so
+        an end-to-end run that silently fails to train one of them (D2's
+        failure mode: a schedule that looks like it trains a module but
+        never actually reaches it) is visible in TensorBoard/`extra_losses`
+        rather than discovered 68 epochs later by a bit-exact LayerNorm.
+
+        Returns 0.0 for a module with no gradients yet (frozen, or before
+        the first backward pass) rather than raising.
+        """
+        def _norm(module: nn.Module) -> float:
+            total_sq = 0.0
+            for param in module.parameters():
+                if param.grad is not None:
+                    total_sq += param.grad.detach().float().norm(2).item() ** 2
+            return total_sq ** 0.5
+
+        norms = {"backbone_stem": _norm(self.model.backbone.stem)}
+        for i, stage in enumerate(self.model.backbone.stages):
+            norms[f"backbone_stage{i}"] = _norm(stage)
+        norms["neck"] = _norm(self.model.neck)
+        for i, head in enumerate(self.model.head.heads):
+            norms[f"head_level{i}"] = _norm(head)
+        return norms
 
     def _train_epoch(self, optimizer: AdamW, epoch: int, phase: int) -> dict:
         """Run one training epoch with gradient accumulation.
@@ -411,7 +543,7 @@ class Trainer:
         steps_taken = 0     # optimizer.step() calls (effective steps)
         oom_skipped = 0
         nan_skipped = 0
-        rgb_stem_grad_norms: list[float] = []
+        module_grad_norms: dict[str, list[float]] = {}
         micro_step = 0      # micro-batches accumulated since the last flush
         optimizer.zero_grad(set_to_none=True)
 
@@ -461,13 +593,17 @@ class Trainer:
                 else:
                     scaled_loss.backward()
 
-                # E6 instrumentation: capture the RGB stem's gradient norm
-                # right after backward(), before clipping/step touch it —
-                # proves whether the Phase 2 unfreeze fix actually let
-                # gradients flow into the stem (design.md Q10). No-op cost
-                # for the student model / Phase 1 (norm is 0.0 when frozen).
+                # D-F instrumentation: capture per-module gradient norms
+                # right after backward(), before clipping/step touch them —
+                # generalises the previous single-module (RGB-stem-only) E6
+                # instrumentation to every backbone stage, the stem, the
+                # neck, and each head level, so an end-to-end run that
+                # silently fails to reach one of them is visible rather than
+                # discovered by a bit-exact LayerNorm after the fact (D2/H-F).
+                # No-op cost for the student model.
                 if self.config.model_type == "master":
-                    rgb_stem_grad_norms.append(self._rgb_stem_grad_norm())
+                    for name, value in self._module_grad_norms().items():
+                        module_grad_norms.setdefault(name, []).append(value)
 
                 micro_step += 1
                 if micro_step % accum == 0:
@@ -524,24 +660,9 @@ class Trainer:
             "nan_skipped": float(nan_skipped),
             "steps_taken": float(steps_taken),
         }
-        if rgb_stem_grad_norms:
-            result["rgb_stem_grad_norm"] = sum(rgb_stem_grad_norms) / len(rgb_stem_grad_norms)
+        for name, values in module_grad_norms.items():
+            result[f"grad_norm_{name}"] = sum(values) / len(values)
         return result
-
-    def _rgb_stem_grad_norm(self) -> float:
-        """L2 norm of the RGB stem's gradients (E6 instrumentation, Q10).
-
-        Returns 0.0 when the stem is frozen (no gradients) or has no
-        gradients yet. Used to verify the Phase 2 unfreeze fix actually
-        fires, independent of whether it changes the mAP outcome — an
-        unfreeze that silently did not fire is a failed run, not a refuted
-        hypothesis (design.md E6 bar).
-        """
-        total_sq = 0.0
-        for param in self.model.backbone.rgb_stem.parameters():
-            if param.grad is not None:
-                total_sq += param.grad.detach().float().norm(2).item() ** 2
-        return total_sq ** 0.5
 
     @torch.no_grad()
     def _validate(self, epoch: int, phase: int) -> dict:
@@ -629,7 +750,10 @@ class Trainer:
 
         Thin wrapper over `decode.decode_detections` (D3) — the single
         source of truth for decode semantics shared with
-        `scripts/visualize_damage_predictions.py`.
+        `scripts/visualize_damage_predictions.py`. `strides` is resolved
+        from `config` (fusion-redesign D-D), not hardcoded, so a 4-level
+        checkpoint decodes with its own 4 strides instead of a stale
+        `(8, 16, 32)` that would misalign predictions and anchor grids.
         """
         boxes, scores, labels = decode_detections(
             preds,
@@ -637,7 +761,7 @@ class Trainer:
             batch_idx=batch_idx,
             num_classes=config.num_classes,
             image_size=config.image_size,
-            strides=(8, 16, 32),
+            strides=tuple(resolve_active_strides(config)),
             conf_threshold=config.conf_threshold,
             nms_iou_threshold=config.nms_iou_threshold,
             nms_enabled=config.nms_enabled,
@@ -680,11 +804,20 @@ class Trainer:
         below; `experiment_sha256` (D-H) is recorded alongside separately
         since it is not itself a config field — two runs are comparable
         only if `experiment_sha256` AND `effective_batch` both match.
+
+        `arch_version` (fusion-redesign D-C) tags the checkpoint's state
+        dict schema. Every key changes under the redesign, so a v1
+        (dual-stream fusion) checkpoint is unloadable into the v2 model;
+        `arch_version` converts that into one actionable error message
+        (`scripts/evaluate_checkpoint.py`,
+        `scripts/visualize_damage_predictions.py`) instead of a 200-line
+        missing/unexpected-key dump.
         """
         path = self.output_dir / filename
         checkpoint = {
             "epoch": epoch,
             "phase": phase,
+            "arch_version": CHECKPOINT_ARCH_VERSION,
             "model_state_dict": self.model.state_dict(),
             "metrics": metrics,
             "best_map50": self.best_map50,

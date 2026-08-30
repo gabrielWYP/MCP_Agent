@@ -70,6 +70,11 @@ class TestE2ETraining:
             num_classes=2,
             image_size=64,  # small for speed
             batch_size=2,
+            effective_batch=2,
+            # This test specifically exercises the legacy two-phase
+            # schedule; fusion-redesign D-4 makes "end_to_end" the default
+            # for model_type="master", so this must opt back in explicitly.
+            schedule="two_phase",
             epochs_phase1=2,
             epochs_phase2=2,
             lr_phase1=1e-3,

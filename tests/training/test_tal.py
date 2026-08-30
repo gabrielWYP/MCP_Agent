@@ -158,3 +158,49 @@ class TestGenerateAnchors:
         assert num_per_level == [4, 1]
         assert torch.all(anchor_strides[:4] == 8.0)
         assert torch.all(anchor_strides[4:] == 32.0)
+
+    def test_four_level_anchor_count_at_640(self):
+        """fusion-redesign D-D: `_generate_anchors` needs no code change for
+        4 levels — it is already generic (`zip(feat_sizes, strides)`, no
+        `[8, 16, 32]` anywhere). 640x640 input, head_strides=[4,8,16,32]:
+        [160,80,40,20]^2 -> 25600+6400+1600+400 = 34,000 anchors."""
+        feat_sizes = [(160, 160), (80, 80), (40, 40), (20, 20)]
+        strides = [4, 8, 16, 32]
+
+        anchors, anchor_strides, num_per_level = _generate_anchors(
+            feat_sizes, strides, torch.device("cpu")
+        )
+
+        assert num_per_level == [25600, 6400, 1600, 400]
+        assert anchors.shape == (34000, 2)
+        assert anchor_strides.shape == (34000,)
+
+
+class TestLevelAdmissibility:
+    """D8/D-3: per-level GT-size admissibility bins, generalised to 4 levels."""
+
+    def test_median_damage_box_maps_to_p2_at_four_level_ranges(self):
+        """assigner_level_ranges=[32,64,128]: a 30px box (the measured
+        median damage short side, proposal.md D-3) maps to level 0 (P2,
+        stride 4) — this is the whole point of reconnecting P2."""
+        level_ids = torch.tensor([0, 1, 2, 3])
+        level_mask = TaskAlignedAssigner._level_admissibility(
+            level_ids, gt_w=30.0, gt_h=25.0, level_ranges=[32.0, 64.0, 128.0]
+        )
+        assert level_mask.tolist() == [True, False, False, False]
+
+    def test_large_box_maps_to_coarsest_level(self):
+        level_ids = torch.tensor([0, 1, 2, 3])
+        level_mask = TaskAlignedAssigner._level_admissibility(
+            level_ids, gt_w=200.0, gt_h=200.0, level_ranges=[32.0, 64.0, 128.0]
+        )
+        assert level_mask.tolist() == [False, False, False, True]
+
+    def test_three_level_ranges_unaffected_by_generalisation(self):
+        """The pre-redesign 3-level config ([8,16,32], ranges=[64,128])
+        must behave exactly as before."""
+        level_ids = torch.tensor([0, 1, 2])
+        level_mask = TaskAlignedAssigner._level_admissibility(
+            level_ids, gt_w=30.0, gt_h=30.0, level_ranges=[64.0, 128.0]
+        )
+        assert level_mask.tolist() == [True, False, False]

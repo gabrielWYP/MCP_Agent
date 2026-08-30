@@ -15,6 +15,7 @@ import yaml
 
 from .machine import derive_grad_accum_steps
 from .precision import validate_bf16_support, validate_precision
+from .strides import DEFAULT_HEAD_STRIDES, validate_strides
 
 
 @dataclass
@@ -64,6 +65,30 @@ class TrainingConfig:
             for results to be comparable (alongside `experiment_sha256`).
             `grad_accum_steps = effective_batch // batch_size` is always
             derived, never itself a config field.
+        in_channels: MasterModel backbone stem input channels. 4 (default)
+            for the early-fused RGB+NIR input; 3 for the RGB-only H-D
+            control arm (fusion-redesign). Ignored for model_type="student".
+        head_strides: MasterModel FPN/head pyramid strides, finest-first.
+            Default `[4, 8, 16, 32]` includes the reconnected P2 level
+            (fusion-redesign D-3). The single source of truth for
+            `FPNNeck.emit_levels`, `YOLODetectionHead`'s level count,
+            `YOLOv8Loss.strides`, and `decode_detections(strides=...)` — see
+            `src/training/strides.py`. Ignored for model_type="student"
+            (the student backbone is unaffected by this redesign and always
+            uses 3 fixed levels at `[8, 16, 32]`).
+        schedule: "two_phase" | "end_to_end". MasterModel training schedule
+            (fusion-redesign D-4). "end_to_end" (default) trains every
+            backbone stage, the stem, the neck and the head from epoch 0,
+            with pretrained stages at `backbone_lr_mult` times the
+            neck/head learning rate. "two_phase" preserves the previous
+            frozen-then-partially-unfrozen schedule for configs that
+            explicitly opt back into it (e.g. `training_mango.yaml`).
+            Ignored for model_type="student" (always single-phase).
+        backbone_lr_mult: Discriminative LR multiplier applied to pretrained
+            backbone-stage parameters under `schedule="end_to_end"`. The
+            stem is intentionally NOT in this group — it is 4-channel and
+            out of ImageNet distribution by construction, so it trains at
+            the full (non-discriminated) rate alongside the neck and head.
     """
 
     # Paths
@@ -112,9 +137,11 @@ class TrainingConfig:
     # ships off so the pre-fix assignment behavior is measurable (E2) before
     # any run opts into center-sampling via a nonzero radius (stride units).
     assigner_center_radius: float = 0.0
-    # Per-level GT-size admissibility bins (D8): max(w,h)<64 -> P3/stride-8,
-    # <128 -> P4/stride-16, else P5/stride-32 (pixel space at image_size=640).
-    assigner_level_ranges: list[float] = field(default_factory=lambda: [64.0, 128.0])
+    # Per-level GT-size admissibility bins. fusion-redesign D-3/D-D default:
+    # max(w,h)<32 -> P2/stride-4, <64 -> P3/stride-8, <128 -> P4/stride-16,
+    # else -> P5/stride-32 (pixel space at image_size=640). Must always have
+    # exactly len(head_strides) - 1 entries — enforced in __post_init__.
+    assigner_level_ranges: list[float] = field(default_factory=lambda: [32.0, 64.0, 128.0])
     # Non-destructive per-class/per-level positive-anchor instrumentation
     # (A4). Off by default; must not alter target_classes/bboxes/scores/fg_mask.
     assigner_collect_stats: bool = False
@@ -162,6 +189,15 @@ class TrainingConfig:
     # to the training loop.
     effective_batch: int = 8
 
+    # Architecture (W1-W5, fusion-redesign) — MasterModel only; ignored for
+    # model_type="student".
+    in_channels: int = 4
+    head_strides: list[int] = field(default_factory=lambda: list(DEFAULT_HEAD_STRIDES))
+
+    # Training schedule (D-4, fusion-redesign) — MasterModel only.
+    schedule: str = "end_to_end"
+    backbone_lr_mult: float = 0.1
+
     def __post_init__(self) -> None:
         valid_types = {"master", "student"}
         if self.model_type not in valid_types:
@@ -178,6 +214,19 @@ class TrainingConfig:
         # value is intentionally discarded here — grad_accum_steps is
         # derived on demand by the trainer, never stored as a config field.
         derive_grad_accum_steps(self.effective_batch, self.batch_size)
+        valid_schedules = {"two_phase", "end_to_end"}
+        if self.schedule not in valid_schedules:
+            raise ValueError(
+                f"Invalid schedule '{self.schedule}'. Must be one of: {valid_schedules}"
+            )
+        # fusion-redesign D-D: the one genuinely silent failure in this area
+        # — a shorter assigner_level_ranges leaves the coarsest pyramid
+        # level with zero positive assignments, with no exception. Skipped
+        # for model_type="student": the student backbone is unaffected by
+        # this redesign and always uses its own fixed 3-level [8, 16, 32]
+        # strides, so head_strides/assigner_level_ranges do not apply to it.
+        if self.model_type == "master":
+            validate_strides(self.head_strides, self.assigner_level_ranges)
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
@@ -210,6 +259,11 @@ class TrainingConfig:
 
     @property
     def total_epochs(self) -> int:
-        if self.model_type == "student":
+        # model_type="student": always single-phase, `epochs` epochs.
+        # model_type="master", schedule="end_to_end" (fusion-redesign D-4
+        # default): also single-phase, `epochs` epochs.
+        # model_type="master", schedule="two_phase" (legacy, opt-in):
+        # epochs_phase1 + epochs_phase2.
+        if self.model_type == "student" or self.schedule == "end_to_end":
             return self.epochs
         return self.epochs_phase1 + self.epochs_phase2

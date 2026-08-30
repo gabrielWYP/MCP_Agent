@@ -55,6 +55,8 @@ from src.models.student.student_model import StudentModel
 from src.training.config import TrainingConfig
 from src.training.dataset import letterbox
 from src.training.decode import decode_detections
+from src.training.loop import CHECKPOINT_ARCH_VERSION
+from src.training.strides import resolve_from_checkpoint, STUDENT_STRIDES
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -70,7 +72,11 @@ CLASS_COLORS = {
 }
 CLASS_NAMES = {0: "mango", 1: "damage"}
 
-STRIDES = [8, 16, 32]
+# MasterModel's strides are resolved per-checkpoint in `load_model` below
+# (fusion-redesign D-D) — a hardcoded list here would silently misalign a
+# 4-level checkpoint's predictions against the wrong anchor grid.
+# `STUDENT_STRIDES` (imported, not re-declared — see `src/training/strides.py`)
+# is out of scope for fusion-redesign (D-2) and stays fixed.
 
 logging.basicConfig(
     level=logging.INFO,
@@ -161,24 +167,40 @@ def load_model(
     checkpoint_path: str,
     config: TrainingConfig,
     device: torch.device,
-) -> torch.nn.Module:
+) -> tuple[torch.nn.Module, list[int]]:
     """Instantiate the model and load checkpoint weights.
 
     Handles both checkpoint dicts (with 'model_state_dict' key) and raw
     state dicts.
+
+    Returns:
+        model: the loaded, eval-mode model.
+        strides: the stride list to decode with — `STUDENT_STRIDES` for
+            `model_type="student"` (unaffected by fusion-redesign, D-2), or
+            resolved from the checkpoint for `model_type="master"`
+            (fusion-redesign D-D) rather than a hardcoded `[8, 16, 32]` that
+            would silently misalign a 4-level checkpoint's predictions.
     """
-    if model_type == "master":
-        model = MasterModel(
-            num_classes=config.num_classes,
-            pretrained_backbone=False,
-            backbone_variant=config.backbone_variant,
-        )
-    else:
-        model = StudentModel(num_classes=config.num_classes)
-
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    is_checkpoint_dict = isinstance(checkpoint, dict) and "model_state_dict" in checkpoint
 
-    if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+    head_strides = None
+    if is_checkpoint_dict:
+        # fusion-redesign D-C: a v1 (dual-stream fusion) checkpoint is
+        # unloadable into the v2 MasterModel — every state_dict key
+        # changes. Check `arch_version` before `load_state_dict` so the
+        # failure is one actionable sentence, not a 200-line key-mismatch
+        # dump.
+        arch_version = checkpoint.get("arch_version")
+        if model_type == "master" and arch_version != CHECKPOINT_ARCH_VERSION:
+            raise ValueError(
+                f"Checkpoint at {checkpoint_path} has arch_version={arch_version!r}, "
+                f"expected {CHECKPOINT_ARCH_VERSION}. Architecture v1 checkpoints "
+                "(dual-stream fusion) are not loadable by MasterModel v2 — see "
+                "openspec/changes/fusion-redesign."
+            )
+        if model_type == "master":
+            head_strides = resolve_from_checkpoint(checkpoint)
         state_dict = checkpoint["model_state_dict"]
         logger.info(
             "Loaded checkpoint dict (epoch=%s, best_map50=%s)",
@@ -189,11 +211,23 @@ def load_model(
         state_dict = checkpoint
         logger.info("Loaded raw state_dict.")
 
+    if model_type == "master":
+        model = MasterModel(
+            num_classes=config.num_classes,
+            pretrained_backbone=False,
+            backbone_variant=config.backbone_variant,
+            head_strides=head_strides,
+        )
+        strides = list(model.head_strides)
+    else:
+        model = StudentModel(num_classes=config.num_classes)
+        strides = list(STUDENT_STRIDES)
+
     model.load_state_dict(state_dict, strict=True)
     model.to(device)
     model.eval()
     logger.info("Model loaded: %s (%s parameters)", model_type, sum(p.numel() for p in model.parameters()))
-    return model
+    return model, strides
 
 
 # ---------------------------------------------------------------------------
@@ -307,6 +341,7 @@ def decode_predictions(
     num_classes: int,
     image_size: int,
     conf_threshold: float,
+    strides: tuple[int, ...] = tuple(STUDENT_STRIDES),
     nms_iou_threshold: float = 0.5,
     nms_enabled: bool = True,
     per_class_candidates: bool = True,
@@ -327,6 +362,11 @@ def decode_predictions(
         image_size: Input image size (unused for output scaling here — this
             script draws in letterbox pixel space, not normalized [0, 1]).
         conf_threshold: Minimum confidence to keep a candidate.
+        strides: FPN level strides, aligned with `output`'s level order.
+            Default is the student's fixed `STUDENT_STRIDES`; `main()` below
+            always passes the strides resolved by `load_model`
+            (fusion-redesign D-D) rather than relying on this default for a
+            MasterModel checkpoint, which may have a different level count.
         nms_iou_threshold: IoU threshold for per-class NMS.
         nms_enabled: Whether to apply per-class NMS (E1 lever).
         per_class_candidates: Whether to emit one candidate per qualifying
@@ -344,7 +384,7 @@ def decode_predictions(
         batch_idx=0,
         num_classes=num_classes,
         image_size=image_size,
-        strides=tuple(STRIDES),
+        strides=tuple(strides),
         conf_threshold=conf_threshold,
         nms_iou_threshold=nms_iou_threshold,
         nms_enabled=nms_enabled,
@@ -575,8 +615,9 @@ def main() -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
     logger.info("Output directory: %s", output_dir)
 
-    # Load model
-    model = load_model(args.model_type, args.checkpoint, config, device)
+    # Load model. `strides` is resolved from the checkpoint for MasterModel
+    # (fusion-redesign D-D) — see `load_model`'s docstring.
+    model, strides = load_model(args.model_type, args.checkpoint, config, device)
 
     # Discover images
     rgb_dir = Path(args.rgb_dir)
@@ -649,6 +690,7 @@ def main() -> int:
                 config.num_classes,
                 config.image_size,
                 args.conf_threshold,
+                strides=tuple(strides),
                 nms_iou_threshold=args.nms_iou_threshold,
                 nms_enabled=args.nms_enabled,
                 per_class_candidates=args.decode_per_class,

@@ -37,7 +37,7 @@ def decode_detections(
     batch_idx: int,
     num_classes: int,
     image_size: int,
-    strides: Sequence[int] = (8, 16, 32),
+    strides: Sequence[int],
     conf_threshold: float = 0.25,
     nms_iou_threshold: float = 0.5,
     nms_enabled: bool = True,
@@ -56,6 +56,9 @@ def decode_detections(
         num_classes: number of detection classes.
         image_size: input image size (square), used to normalize output boxes.
         strides: FPN level strides, aligned with `preds`/`cls_preds` order.
+            Required, no default (fusion-redesign D-D) — a forgotten
+            argument is a `TypeError` instead of a silent `[8, 16, 32]`
+            default that misaligns a 4-level checkpoint's predictions.
         conf_threshold: minimum per-class sigmoid score to keep a candidate.
             Default 0.25 matches the legacy hardcoded threshold.
         nms_iou_threshold: IoU threshold for per-class NMS suppression.
