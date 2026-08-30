@@ -8,18 +8,18 @@ context: |
 
 testing:
   strict_tdd: false
-  reason: "Phase 1 test bootstrap archived. Current test_arch.py has a level mismatch bug (DualFPN→4 levels, YOLODetectionHead←3). Needs fix before tests pass."
+  reason: "Standard mode. Full pytest suite (93+ tests) passes via ./.venv/bin/python -m pytest; `python` is not on PATH, use the venv interpreter."
   test_runner:
-    command: "python -m pytest src/models/master/test_arch.py -v"
-    framework: pytest (installed in .venv, but no pytest-style test functions)
+    command: "./.venv/bin/python -m pytest"
+    framework: pytest (93+ tests passing as of damage-map-audit, ~80s)
   layers:
     unit:
       available: true
-      tool: "pytest (script-style assertions)"
-      scope: "src/models/master/test_arch.py (module-by-module sanity checks)"
-      count: 0
-      note: "test_arch.py runs as __main__ script, not pytest-collected tests. Contains assert statements that will crash on shape mismatch."
-      coverage: "N/A — broken; formerly 96%"
+      tool: "pytest"
+      scope: "tests/ (93+ pytest-collected tests across src/training, src/models, scripts/)"
+      count: 93
+      note: "Full pytest-collected suite; run via ./.venv/bin/python -m pytest (`python` is not on PATH)."
+      coverage: "Not measured; no coverage threshold configured yet."
     integration:
       available: false
       tool: "—"
@@ -28,9 +28,9 @@ testing:
       available: false
       tool: "—"
   coverage:
-    available: true
-    command: "python -m pytest --cov=src/models/master/ src/models/master/test_arch.py"
-    threshold: "N/A (currently broken)"
+    available: false
+    command: "—"
+    threshold: "N/A (not configured yet)"
   quality:
     linter:
       available: false
@@ -62,10 +62,10 @@ rules:
     - Follow existing code patterns (src/package modular structure)
     - New modules go under src/<domain>/
     tdd: false
-    test_command: "python -m pytest src/models/master/test_arch.py -v"
+    test_command: "./.venv/bin/python -m pytest"
   verify:
-    test_command: "python -m pytest src/models/master/test_arch.py -v"
-    build_command: "python -c \"import sys; exec(open('src/models/master/test_arch.py').read())\""
+    test_command: "./.venv/bin/python -m pytest"
+    build_command: "./.venv/bin/python -c \"import src.training.train, src.training.kd_train\""
     coverage_threshold: 0
   archive:
     - Warn before merging destructive deltas

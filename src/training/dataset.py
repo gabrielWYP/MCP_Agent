@@ -10,6 +10,7 @@ Label format: `class_id cx cy w h` (normalized 0-1, YOLO convention)
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Callable
 import warnings
@@ -155,6 +156,7 @@ class YOLODataset(Dataset):
         nir_mean: float = 0.0569,
         nir_std: float = 0.0546,
         letterbox_value: int = 114,
+        manifest_path: str | Path | None = None,
     ):
         self.rgb_dir = Path(rgb_dir)
         self.nir_dir = Path(nir_dir)
@@ -164,6 +166,7 @@ class YOLODataset(Dataset):
         self.nir_mean = nir_mean
         self.nir_std = nir_std
         self.letterbox_value = letterbox_value
+        self.manifest_path = Path(manifest_path) if manifest_path is not None else None
 
         self._uses_default_multimodal_transforms = transform is None
         if self._uses_default_multimodal_transforms:
@@ -190,6 +193,9 @@ class YOLODataset(Dataset):
         Returns:
             List of dicts with keys: rgb_path, nir_path, label_path, image_id.
         """
+        if self.manifest_path is not None:
+            self._verify_manifest_alignment()
+
         pairs = []
         rgb_files = sorted(self.rgb_dir.glob("*.jpg"))
 
@@ -217,6 +223,61 @@ class YOLODataset(Dataset):
             })
 
         return pairs
+
+    def _verify_manifest_alignment(self) -> None:
+        """Fail closed if this split's directory contents diverge from the manifest.
+
+        `prepare_yolo_splits.py` previously left stray label files behind from
+        earlier shuffles, and this dataset historically keyed off directory
+        contents rather than the manifest — silently training/evaluating on a
+        leaked split (see design.md Prerequisite P1 / D1). A loud error here
+        forces one explicit `scripts/prepare_yolo_splits.py --reconcile` fix
+        rather than silently auto-correcting, which would hide that a run
+        used a contaminated split.
+        """
+        if not self.manifest_path.exists():
+            return  # No manifest yet (e.g., dataset not split); nothing to check.
+
+        manifest = json.loads(self.manifest_path.read_text())
+        expected = set(manifest.get(self.split, []))
+        actual = {path.stem for path in self.labels_dir.glob("*.txt")}
+
+        if actual != expected:
+            extra = sorted(actual - expected)
+            missing = sorted(expected - actual)
+            raise ValueError(
+                f"YOLODataset split '{self.split}' at {self.labels_dir} diverges from "
+                f"manifest {self.manifest_path}. "
+                f"On disk but not in manifest for this split: {extra}. "
+                f"In manifest but missing on disk: {missing}. "
+                "Run `./.venv/bin/python scripts/prepare_yolo_splits.py --reconcile "
+                "--no-dry-run` to fix, or pass manifest_path=None to skip this check."
+            )
+
+    def gt_count_report(self) -> dict:
+        """Report per-class GT instance counts with a direct on-disk recount.
+
+        `loaded` reflects the counts `get_class_counts()` derives from the
+        pairs this dataset actually discovered; `on_disk` recounts straight
+        from every label file under this split's directory, independent of
+        pairing/loading logic. Equal values confirm the dataset is not
+        silently dropping or duplicating GT instances relative to the label
+        files on disk (design.md Prerequisite P1 self-reporting, W0-c).
+        """
+        loaded = self.get_class_counts()
+
+        on_disk: dict[int, int] = {}
+        for label_path in self.labels_dir.glob("*.txt"):
+            _, labels = self._load_labels(label_path)
+            for lbl in labels:
+                on_disk[int(lbl)] = on_disk.get(int(lbl), 0) + 1
+
+        return {
+            "loaded": loaded,
+            "on_disk": on_disk,
+            "image_count": len(self.pairs),
+            "label_file_count": sum(1 for _ in self.labels_dir.glob("*.txt")),
+        }
 
     def _load_labels(self, path: Path) -> tuple[np.ndarray, np.ndarray]:
         """Parse YOLO-format label file.

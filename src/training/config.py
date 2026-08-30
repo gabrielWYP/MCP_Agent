@@ -23,6 +23,9 @@ class TrainingConfig:
         nir_dir: Path to NIR images directory.
         labels_dir: Path to YOLO label files root (contains train/, val/).
         output_dir: Where to save checkpoints and logs.
+        split_manifest: Path to the split manifest (splits.json) used to
+            fail-fast if a split's directory contents diverge from it. Set to
+            None to skip this guard (e.g., synthetic/unsplit test fixtures).
         backbone_variant: ConvNeXt variant ("tiny" or "small").
         num_classes: Number of detection classes.
         image_size: Input image size (square).
@@ -53,6 +56,7 @@ class TrainingConfig:
     nir_dir: str = "data/cache/mango/nir"
     labels_dir: str = "data/annotations/yolo/labels"
     output_dir: str = "checkpoints/mastermodel"
+    split_manifest: str | None = "data/annotations/yolo/splits.json"
 
     # Model
     backbone_variant: str = "tiny"
@@ -73,7 +77,32 @@ class TrainingConfig:
     # Loss
     box_weight: float = 7.5
     cls_weight: float = 0.5
-    class_weights: list[float] = field(default_factory=lambda: [2.7, 0.5])
+    # [mango, damage]. `[0.5, 1.5]` is the value every recorded checkpoint was
+    # trained under; held constant for the duration of the damage-map-audit
+    # experiment ladder so a class-1 AP change can be attributed to the
+    # assigner fix rather than a reweighting. See
+    # openspec/specs/yolo-loss/spec.md and proposal.md Q2 for the full
+    # inverse-frequency-vs-experimental-constant rationale.
+    class_weights: list[float] = field(default_factory=lambda: [0.5, 1.5])
+
+    # Decode (src/training/decode.py::decode_detections) — see training-loop spec.
+    conf_threshold: float = 0.25
+    nms_iou_threshold: float = 0.5
+    nms_enabled: bool = True
+    decode_per_class: bool = True
+    max_detections: int = 300
+
+    # Task-Aligned Assigner (src/training/loss.py) — see yolo-loss spec.
+    # 0.0 = legacy strict anchor-center-inside-GT containment (default, D9):
+    # ships off so the pre-fix assignment behavior is measurable (E2) before
+    # any run opts into center-sampling via a nonzero radius (stride units).
+    assigner_center_radius: float = 0.0
+    # Per-level GT-size admissibility bins (D8): max(w,h)<64 -> P3/stride-8,
+    # <128 -> P4/stride-16, else P5/stride-32 (pixel space at image_size=640).
+    assigner_level_ranges: list[float] = field(default_factory=lambda: [64.0, 128.0])
+    # Non-destructive per-class/per-level positive-anchor instrumentation
+    # (A4). Off by default; must not alter target_classes/bboxes/scores/fg_mask.
+    assigner_collect_stats: bool = False
 
     # Scheduler
     warmup_epochs: int = 3

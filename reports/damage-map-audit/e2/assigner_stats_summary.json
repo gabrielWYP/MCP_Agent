@@ -1,0 +1,21 @@
+{
+  "per_class_level_counts": {
+    "0_1": 156,
+    "1_0": 2301,
+    "0_2": 1755,
+    "1_1": 233,
+    "1_2": 61
+  },
+  "summary": {
+    "0": {
+      "total_positive_anchors": 1911,
+      "gt_instances": 148,
+      "mean_positives_per_gt": 12.912162162162161
+    },
+    "1": {
+      "total_positive_anchors": 2595,
+      "gt_instances": 253,
+      "mean_positives_per_gt": 10.256916996047432
+    }
+  }
+}

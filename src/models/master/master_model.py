@@ -197,22 +197,38 @@ class MasterModel(nn.Module):
             "NIR stem remains trainable."
         )
 
-    def unfreeze_backbone_stages(self, unfreeze_stages: list[int]):
+    def unfreeze_backbone_stages(
+        self,
+        unfreeze_stages: list[int],
+        unfreeze_rgb_stem: bool = False,
+    ):
         """
         Unfreeze specific backbone stages by index (0-based).
-        Stems always remain frozen to preserve modality-specific preprocessing.
 
         Args:
             unfreeze_stages: List of stage indices to unfreeze (e.g., [2, 3] for stages 3-4).
+            unfreeze_rgb_stem: If True, also unfreeze the RGB stem (damage-map-audit
+                E6/production fix). `freeze_backbone()` unconditionally freezes the
+                RGB stem regardless of `freeze_stages`; without this flag, a Phase 2
+                "unfreeze" call never actually lets the RGB stem adapt, which is
+                the documented root cause behind the maestro underperforming its
+                own student (0.216 vs 0.394 mAP@0.5) — see design.md Out of Scope /
+                proposal.md Round 3 Q10. Defaults to False to preserve prior
+                behavior for any caller that does not explicitly opt in.
         """
         for i, stage in enumerate(self.backbone.shared_stages):
             if i in unfreeze_stages:
                 for param in stage.parameters():
                     param.requires_grad = True
 
+        if unfreeze_rgb_stem:
+            for param in self.backbone.rgb_stem.parameters():
+                param.requires_grad = True
+
         print(
             f"[MasterModel] Unfrozen stages: {unfreeze_stages}. "
-            "RGB stem remains frozen; NIR stem remains trainable."
+            f"RGB stem {'unfrozen' if unfreeze_rgb_stem else 'remains frozen'}; "
+            "NIR stem remains trainable."
         )
 
     def count_parameters(self) -> dict[str, int]:

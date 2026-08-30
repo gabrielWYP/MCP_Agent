@@ -256,8 +256,16 @@ def compute_map(
     gt_labels: list[torch.Tensor],
     num_classes: int = 2,
     iou_threshold: float = 0.5,
+    score_threshold: float = 0.25,
 ) -> dict:
     """Compute mAP metrics across a dataset.
+
+    AP itself (`_compute_ap_at_iou`) ranks all predictions by score and is
+    threshold-independent by construction; `score_threshold` only gates the
+    classwise precision/recall/F1/TP-FP-FN operating point, which must match
+    whatever confidence threshold the decode path used to produce
+    `pred_boxes`/`pred_scores`/`pred_labels` (training-loop spec:
+    "Configurable Confidence and NMS Thresholds").
 
     Args:
         pred_boxes: List of (P_i, 4) predicted boxes per image (cxcywh normalized).
@@ -267,10 +275,14 @@ def compute_map(
         gt_labels: List of (G_i,) GT class IDs per image.
         num_classes: Number of classes.
         iou_threshold: IoU threshold for mAP@IoU computation.
+        score_threshold: Confidence threshold for the precision/recall/F1
+            operating point. Must match the decode path's `conf_threshold`
+            (previously hardcoded to 0.25 here, independent of the caller's
+            actual decode configuration).
 
     Returns:
-        Dict with mAP, AP, and classwise precision/recall/F1 at IoU=0.5
-        and the decoder's confidence threshold (0.25).
+        Dict with mAP, AP, and classwise precision/recall/F1 at IoU=0.5 and
+        `score_threshold`.
     """
     pred_boxes_xyxy = [
         _cxcywh_to_xyxy(boxes) if len(boxes) > 0 else boxes
@@ -312,9 +324,27 @@ def compute_map(
         gt_boxes_xyxy,
         gt_labels,
         iou_threshold=iou_threshold,
-        score_threshold=0.25,
+        score_threshold=score_threshold,
         num_classes=num_classes,
     )
+
+    # GT-count accounting integrity (training-metrics spec "GT-Count Accounting
+    # Integrity"): tp + fn must equal the number of GT instances for that
+    # class. This holds algebraically by construction in
+    # `_compute_operating_point` (fn += len(targets) - len(matched) per
+    # image), so a mismatch here means a discrepancy was introduced upstream
+    # (e.g. a corrupted split) — log it explicitly instead of silently
+    # trusting the metric.
+    for cls_id, count_dict in counts.items():
+        gt_total = sum(int((labels_i == cls_id).sum()) for labels_i in gt_labels)
+        observed = count_dict["tp"] + count_dict["fn"]
+        if observed != gt_total:
+            logger.warning(
+                "GT-count mismatch for class %d: tp+fn=%d but %d GT instances "
+                "exist in this split. This is not expected by construction — "
+                "investigate before trusting this run's metrics for this class.",
+                cls_id, observed, gt_total,
+            )
 
     return {
         "map50": map50,

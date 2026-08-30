@@ -119,6 +119,7 @@ def main():
         nir_mean=config.nir_mean,
         nir_std=config.nir_std,
         letterbox_value=config.letterbox_value,
+        manifest_path=config.split_manifest,
     )
 
     val_dataset = YOLODataset(
@@ -130,6 +131,7 @@ def main():
         nir_mean=config.nir_mean,
         nir_std=config.nir_std,
         letterbox_value=config.letterbox_value,
+        manifest_path=config.split_manifest,
     )
 
     print(f"Dataset: {len(train_dataset)} train, {len(val_dataset)} val images")
