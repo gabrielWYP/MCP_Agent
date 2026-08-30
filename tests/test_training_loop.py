@@ -102,7 +102,7 @@ class TestForwardCallBranching:
 
         config = TrainingConfig(
             model_type=model_type,
-            amp=False,
+            precision="fp32",
             num_classes=2,
             batch_size=1,
         )
@@ -147,6 +147,7 @@ class TestForwardCallBranching:
         trainer.global_step = 0
         trainer.writer = None
         trainer.scaler = MagicMock()
+        trainer.grad_accum_steps = 1  # no accumulation — this test is about forward branching
 
         # Mock criterion to return a loss with grad_fn
         mock_criterion = MagicMock()

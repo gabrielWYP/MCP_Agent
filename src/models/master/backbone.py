@@ -11,6 +11,8 @@ Design decisions:
   with channels [96, 192, 384, 768]
 """
 
+from contextlib import nullcontext
+
 import torch
 import torch.nn as nn
 from torchvision.models import (
@@ -156,15 +158,33 @@ class DualConvNeXtBackbone(nn.Module):
         Returns:
             rgb_features: [S1, S2, S3, S4]
             nir_features: [S1, S2, S3, S4]
+
+        Precision scoping (fusion-redesign D-I): ConvNeXt stage 4 was
+        reported numerically fragile under CUDA autocast in this dual-stream
+        setup, so this forward used to force `autocast(enabled=False)`
+        unconditionally. That guard is now scoped to fp16 only: it is a
+        no-op under fp32 (nothing to disable) and, critically, a no-op under
+        bf16 as well — bf16 carries fp32's exponent range, so the fp16
+        overflow mechanism the original comment describes does not apply,
+        and H-BF16 (see design.md) specifically needs bf16 to reach these
+        stages rather than being silently forced back to fp32.
         """
-        # ConvNeXt stage 4 is numerically fragile under CUDA autocast in this
-        # dual-stream setup. Run the backbone in FP32 so the teacher produces
-        # stable features for both detection and future distillation.
         device_type = rgb.device.type
-        with torch.amp.autocast(device_type=device_type, enabled=False):
+        fp16_ambient = (
+            torch.is_autocast_enabled(device_type)
+            and torch.get_autocast_dtype(device_type) == torch.float16
+        )
+        ctx = (
+            torch.amp.autocast(device_type=device_type, enabled=False)
+            if fp16_ambient
+            else nullcontext()
+        )
+        with ctx:
             # Pass through modality-specific stems
-            rgb_x = self.rgb_stem(rgb.float())   # (N, 96, H/4, W/4)
-            nir_x = self.nir_stem(nir.float())   # (N, 96, H/4, W/4)
+            rgb_in = rgb.float() if fp16_ambient else rgb
+            nir_in = nir.float() if fp16_ambient else nir
+            rgb_x = self.rgb_stem(rgb_in)   # (N, 96, H/4, W/4)
+            nir_x = self.nir_stem(nir_in)   # (N, 96, H/4, W/4)
 
             rgb_features, nir_features = [], []
 

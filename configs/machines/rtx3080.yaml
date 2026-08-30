@@ -1,0 +1,9 @@
+# Machine profile: RTX 3080 (10 GB, Ampere).
+#
+# HOW the run executes only — see gtx1660s.yaml for the whitelist rules.
+# With effective_batch=8, batch_size=4 gives grad_accum_steps=2.
+device: cuda
+batch_size: 4
+num_workers: 4
+pin_memory: true
+precision: fp32

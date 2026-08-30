@@ -9,6 +9,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -20,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from src.training.config import TrainingConfig
 from src.training.dataset import YOLODataset, build_dataloader, collate_fn, build_weighted_sampler
 from src.training.loop import Trainer
+from src.training.machine import apply_machine_profile, experiment_sha256, load_machine_profile
 from src.training.run_artifacts import (
     build_versioned_stage_plan,
     collect_stage_results,
@@ -44,6 +46,17 @@ def parse_args() -> argparse.Namespace:
         choices=["master", "student"],
         default=None,
         help="Model type to train: master or student.",
+    )
+    parser.add_argument(
+        "--machine",
+        type=str,
+        default=None,
+        help=(
+            "Path to a machine-profile YAML (configs/machines/*.yaml) setting "
+            "device/batch_size/num_workers/pin_memory/precision. Applied after "
+            "--config, before --override. A profile may set only those five "
+            "keys — anything else raises (fusion-redesign D-H)."
+        ),
     )
     parser.add_argument(
         "--override",
@@ -84,9 +97,22 @@ def main():
     else:
         config = TrainingConfig()
 
+    # experiment_sha256 (D-H): hash of the experiment file's raw bytes, so
+    # two runs are comparable only if this matches (alongside
+    # effective_batch). Computed before --machine/--override touch the
+    # in-memory config — it hashes the file, not the resolved config.
+    run_experiment_sha256 = experiment_sha256(args.config) if args.config else None
+
+    # Machine profile (D-H): device/batch_size/num_workers/pin_memory/
+    # precision only — whitelist-enforced so a profile cannot alter the
+    # experiment being measured.
+    if args.machine:
+        machine_profile = load_machine_profile(args.machine)
+        apply_machine_profile(config, machine_profile)
+
     # Apply overrides
     for override in args.override:
-        key, value = override.split("=")
+        key, value = override.split("=", 1)
         # Type coercion
         if hasattr(config, key):
             current = getattr(config, key)
@@ -96,6 +122,18 @@ def main():
                 value = int(value)
             elif isinstance(current, float):
                 value = float(value)
+            elif isinstance(current, list):
+                # List coercion (ported from evaluate_checkpoint.py's
+                # _apply_overrides so the two entrypoints cannot drift):
+                # `--override head_strides=[4,8,16,32]` used to assign the
+                # literal string "[4,8,16,32]" (len()==12), silently
+                # producing a wrong-but-plausible pyramid instead of the
+                # intended 4-level one. `[...]` parses as JSON (preserving
+                # int/float as written); comma-separated values fall back
+                # to floats.
+                value = json.loads(value) if value.strip().startswith("[") else [
+                    float(v) for v in value.split(",")
+                ]
             setattr(config, key, value)
 
     # CLI --model flag overrides config model_type
@@ -134,7 +172,12 @@ def main():
     else:
         print(f"  Phase 1: {config.epochs_phase1} epochs, lr={config.lr_phase1}")
         print(f"  Phase 2: {config.epochs_phase2} epochs, lr={config.lr_phase2}")
-    print(f"  Batch size: {config.batch_size}, AMP: {config.amp}")
+    print(
+        f"  Batch size: {config.batch_size}, Precision: {config.precision}, "
+        f"Device: {config.device}, effective_batch: {config.effective_batch}"
+    )
+    if run_experiment_sha256:
+        print(f"  experiment_sha256: {run_experiment_sha256}")
 
     # Create datasets. Do not pass explicit transforms here: YOLODataset's
     # default path keeps spatial augmentations synchronized across RGB, NIR,
@@ -173,7 +216,7 @@ def main():
         sampler=train_sampler,
         collate_fn=collate_fn,
         num_workers=config.num_workers,
-        pin_memory=True,
+        pin_memory=config.pin_memory,
         drop_last=True,
     )
 
@@ -183,7 +226,7 @@ def main():
         shuffle=False,
         collate_fn=collate_fn,
         num_workers=config.num_workers,
-        pin_memory=True,
+        pin_memory=config.pin_memory,
     )
 
     # Create model
@@ -207,6 +250,7 @@ def main():
         train_loader=train_loader,
         val_loader=val_loader,
     )
+    trainer.experiment_sha256 = run_experiment_sha256
 
     results = trainer.fit()
 
@@ -219,6 +263,10 @@ def main():
             command=[sys.executable, *sys.argv],
             stage_key=versioned_plan.stage_key,
             stage_label=versioned_plan.stage_label,
+            experiment_sha256=run_experiment_sha256,
+            effective_batch=config.effective_batch,
+            precision=config.precision,
+            device=config.device,
         )
         run_results = collect_stage_results(versioned_plan.run_dir)
         write_run_summary(versioned_plan.run_dir, versioned_plan.run_id, run_results)

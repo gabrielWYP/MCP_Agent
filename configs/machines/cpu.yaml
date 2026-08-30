@@ -1,0 +1,12 @@
+# Machine profile: CPU-only (smoke tests / no GPU available).
+#
+# HOW the run executes only — see gtx1660s.yaml for the whitelist rules.
+# batch_size=1 keeps grad_accum_steps as a whole number against the default
+# effective_batch=8 (grad_accum_steps=8); num_workers=0 avoids DataLoader
+# worker IPC overhead on a CPU-only box (dataset.py already degrades to 0
+# gracefully if workers fail, so this is a preference, not a requirement).
+device: cpu
+batch_size: 1
+num_workers: 0
+pin_memory: false
+precision: fp32

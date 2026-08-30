@@ -13,6 +13,9 @@ from typing import Any
 
 import yaml
 
+from .machine import derive_grad_accum_steps
+from .precision import validate_bf16_support, validate_precision
+
 
 @dataclass
 class TrainingConfig:
@@ -43,12 +46,24 @@ class TrainingConfig:
         patience: Early stopping patience (epochs without mAP improvement).
         log_interval: Steps between TensorBoard logs.
         save_interval: Epochs between periodic checkpoints.
-        amp: Enable automatic mixed precision.
+        precision: One of "fp32" | "fp16" | "bf16". Replaces the old
+            `amp: bool = True` flag, which silently enabled fp16 in any
+            config omitting the key. Defaults to "fp32". "bf16" requires an
+            Ampere-or-newer CUDA device and is validated at load time.
         grad_clip: Gradient clipping max norm.
         num_workers: DataLoader workers.
         nir_mean: NIR channel normalization mean.
         nir_std: NIR channel normalization std.
         seed: Random seed.
+        device: "auto" | "cuda" | "cpu" | an explicit `torch.device` string
+            (e.g. "cuda:0"). "auto" resolves to CUDA if available, else CPU
+            — the same expression the trainer used to hardcode.
+        pin_memory: DataLoader `pin_memory`. A machine-profile key (D-H).
+        effective_batch: The experimental constant. Physical `batch_size` is
+            a memory knob; `effective_batch` is what every run must match
+            for results to be comparable (alongside `experiment_sha256`).
+            `grad_accum_steps = effective_batch // batch_size` is always
+            derived, never itself a config field.
     """
 
     # Paths
@@ -112,8 +127,9 @@ class TrainingConfig:
     log_interval: int = 10
     save_interval: int = 5
 
-    # Mixed precision
-    amp: bool = True
+    # Mixed precision — "fp32" | "fp16" | "bf16". See `precision` docstring
+    # above; `amp` is removed, not deprecated (fusion-redesign D-I).
+    precision: str = "fp32"
 
     # Gradient clipping
     grad_clip: float = 10.0
@@ -135,6 +151,17 @@ class TrainingConfig:
     # Reproducibility
     seed: int = 42
 
+    # Hardware portability (W9, fusion-redesign D-H) — machine-profile
+    # fields. Kept identical in meaning to a machine profile's own keys so
+    # `machine.apply_machine_profile` can `setattr` them directly.
+    device: str = "auto"
+    pin_memory: bool = True
+    # The experimental constant (Q7, fusion-redesign): must be fixed before
+    # a validation ladder starts and held constant across every rung. Not
+    # itself read by the model; only `grad_accum_steps` (derived) matters
+    # to the training loop.
+    effective_batch: int = 8
+
     def __post_init__(self) -> None:
         valid_types = {"master", "student"}
         if self.model_type not in valid_types:
@@ -142,6 +169,15 @@ class TrainingConfig:
                 f"Invalid model_type '{self.model_type}'. "
                 f"Must be one of: {valid_types}"
             )
+        validate_precision(self.precision)
+        if self.precision == "bf16":
+            validate_bf16_support()
+        # Fails fast: an effective_batch/batch_size pair that does not
+        # divide evenly would mean the recorded effective_batch never
+        # matched what actually ran (fusion-redesign D-H). The returned
+        # value is intentionally discarded here — grad_accum_steps is
+        # derived on demand by the trainer, never stored as a config field.
+        derive_grad_accum_steps(self.effective_batch, self.batch_size)
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)

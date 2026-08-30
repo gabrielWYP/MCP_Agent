@@ -20,7 +20,6 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
-from torch.amp import GradScaler, autocast
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, LambdaLR
 from torch.utils.data import DataLoader
@@ -28,7 +27,9 @@ from torch.utils.data import DataLoader
 from .config import TrainingConfig
 from .decode import decode_detections
 from .loss import YOLOv8Loss
+from .machine import derive_grad_accum_steps
 from .metrics import compute_map, generate_training_curves, LossHistory
+from .precision import autocast_ctx, make_scaler
 
 
 class Trainer:
@@ -55,8 +56,22 @@ class Trainer:
         self.train_loader = train_loader
         self.val_loader = val_loader
 
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # Device selection (W9, fusion-redesign D-H): "auto" preserves the
+        # previous hardcoded expression; any other value (e.g. "cuda:0",
+        # "cpu") is passed through explicitly, closing the gap with
+        # scripts/evaluate_checkpoint.py's existing --device flag.
+        if config.device == "auto":
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        else:
+            self.device = torch.device(config.device)
         self.model.to(self.device)
+
+        # Gradient accumulation (D-H): effective_batch is the experimental
+        # constant; batch_size is a memory knob. Derived, never read from a
+        # machine profile directly — see src/training/machine.py.
+        self.grad_accum_steps = derive_grad_accum_steps(
+            config.effective_batch, config.batch_size
+        )
 
         # Loss
         self.criterion = YOLOv8Loss(
@@ -71,8 +86,9 @@ class Trainer:
             assigner_collect_stats=getattr(config, "assigner_collect_stats", False),
         ).to(self.device)
 
-        # AMP
-        self.scaler = GradScaler("cuda", enabled=config.amp)
+        # Mixed precision: fp32 | fp16 | bf16 (src/training/precision.py).
+        # Only fp16 needs loss scaling; the scaler is a no-op otherwise.
+        self.scaler = make_scaler(config.precision)
 
         # Output directories
         self.output_dir = Path(config.output_dir)
@@ -84,6 +100,11 @@ class Trainer:
         self.patience_counter = 0
         self.global_step = 0
         self.history_epoch = 0
+        # D-H: SHA-256 of the experiment config file's raw bytes. Set
+        # externally (e.g. by train.py, after resolving --config) since the
+        # Trainer itself has no notion of "which file was --config". None
+        # for callers that do not opt into the experiment/machine split.
+        self.experiment_sha256: str | None = None
 
         # TensorBoard
         self.writer = None
@@ -275,9 +296,17 @@ class Trainer:
                 per_class_f1=per_class_f1,
                 per_class_counts=per_class_counts,
                 extra_losses={
-                    name: value
-                    for name, value in train_metrics.items()
-                    if name.endswith("_loss") and name not in {"cls_loss", "box_loss", "total_loss"}
+                    **{
+                        name: value
+                        for name, value in train_metrics.items()
+                        if name.endswith("_loss") and name not in {"cls_loss", "box_loss", "total_loss"}
+                    },
+                    # D-G counters: always recorded, regardless of the
+                    # "_loss" naming filter above, so a clean run is
+                    # distinguishable from a run where nothing trained.
+                    "oom_skipped": train_metrics["oom_skipped"],
+                    "nan_skipped": train_metrics["nan_skipped"],
+                    "steps_taken": train_metrics["steps_taken"],
                 },
             )
 
@@ -289,6 +318,11 @@ class Trainer:
                 self.writer.add_scalar(f"Phase{phase}/val/map50", map50, epoch)
                 self.writer.add_scalar(f"Phase{phase}/val/map_50_95", val_metrics.get("map_50_95", 0.0), epoch)
                 self.writer.add_scalar(f"Phase{phase}/lr", optimizer.param_groups[0]["lr"], epoch)
+
+                # D-G counters (see _train_epoch docstring).
+                self.writer.add_scalar(f"Phase{phase}/train/oom_skipped", train_metrics["oom_skipped"], epoch)
+                self.writer.add_scalar(f"Phase{phase}/train/nan_skipped", train_metrics["nan_skipped"], epoch)
+                self.writer.add_scalar(f"Phase{phase}/train/steps_taken", train_metrics["steps_taken"], epoch)
 
                 # Per-class AP
                 for cls_id, ap in val_metrics.get("per_class_ap_50", {}).items():
@@ -314,14 +348,16 @@ class Trainer:
             if map50 >= self.best_map50:
                 self.best_map50 = map50
                 self.patience_counter = 0
-                self._save_checkpoint(epoch, phase, val_metrics, "best_model.pt")
+                self._save_checkpoint(epoch, phase, val_metrics, "best_model.pt", train_metrics=train_metrics)
                 print(f"    ✓ New best mAP@0.5: {map50:.4f}")
             else:
                 self.patience_counter += 1
 
             # Periodic checkpoint
             if epoch % self.config.save_interval == 0:
-                self._save_checkpoint(epoch, phase, val_metrics, f"checkpoint_epoch{epoch}.pt")
+                self._save_checkpoint(
+                    epoch, phase, val_metrics, f"checkpoint_epoch{epoch}.pt", train_metrics=train_metrics
+                )
 
             # Early stopping
             if self.patience_counter >= self.config.patience:
@@ -329,17 +365,68 @@ class Trainer:
                 break
 
     def _train_epoch(self, optimizer: AdamW, epoch: int, phase: int) -> dict:
-        """Run one training epoch.
+        """Run one training epoch with gradient accumulation.
+
+        D-G (fusion-redesign): OOM and NaN/Inf batch faults are counted and,
+        past a bounded tolerance, fatal. A run in which every batch fails
+        used to complete "successfully" with `total_loss=0.0` and a saved
+        checkpoint from a model that never received a gradient — see
+        `openspec/changes/fusion-redesign/design.md` D-G. Silent skipping is
+        no longer an option:
+
+        - `oom_skipped`: CUDA OOM is tolerated on epoch 1 only (allocator
+          warm-up). From epoch 2 onward, any OOM skip raises immediately.
+        - `nan_skipped`: always counted; never itself the trigger for a raise
+          (see `steps_taken` below), but recorded so a future bf16 rung
+          cannot convert a REFUTE into a false CONFIRM by silently discarding
+          the batches that produced non-finite loss.
+        - `steps_taken`: **optimizer** steps actually executed (i.e. effective
+          steps, after accumulation — see D-H below). Zero in any epoch is
+          always fatal, regardless of which guard caused it.
+
+        D-H (fusion-redesign): gradient accumulation keeps `effective_batch`
+        constant while `batch_size` (a memory knob) varies across hardware.
+        Each micro-batch's loss is scaled by `1/grad_accum_steps` before
+        `backward()`; `backward()` runs every micro-batch, but
+        `clip_grad_norm_` + `optimizer.step()` + `zero_grad()` run only once
+        per `grad_accum_steps` micro-batches, with any leftover
+        micro-batches flushed as a final (smaller) step at epoch end.
+        `grad_clip` is therefore applied once per **effective** step, never
+        per micro-batch — clipping a partial gradient would change the
+        optimisation accumulation exists to hold constant. With
+        `grad_accum_steps == 1` (no accumulation), this degrades exactly to
+        the pre-accumulation per-micro-batch step behaviour.
 
         Returns:
-            Dict with avg cls_loss, box_loss, total_loss.
+            Dict with avg cls_loss, box_loss, total_loss (averaged over
+            successful *micro-batches*), and the
+            oom_skipped/nan_skipped/steps_taken (optimizer steps) counters.
         """
         self.model.train()
+        accum = self.grad_accum_steps
         total_cls = 0.0
         total_box = 0.0
         total_loss = 0.0
-        n_batches = 0
+        micro_batches = 0   # successful forward+backward passes
+        steps_taken = 0     # optimizer.step() calls (effective steps)
+        oom_skipped = 0
+        nan_skipped = 0
         rgb_stem_grad_norms: list[float] = []
+        micro_step = 0      # micro-batches accumulated since the last flush
+        optimizer.zero_grad(set_to_none=True)
+
+        def _flush_step() -> None:
+            nonlocal steps_taken
+            if self.config.precision == "fp16":
+                self.scaler.unscale_(optimizer)
+            nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip)
+            if self.config.precision == "fp16":
+                self.scaler.step(optimizer)
+                self.scaler.update()
+            else:
+                optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            steps_taken += 1
 
         for batch in self.train_loader:
             rgb = batch["rgb"].to(self.device)
@@ -347,10 +434,8 @@ class Trainer:
             bboxes = [b.to(self.device) for b in batch["bboxes"]]
             labels = [l.to(self.device) for l in batch["labels"]]
 
-            optimizer.zero_grad(set_to_none=True)
-
             try:
-                with autocast("cuda", enabled=self.config.amp):
+                with autocast_ctx(self.device.type, self.config.precision):
                     if self.config.model_type == "student":
                         output = self.model(rgb)
                     else:
@@ -360,16 +445,21 @@ class Trainer:
                     targets = {"bboxes": bboxes, "labels": labels}
                     loss, loss_dict = self.criterion(predictions, targets)
 
-                # NaN / Inf guard: skip batch if loss explodes
+                # NaN / Inf guard: skip batch if loss explodes. Always
+                # counted — see D-G docstring above for why this must not
+                # also be silent. Checked on the unscaled loss so the
+                # reported/counted value is independent of grad_accum_steps.
                 if torch.isnan(loss) or torch.isinf(loss):
-                    print(f"  [NaN] Skipping batch (loss={loss.item():.2f})")
+                    nan_skipped += 1
+                    print(f"  [NaN] Skipping batch (loss={loss.item():.2f}), "
+                          f"nan_skipped={nan_skipped}")
                     continue
 
-                if self.config.amp:
-                    self.scaler.scale(loss).backward()
-                    self.scaler.unscale_(optimizer)
+                scaled_loss = loss / accum
+                if self.config.precision == "fp16":
+                    self.scaler.scale(scaled_loss).backward()
                 else:
-                    loss.backward()
+                    scaled_loss.backward()
 
                 # E6 instrumentation: capture the RGB stem's gradient norm
                 # right after backward(), before clipping/step touch it —
@@ -379,33 +469,60 @@ class Trainer:
                 if self.config.model_type == "master":
                     rgb_stem_grad_norms.append(self._rgb_stem_grad_norm())
 
-                # Gradient clipping
-                nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip)
-
-                if self.config.amp:
-                    self.scaler.step(optimizer)
-                    self.scaler.update()
-                else:
-                    optimizer.step()
+                micro_step += 1
+                if micro_step % accum == 0:
+                    _flush_step()
+                    micro_step = 0
 
             except RuntimeError as e:
                 if "out of memory" in str(e).lower():
-                    print(f"  [OOM] Skipping batch, clearing CUDA cache.")
+                    oom_skipped += 1
                     torch.cuda.empty_cache()
+                    if epoch >= 2:
+                        raise RuntimeError(
+                            f"[OOM] Batch skipped on epoch {epoch} (phase {phase}); "
+                            "OOM tolerance is limited to epoch 1 (allocator "
+                            "warm-up). A run that keeps OOM-ing past epoch 1 is "
+                            "not a valid training run — reduce batch_size or "
+                            "increase grad_accum_steps instead of retrying. "
+                            f"oom_skipped={oom_skipped}, nan_skipped={nan_skipped}, "
+                            f"steps_taken={steps_taken}."
+                        ) from e
+                    print(
+                        f"  [OOM] Skipping batch (epoch 1 warm-up tolerance), "
+                        f"clearing CUDA cache. oom_skipped={oom_skipped}"
+                    )
                     continue
                 raise
 
             total_cls += loss_dict["cls_loss"]
             total_box += loss_dict["box_loss"]
             total_loss += loss.item()
-            n_batches += 1
+            micro_batches += 1
             self.global_step += 1
 
-        n_batches = max(n_batches, 1)
+        # Flush a partial accumulation window at epoch end so the last
+        # (possibly incomplete) group of micro-batches is not silently
+        # dropped from the optimizer update.
+        if micro_step != 0:
+            _flush_step()
+
+        if steps_taken == 0:
+            raise RuntimeError(
+                f"Training epoch {epoch} (phase {phase}) took zero optimizer "
+                f"steps (oom_skipped={oom_skipped}, nan_skipped={nan_skipped}). "
+                "A run with zero steps produced no gradient update and must "
+                "not be reported as a completed epoch — see "
+                "openspec/changes/fusion-redesign/design.md D-G."
+            )
+
         result = {
-            "cls_loss": total_cls / n_batches,
-            "box_loss": total_box / n_batches,
-            "total_loss": total_loss / n_batches,
+            "cls_loss": total_cls / micro_batches,
+            "box_loss": total_box / micro_batches,
+            "total_loss": total_loss / micro_batches,
+            "oom_skipped": float(oom_skipped),
+            "nan_skipped": float(nan_skipped),
+            "steps_taken": float(steps_taken),
         }
         if rgb_stem_grad_norms:
             result["rgb_stem_grad_norm"] = sum(rgb_stem_grad_norms) / len(rgb_stem_grad_norms)
@@ -463,7 +580,7 @@ class Trainer:
             rgb = batch["rgb"].to(self.device)
             nir = batch["nir"].to(self.device)
 
-            with autocast("cuda", enabled=self.config.amp):
+            with autocast_ctx(self.device.type, self.config.precision):
                 if self.config.model_type == "student":
                     output = self.model(rgb)
                 else:
@@ -551,14 +668,31 @@ class Trainer:
         phase: int,
         metrics: dict,
         filename: str,
+        train_metrics: dict | None = None,
     ):
-        """Save model checkpoint."""
+        """Save model checkpoint.
+
+        `train_metrics`, when provided, carries the D-G fault counters
+        (`oom_skipped`, `nan_skipped`, `steps_taken`) from the epoch that
+        produced this checkpoint, so a checkpoint can be audited after the
+        fact without re-reading the training log. `effective_batch`,
+        `precision`, and `device` are already part of `self.config.__dict__`
+        below; `experiment_sha256` (D-H) is recorded alongside separately
+        since it is not itself a config field — two runs are comparable
+        only if `experiment_sha256` AND `effective_batch` both match.
+        """
         path = self.output_dir / filename
-        torch.save({
+        checkpoint = {
             "epoch": epoch,
             "phase": phase,
             "model_state_dict": self.model.state_dict(),
             "metrics": metrics,
             "best_map50": self.best_map50,
             "config": self.config.__dict__,
-        }, path)
+            "experiment_sha256": self.experiment_sha256,
+        }
+        if train_metrics is not None:
+            checkpoint["oom_skipped"] = train_metrics.get("oom_skipped")
+            checkpoint["nan_skipped"] = train_metrics.get("nan_skipped")
+            checkpoint["steps_taken"] = train_metrics.get("steps_taken")
+        torch.save(checkpoint, path)

@@ -16,7 +16,7 @@ distill_levels:
 # --- Training (overridden defaults for KD) ---
 epochs: 80
 patience: 30
-amp: false
+precision: fp32
 batch_size: 8
 model_type: student
 
