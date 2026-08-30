@@ -30,3 +30,25 @@ def test_freeze_backbone_keeps_nir_stem_trainable() -> None:
         _all_frozen(stage.parameters())
         for stage in model.backbone.shared_stages
     )
+
+
+def test_unfreeze_backbone_stages_default_leaves_rgb_stem_frozen() -> None:
+    """Backward-compat default: unfreeze_rgb_stem=False changes nothing about the stem."""
+    model = MasterModel(pretrained_backbone=False)
+    model.freeze_backbone(freeze_stages=4)
+
+    model.unfreeze_backbone_stages([2, 3])
+
+    assert _all_frozen(model.backbone.rgb_stem.parameters())
+
+
+def test_unfreeze_backbone_stages_can_unfreeze_rgb_stem() -> None:
+    """E6/Q10 production fix: unfreeze_rgb_stem=True must actually let the
+    RGB stem adapt during a Phase 2 unfreeze call — the documented root cause
+    behind the maestro underperforming its own student."""
+    model = MasterModel(pretrained_backbone=False)
+    model.freeze_backbone(freeze_stages=4)
+
+    model.unfreeze_backbone_stages([2, 3], unfreeze_rgb_stem=True)
+
+    assert _all_trainable(model.backbone.rgb_stem.parameters())

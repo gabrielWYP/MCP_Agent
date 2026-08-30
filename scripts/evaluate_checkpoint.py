@@ -1,0 +1,275 @@
+#!/usr/bin/env python3
+"""Eval-only entrypoint for an existing checkpoint (D10).
+
+Runs `Trainer.evaluate()` against a chosen split with no training loop and
+no `train_loader` dependency, so a checkpoint can be re-scored under a
+different decode configuration (NMS on/off, per-class decode on/off,
+assigner center radius, ...) without retraining. This is the tool the
+damage-map-audit experiment ladder (E0-E3) needs: every inference-only rung
+runs through this script.
+
+Also supports `--assigner-stats` (A0/A4): a forward-only pass (no backward,
+no optimizer step) over the chosen split that accumulates per-class,
+per-level positive-anchor counts via `YOLOv8Loss`'s non-destructive
+instrumentation, written to `<output-dir>/assigner_stats.csv`.
+
+Usage:
+    # Step A — NMS-corrected baseline re-evaluation (no training).
+    python scripts/evaluate_checkpoint.py --config configs/training_student.yaml \\
+        --checkpoint checkpoints/student/best_model.pt --split val \\
+        --override nms_enabled=true decode_per_class=true
+
+    # Step A0 / E2 — assigner instrumentation on an existing checkpoint.
+    python scripts/evaluate_checkpoint.py --config configs/training_student.yaml \\
+        --checkpoint checkpoints/student/best_model.pt --split train \\
+        --assigner-stats --override assigner_center_radius=0.0
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import sys
+from pathlib import Path
+
+import torch
+
+# Ensure project root is importable
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from src.models.master.master_model import MasterModel
+from src.models.student.student_model import StudentModel
+from src.training.config import TrainingConfig
+from src.training.dataset import YOLODataset, build_dataloader, collate_fn
+from src.training.loop import Trainer
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Evaluate an existing checkpoint without retraining."
+    )
+    parser.add_argument("--config", required=True, type=str, help="Path to YAML training config.")
+    parser.add_argument("--checkpoint", required=True, type=str, help="Path to .pt checkpoint file.")
+    parser.add_argument(
+        "--model", type=str, choices=["master", "student"], default=None,
+        help="Model architecture. Defaults to the config's model_type.",
+    )
+    parser.add_argument(
+        "--split", type=str, default="val", choices=["train", "val", "test"],
+        help="Dataset split to evaluate (default: val).",
+    )
+    parser.add_argument(
+        "--override", nargs="*", default=[],
+        help="Override config values: key=value pairs (same syntax as train.py).",
+    )
+    parser.add_argument(
+        "--assigner-stats", action="store_true",
+        help=(
+            "Run a forward-only pass collecting per-class, per-level "
+            "positive-anchor instrumentation (A0/A4/E2) instead of computing mAP."
+        ),
+    )
+    parser.add_argument(
+        "--output-dir", type=str, default="reports/damage-map-audit/eval",
+        help="Directory to write metrics.json / assigner_stats.csv.",
+    )
+    parser.add_argument(
+        "--device", type=str, default=None, help="Device: cuda or cpu (default: auto-detect).",
+    )
+    return parser.parse_args()
+
+
+def _apply_overrides(config: TrainingConfig, overrides: list[str]) -> None:
+    """Apply `key=value` overrides in place, matching train.py's coercion rules."""
+    for override in overrides:
+        key, value = override.split("=", 1)
+        if not hasattr(config, key):
+            logger.warning("Ignoring unknown override key: %s", key)
+            continue
+        current = getattr(config, key)
+        if isinstance(current, bool):
+            value = value.lower() in ("true", "1", "yes")
+        elif isinstance(current, int):
+            value = int(value)
+        elif isinstance(current, float):
+            value = float(value)
+        elif isinstance(current, list):
+            value = json.loads(value) if value.strip().startswith("[") else [
+                float(v) for v in value.split(",")
+            ]
+        setattr(config, key, value)
+
+
+def _load_model(model_type: str, checkpoint_path: str, config: TrainingConfig, device: torch.device):
+    if model_type == "master":
+        model = MasterModel(
+            num_classes=config.num_classes,
+            pretrained_backbone=False,
+            backbone_variant=config.backbone_variant,
+        )
+    else:
+        model = StudentModel(num_classes=config.num_classes)
+
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+        state_dict = checkpoint["model_state_dict"]
+        logger.info(
+            "Loaded checkpoint (epoch=%s, best_map50=%s)",
+            checkpoint.get("epoch", "?"), checkpoint.get("best_map50", "?"),
+        )
+    else:
+        state_dict = checkpoint
+        logger.info("Loaded raw state_dict.")
+
+    model.load_state_dict(state_dict, strict=True)
+    model.to(device)
+    model.eval()
+    return model
+
+
+def _run_assigner_stats(
+    model, config: TrainingConfig, loader, device: torch.device, output_dir: Path,
+) -> dict:
+    """A0/E2: forward-only pass accumulating per-class, per-level positive
+    anchor counts. No backward pass, no optimizer step, no weight update."""
+    from src.training.loss import YOLOv8Loss
+
+    criterion = YOLOv8Loss(
+        num_classes=config.num_classes,
+        box_weight=config.box_weight,
+        cls_weight=config.cls_weight,
+        class_weights=config.class_weights,
+        strides=[8, 16, 32],
+        assigner_center_radius=config.assigner_center_radius,
+        assigner_level_ranges=config.assigner_level_ranges,
+        assigner_collect_stats=True,
+    ).to(device)
+
+    with torch.no_grad():
+        for batch in loader:
+            rgb = batch["rgb"].to(device)
+            nir = batch["nir"].to(device)
+            bboxes = [b.to(device) for b in batch["bboxes"]]
+            labels = [l.to(device) for l in batch["labels"]]
+
+            if config.model_type == "student":
+                output = model(rgb)
+            else:
+                output = model(rgb, nir)
+
+            targets = {"bboxes": bboxes, "labels": labels}
+            criterion(output["preds"], targets)  # forward only; stats accumulate as a side effect
+
+    stats_path = output_dir / "assigner_stats.csv"
+    criterion.write_assigner_stats_csv(stats_path)
+    stats = criterion.get_assigner_stats()
+    logger.info("Assigner stats written to %s", stats_path)
+
+    # Median positive anchors per GT instance, per class (E2 bar: damage <1.0
+    # vs mango >=5.0 pre-fix; see proposal.md falsifiable criteria).
+    class_counts = _gt_instance_counts(loader.dataset)
+    per_class_positives: dict[int, list[int]] = {}
+    for (cls_id, _level), count in stats.items():
+        per_class_positives.setdefault(cls_id, []).append(count)
+
+    summary = {}
+    for cls_id, counts in per_class_positives.items():
+        total_positives = sum(counts)
+        n_gt = class_counts.get(cls_id, 0)
+        summary[cls_id] = {
+            "total_positive_anchors": total_positives,
+            "gt_instances": n_gt,
+            "mean_positives_per_gt": (total_positives / n_gt) if n_gt else None,
+        }
+        logger.info(
+            "class %d: %d positive anchors across %d GT instances (mean %.3f/GT)",
+            cls_id, total_positives, n_gt,
+            (total_positives / n_gt) if n_gt else float("nan"),
+        )
+
+    return {"per_class_level_counts": {f"{k[0]}_{k[1]}": v for k, v in stats.items()}, "summary": summary}
+
+
+def _gt_instance_counts(dataset: YOLODataset) -> dict[int, int]:
+    return dataset.get_class_counts()
+
+
+def main() -> int:
+    args = parse_args()
+
+    config = TrainingConfig.from_yaml(args.config)
+    _apply_overrides(config, args.override)
+
+    model_type = args.model or config.model_type
+    config.model_type = model_type
+
+    device = torch.device(args.device) if args.device else torch.device(
+        "cuda" if torch.cuda.is_available() else "cpu"
+    )
+    logger.info("Device: %s", device)
+    logger.info(
+        "Config: model=%s split=%s conf_threshold=%.3f nms_enabled=%s decode_per_class=%s "
+        "assigner_center_radius=%.2f",
+        model_type, args.split, config.conf_threshold, config.nms_enabled,
+        config.decode_per_class, config.assigner_center_radius,
+    )
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    model = _load_model(model_type, args.checkpoint, config, device)
+
+    dataset = YOLODataset(
+        rgb_dir=config.rgb_dir,
+        nir_dir=config.nir_dir,
+        labels_dir=config.labels_dir,
+        split=args.split,
+        image_size=config.image_size,
+        nir_mean=config.nir_mean,
+        nir_std=config.nir_std,
+        letterbox_value=config.letterbox_value,
+        manifest_path=config.split_manifest,
+    )
+    logger.info("Split '%s': %d images", args.split, len(dataset))
+
+    loader = build_dataloader(
+        dataset, batch_size=config.batch_size, shuffle=False,
+        collate_fn=collate_fn, num_workers=config.num_workers, pin_memory=True,
+    )
+
+    if args.assigner_stats:
+        result = _run_assigner_stats(model, config, loader, device, output_dir)
+        (output_dir / "assigner_stats_summary.json").write_text(json.dumps(result, indent=2))
+        print(json.dumps(result["summary"], indent=2))
+        return 0
+
+    trainer = Trainer(model=model, config=config, train_loader=None, val_loader=loader)
+    metrics = trainer.evaluate()
+
+    metrics_path = output_dir / "metrics.json"
+    metrics_path.write_text(json.dumps(metrics, indent=2, default=str))
+    logger.info("Metrics written to %s", metrics_path)
+
+    print(f"mAP@0.5:      {metrics['map50']:.4f}")
+    print(f"mAP@0.5:0.95: {metrics['map_50_95']:.4f}")
+    for cls_id, ap in sorted(metrics["per_class_ap_50"].items()):
+        precision = metrics["per_class_precision"].get(cls_id, 0.0)
+        recall = metrics["per_class_recall"].get(cls_id, 0.0)
+        counts = metrics["per_class_counts"].get(cls_id, {})
+        print(
+            f"  class {cls_id}: AP50={ap:.4f} precision={precision:.4f} recall={recall:.4f} "
+            f"tp={counts.get('tp', 0)} fp={counts.get('fp', 0)} fn={counts.get('fn', 0)}"
+        )
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
