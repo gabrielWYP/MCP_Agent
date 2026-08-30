@@ -39,7 +39,7 @@ log_interval: 5
 save_interval: 10
 
 # Mixed precision
-amp: false  # FP16 causes NaN in YOLOv8Loss — using FP32
+precision: fp32  # FP16 causes NaN in YOLOv8Loss — using FP32
 
 # Gradient clipping
 grad_clip: 10.0

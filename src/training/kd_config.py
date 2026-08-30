@@ -19,8 +19,9 @@ class KDConfig(TrainingConfig):
     """Configuration for knowledge distillation training.
 
     Extends TrainingConfig with teacher checkpoint and KD hyperparameters.
-    All training parameters (epochs, patience, amp, batch_size, model_type)
-    have KD-specific defaults that override the base TrainingConfig defaults.
+    All training parameters (epochs, patience, precision, batch_size,
+    model_type) have KD-specific defaults that override the base
+    TrainingConfig defaults.
 
     Attributes:
         teacher_checkpoint: Path to MasterModel checkpoint (.pt file).
@@ -43,7 +44,7 @@ class KDConfig(TrainingConfig):
     # Overridden defaults for KD training
     epochs: int = 80
     patience: int = 30
-    amp: bool = False
+    precision: str = "fp32"
     batch_size: int = 4
     model_type: str = "student"
 
