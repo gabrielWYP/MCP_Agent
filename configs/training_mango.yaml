@@ -1,5 +1,13 @@
 # Training config for MasterModel — Mango damage detection
 # Small-dataset strategy: Phase 1 only (frozen backbone), aggressive augmentations
+#
+# fusion-redesign: this file preserves the PRE-redesign architecture and
+# two-phase schedule (`head_strides: [8, 16, 32]`, `schedule: two_phase`),
+# explicitly, so it keeps working end-to-end as a historical baseline. The
+# new architecture's experiment lives in configs/experiment/fusion.yaml —
+# see openspec/changes/fusion-redesign/design.md D-H. No v1 checkpoint
+# trained under this file loads into the redesigned MasterModel (arch_version
+# hard break, design.md D-C).
 
 # Data paths
 rgb_dir: "data/cache/mango/rgb"
@@ -15,8 +23,20 @@ num_classes: 2
 image_size: 640
 letterbox_value: 114
 
+# Architecture: pre-redesign 3-level pyramid (no P2), matching the 2-entry
+# assigner_level_ranges below. schedule: two_phase preserves the frozen ->
+# partial-unfreeze schedule this file was designed around (fusion-redesign
+# D-4 default is "end_to_end"; this config opts back out explicitly).
+head_strides: [8, 16, 32]
+schedule: two_phase
+
 # Training — Phase 1 warmup + Phase 2 backbone unfreeze
-batch_size: 8
+# batch_size: 2, not the historical 8 — measured OOM at 13.54 GB on the
+# 6.44 GB local GPU (fusion-redesign proposal.md Round 2). effective_batch
+# (D-H) keeps the previous nominal batch-8 schedule comparable via
+# gradient accumulation.
+batch_size: 2
+effective_batch: 8
 epochs_phase1: 80
 epochs_phase2: 10          # Short Phase 2 — unfreeze stages 3-4 with low LR
 lr_phase1: 0.001

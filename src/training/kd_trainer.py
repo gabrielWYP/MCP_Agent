@@ -25,12 +25,18 @@ from .kd_config import KDConfig
 from .kd_loss import KDLoss
 from .loop import Trainer
 from .precision import autocast_ctx
+from .strides import STUDENT_STRIDES, select_by_strides
 from src.models.master.master_model import MasterModel
 from src.models.master.distill_projections import (
     backbone_projections,
     fpn_projections,
     head_projections,
 )
+
+# The teacher (MasterModel) may emit more levels than the student's fixed
+# `STUDENT_STRIDES` (default [4, 8, 16, 32], fusion-redesign D-3); KD must
+# select the matching 3 by stride rather than by position — see
+# `select_by_strides` and design.md §5's ProjectionLayers hazard.
 
 
 class KDTrainer(Trainer):
@@ -99,6 +105,7 @@ class KDTrainer(Trainer):
             num_classes=config.num_classes,
             pretrained_backbone=False,
             backbone_variant=config.backbone_variant,
+            head_strides=config.head_strides,
         )
 
         checkpoint = torch.load(str(ckpt_path), map_location="cpu", weights_only=False)
@@ -171,20 +178,34 @@ class KDTrainer(Trainer):
                     # --- Teacher forward (no grad) ---
                     with torch.no_grad():
                         t_out = self.teacher(rgb, nir)
-                        # Use distill_backbone_rgb[2:] for S3, S4 — student is
-                        # RGB-only, so distill from RGB teacher features.
+                        # `distill_backbone` (renamed from `distill_backbone_rgb`,
+                        # fusion-redesign W7/W4): the teacher's backbone is now
+                        # a single early-fused stream, so this is no longer an
+                        # "RGB-only" feature set — it carries NIR information
+                        # too (design.md D-5). [2:] still selects S3, S4;
+                        # channels [384, 768] are unchanged.
                         proj_backbone = self.model.kd_proj_backbone(
-                            t_out["distill_backbone_rgb"][2:]
+                            t_out["distill_backbone"][2:]
                         )
-                        proj_fpn = self.model.kd_proj_fpn(
-                            t_out["distill_fpn"]
+                        # fusion-redesign D-3/§5: the teacher may emit more
+                        # pyramid/head levels than the student's fixed 3
+                        # (default head_strides=[4,8,16,32] vs the student's
+                        # [8,16,32]). Select the matching levels by stride,
+                        # not by position — a positional zip/truncation would
+                        # silently distill P2/P3/P4 into student P3/P4/P5.
+                        teacher_strides = self.teacher.head_strides
+                        fpn_for_student = select_by_strides(
+                            t_out["distill_fpn"], teacher_strides, STUDENT_STRIDES
                         )
-                        proj_head_cls = self.model.kd_proj_head_cls(
-                            t_out["distill_head_cls"]
+                        head_cls_for_student = select_by_strides(
+                            t_out["distill_head_cls"], teacher_strides, STUDENT_STRIDES
                         )
-                        proj_head_reg = self.model.kd_proj_head_reg(
-                            t_out["distill_head_reg"]
+                        head_reg_for_student = select_by_strides(
+                            t_out["distill_head_reg"], teacher_strides, STUDENT_STRIDES
                         )
+                        proj_fpn = self.model.kd_proj_fpn(fpn_for_student)
+                        proj_head_cls = self.model.kd_proj_head_cls(head_cls_for_student)
+                        proj_head_reg = self.model.kd_proj_head_reg(head_reg_for_student)
 
                     # --- Student forward (RGB only) ---
                     s_out = self.model(rgb)

@@ -4,40 +4,44 @@ Master Model — Full architecture for multimodal mango damage detection.
 Input:  RGB image (N, 3, H, W) + NIR image (N, 1, H, W)
 Output: YOLO-style detections + intermediate features for knowledge distillation
 
+fusion-redesign: simple early fusion. RGB and NIR are stacked into one
+4-channel tensor and fed through a single-stream backbone — no cross-modal
+attention module, no second FPN. `forward(rgb, nir)` keeps its two-tensor
+signature so `dataset.py`, `Trainer._train_epoch`, and `KDTrainer` need no
+call-site edit; the concatenation is internal to the model.
+
 Full pipeline:
     RGB + NIR
+        ↓ cat(dim=1)
+    EarlyFusionBackbone (single stem, single stage stack)
         ↓
-    DualConvNeXtBackbone (shared weights, separate stems)
+    [S1..S4] — 4 stage features
         ↓
-    [rgb_features, nir_features]  — 4 stages each
+    FPNNeck ( SingleFPN, unchanged )
         ↓
-    CrossModalFusion (cross-attention per stage)
-        ↓
-    [fused_features, nir_features]
-        ↓
-    DualFPN (two FPNs + per-level fusion)
-        ↓
-    unified_pyramid [P3, P4, P5]
+    pyramid — levels named by `head_strides`, default [P2, P3, P4, P5]
         ↓
     YOLODetectionHead (anchor-free, decoupled)
         ↓
-    {preds, cls_preds, reg_preds, distill_feats}
+    {preds, cls_preds, reg_preds, distill_backbone, distill_fpn,
+     distill_head_cls, distill_head_reg}   — 7 keys
 
 Distillation outputs exposed:
-    - backbone_rgb_features:  [S1..S4] from RGB encoder
-    - backbone_fused_features: [F1..F4] after cross-attention
-    - fpn_pyramid:            [P3..P5] unified pyramid
-    - head_cls_feats:         [cls_stem_P3, cls_stem_P4, cls_stem_P5]
-    - head_reg_feats:         [reg_stem_P3, reg_stem_P4, reg_stem_P5]
+    - distill_backbone:  [S1..S4] from the single backbone stream
+    - distill_fpn:       the emitted pyramid levels (per `head_strides`)
+    - distill_head_cls:  [cls_stem per level] head classification features
+    - distill_head_reg:  [reg_stem per level] head regression features
 """
+
+from __future__ import annotations
 
 import torch
 import torch.nn as nn
 
-from .backbone import DualConvNeXtBackbone
-from .fusion import CrossModalFusion
-from .neck import DualFPN
+from .backbone import EarlyFusionBackbone
+from .neck import FPNNeck
 from .head import YOLODetectionHead, NUM_CLASSES
+from src.training.strides import DEFAULT_HEAD_STRIDES, validate_strides
 
 
 class MasterModel(nn.Module):
@@ -46,12 +50,20 @@ class MasterModel(nn.Module):
 
     Args:
         num_classes (int): Detection classes (default 2: mango, danado).
-        pretrained_backbone (bool): Load ImageNet weights for ConvNeXt stages.
+        pretrained_backbone (bool): Load ImageNet weights for ConvNeXt stages
+            and inflate the stem (mean-preserving for `in_channels=4`,
+            verbatim for `in_channels=3`).
         fpn_channels (int): FPN output channels (default 256).
-        fusion_dropout (float): Dropout in cross-attention fusion.
-        fpn_dropout (float): Dropout in FPN fusion convs.
-        head_strides (list[int]): Strides for YOLO head levels.
+        head_strides (list[int] | None): Pyramid strides the head is built
+            over, finest-first. Default `[4, 8, 16, 32]` — includes the
+            reconnected P2 level (fusion-redesign D-3). Pass `[8, 16, 32]`
+            to reproduce the pre-redesign 3-level pyramid.
         backbone_variant (str): ConvNeXt variant — "tiny" or "small".
+        in_channels (int): Backbone stem input channels. 4 (default) for
+            the early-fused RGB+NIR input; 3 for the RGB-only H-D control
+            arm. `forward` always takes `(rgb, nir)`; with `in_channels=3`,
+            `nir` is accepted but ignored (control-arm convenience so call
+            sites do not need a separate code path).
     """
 
     # ConvNeXt stage channels (identical for Tiny and Small)
@@ -62,106 +74,85 @@ class MasterModel(nn.Module):
         num_classes: int = NUM_CLASSES,
         pretrained_backbone: bool = True,
         fpn_channels: int = 256,
-        fusion_dropout: float = 0.1,
-        fpn_dropout: float = 0.1,
-        head_strides: list[int] = None,
+        head_strides: list[int] | None = None,
         backbone_variant: str = "tiny",
+        in_channels: int = 4,
     ):
         super().__init__()
 
-        # --- 1. Dual backbone (shared weights, separate stems) ---
-        self.backbone = DualConvNeXtBackbone(
-            pretrained=pretrained_backbone, variant=backbone_variant
+        strides = list(head_strides) if head_strides is not None else list(DEFAULT_HEAD_STRIDES)
+        validate_strides(strides)
+        self.head_strides = strides
+        self.in_channels = in_channels
+
+        # --- 1. Single-stream early-fusion backbone ---
+        self.backbone = EarlyFusionBackbone(
+            pretrained=pretrained_backbone, variant=backbone_variant, in_channels=in_channels
         )
 
-        # --- 2. Cross-modal attention fusion ---
-        self.fusion = CrossModalFusion(
-            stage_channels=self.STAGE_CHANNELS,
-            dropout=fusion_dropout,
-        )
-
-        # --- 3. Dual FPN neck ---
-        self.neck = DualFPN(
+        # --- 2. FPN neck (SingleFPN, wrapped to emit the configured levels) ---
+        self.neck = FPNNeck(
             in_channels=self.STAGE_CHANNELS,
             out_channels=fpn_channels,
-            dropout=fpn_dropout,
+            strides=tuple(strides),
         )
 
-        # --- 4. YOLO-style detection head (compatible with YOLO Nano student) ---
+        # --- 3. YOLO-style detection head (compatible with YOLO Nano student) ---
         self.head = YOLODetectionHead(
             fpn_channels=fpn_channels,
             num_classes=num_classes,
-            strides=head_strides or [8, 16, 32],
+            strides=strides,
         )
 
     # ------------------------------------------------------------------
     # Forward
     # ------------------------------------------------------------------
 
-    def forward(
-        self,
-        rgb: torch.Tensor,
-        nir: torch.Tensor,
-        return_attention: bool = False,
-    ) -> dict:
+    def forward(self, rgb: torch.Tensor, nir: torch.Tensor) -> dict:
         """
         Args:
-            rgb: (N, 3, H, W) — RGB image, normalized
-            nir: (N, 1, H, W) — NIR grayscale image, normalized
-            return_attention: If True, include 'attention_maps' in output dict.
+            rgb: (N, 3, H, W) — RGB image, normalized.
+            nir: (N, 1, H, W) — NIR grayscale image, normalized. Ignored
+                when `self.in_channels == 3` (the H-D RGB-only control arm),
+                accepted anyway so call sites do not need a separate path.
 
         Returns:
             dict with keys:
                 'preds'              : list of (B, nc+4, H_i, W_i) per level
                 'cls_preds'          : list of (B, nc, H_i, W_i) per level
                 'reg_preds'          : list of (B, 4, H_i, W_i) per level
-                'distill_backbone_rgb'   : [S1..S4] RGB backbone features
-                'distill_backbone_fused' : [F1..F4] cross-attention fused features
-                'distill_fpn'            : [P3..P5] unified FPN pyramid
-                'distill_head_cls'       : [cls_stem x3] head classification features
-                'distill_head_reg'       : [reg_stem x3] head regression features
-                'attention_maps'         : (if return_attention) [M1..M4] each (N,H,W)
+                'distill_backbone'   : [S1..S4] backbone stage features
+                'distill_fpn'        : emitted FPN pyramid levels
+                'distill_head_cls'   : [cls_stem per level] head features
+                'distill_head_reg'   : [reg_stem per level] head features
         """
-        # --- Backbone ---
-        rgb_features, nir_features = self.backbone(rgb, nir)
-        # rgb_features: [S1..S4], channels [96, 192, 384, 768]
-        # nir_features: [S1..S4], same channels
-
-        # --- Cross-modal fusion ---
-        if return_attention:
-            fused_features, nir_features_pass, attn_maps = self.fusion(
-                rgb_features, nir_features, return_attention=True
-            )
+        # --- Early fusion: stack RGB+NIR into one input tensor ---
+        if self.in_channels == 4:
+            x = torch.cat([rgb, nir], dim=1)  # (N, 4, H, W)
         else:
-            fused_features, nir_features_pass = self.fusion(rgb_features, nir_features)
-        # fused_features: [F1..F4] — RGB enriched with NIR context
+            x = rgb  # H-D RGB-only control arm
 
-        # --- Dual FPN ---
-        pyramid = self.neck(fused_features, nir_features_pass)
-        # pyramid: [P3..P5] at fpn_channels (256)
+        # --- Backbone (single stream) ---
+        backbone_features = self.backbone(x)  # [S1..S4], channels [96, 192, 384, 768]
+
+        # --- FPN neck ---
+        pyramid = self.neck(backbone_features)  # levels named by self.head_strides
 
         # --- YOLO Detection Head ---
         head_output = self.head(pyramid)
 
-        # --- Assemble output with all distillation features ---
-        output = {
+        return {
             # Detection outputs
             "preds":      head_output["preds"],
             "cls_preds":  head_output["cls_preds"],
             "reg_preds":  head_output["reg_preds"],
 
             # Distillation features — exposed for student training
-            "distill_backbone_rgb":   rgb_features,          # [S1..S4]
-            "distill_backbone_fused": fused_features,        # [F1..F4]
-            "distill_fpn":            pyramid,               # [P3..P5]
-            "distill_head_cls":       head_output["distill_cls"],  # [cls_stem x3]
-            "distill_head_reg":       head_output["distill_reg"],  # [reg_stem x3]
+            "distill_backbone": backbone_features,          # [S1..S4]
+            "distill_fpn":       pyramid,                    # emitted levels
+            "distill_head_cls":  head_output["distill_cls"], # [cls_stem per level]
+            "distill_head_reg":  head_output["distill_reg"], # [reg_stem per level]
         }
-
-        if return_attention:
-            output["attention_maps"] = attn_maps  # [M1..M4] each (N, H, W)
-
-        return output
 
     # ------------------------------------------------------------------
     # Utility
@@ -169,66 +160,60 @@ class MasterModel(nn.Module):
 
     def freeze_backbone(self, freeze_stages: int = 2):
         """
-        Freeze the first N stages of the shared backbone.
-        Useful for fine-tuning with a small dataset — freeze early stages
-        (which capture generic features) and only train later stages.
+        Freeze the stem plus the first N stages of the backbone.
+
+        No stem/stage asymmetry: there is only one stream now, so the stem
+        is frozen or trainable exactly like the two-stream design's shared
+        stages were (fusion-redesign D-4 — the previous
+        `rgb_stem`-always-frozen / `nir_stem`-always-trainable split had no
+        remaining rationale once there is a single input stem).
 
         Args:
             freeze_stages: Number of stages to freeze (0-4).
-                           0 = freeze nothing, 4 = freeze all stages.
+                           0 = freeze nothing but the stem is still governed
+                           by this call (see below), 4 = freeze all stages.
         """
-        # Freeze RGB stem: it starts from ImageNet and is high-risk to overfit.
-        for param in self.backbone.rgb_stem.parameters():
-            param.requires_grad = False
+        for param in self.backbone.stem.parameters():
+            param.requires_grad = freeze_stages == 0
 
-        # Keep NIR stem trainable: it is the modality adapter for 850 nm images.
-        for param in self.backbone.nir_stem.parameters():
-            param.requires_grad = True
-
-        # Freeze shared stages up to freeze_stages
-        for i, stage in enumerate(self.backbone.shared_stages):
+        for i, stage in enumerate(self.backbone.stages):
             if i < freeze_stages:
                 for param in stage.parameters():
                     param.requires_grad = False
+            else:
+                for param in stage.parameters():
+                    param.requires_grad = True
 
-        frozen = freeze_stages
-        print(
-            f"[MasterModel] Frozen: RGB stem + first {frozen} shared stages. "
-            "NIR stem remains trainable."
-        )
+        print(f"[MasterModel] Frozen: stem (if freeze_stages>0) + first {freeze_stages} stages.")
 
     def unfreeze_backbone_stages(
         self,
         unfreeze_stages: list[int],
-        unfreeze_rgb_stem: bool = False,
+        unfreeze_stem: bool = False,
     ):
         """
         Unfreeze specific backbone stages by index (0-based).
 
         Args:
             unfreeze_stages: List of stage indices to unfreeze (e.g., [2, 3] for stages 3-4).
-            unfreeze_rgb_stem: If True, also unfreeze the RGB stem (damage-map-audit
-                E6/production fix). `freeze_backbone()` unconditionally freezes the
-                RGB stem regardless of `freeze_stages`; without this flag, a Phase 2
-                "unfreeze" call never actually lets the RGB stem adapt, which is
-                the documented root cause behind the maestro underperforming its
-                own student (0.216 vs 0.394 mAP@0.5) — see design.md Out of Scope /
-                proposal.md Round 3 Q10. Defaults to False to preserve prior
+            unfreeze_stem: If True, also unfreeze the stem. Renamed from the
+                previous `unfreeze_rgb_stem` (fusion-redesign D-4) — there is
+                only one stem now, so the RGB/NIR asymmetry no longer
+                applies. Defaults to False to preserve prior call-site
                 behavior for any caller that does not explicitly opt in.
         """
-        for i, stage in enumerate(self.backbone.shared_stages):
+        for i, stage in enumerate(self.backbone.stages):
             if i in unfreeze_stages:
                 for param in stage.parameters():
                     param.requires_grad = True
 
-        if unfreeze_rgb_stem:
-            for param in self.backbone.rgb_stem.parameters():
+        if unfreeze_stem:
+            for param in self.backbone.stem.parameters():
                 param.requires_grad = True
 
         print(
             f"[MasterModel] Unfrozen stages: {unfreeze_stages}. "
-            f"RGB stem {'unfrozen' if unfreeze_rgb_stem else 'remains frozen'}; "
-            "NIR stem remains trainable."
+            f"Stem {'unfrozen' if unfreeze_stem else 'unchanged'}."
         )
 
     def count_parameters(self) -> dict[str, int]:
@@ -238,7 +223,6 @@ class MasterModel(nn.Module):
 
         return {
             "backbone":   count(self.backbone),
-            "fusion":     count(self.fusion),
             "neck":       count(self.neck),
             "head":       count(self.head),
             "total":      count(self),

@@ -239,6 +239,8 @@ def main():
             num_classes=config.num_classes,
             pretrained_backbone=True,
             backbone_variant=config.backbone_variant,
+            head_strides=config.head_strides,
+            in_channels=config.in_channels,
         )
         params = model.count_parameters()
         print(f"Model parameters: {params['total']:,} total, {params['backbone']:,} backbone")

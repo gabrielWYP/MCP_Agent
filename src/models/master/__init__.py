@@ -1,6 +1,5 @@
-from .backbone import DualConvNeXtBackbone
-from .fusion import CrossModalFusion
-from .neck import DualFPN
+from .backbone import EarlyFusionBackbone
+from .neck import FPNNeck, SingleFPN
 from .head import YOLODetectionHead, DecoupledHead, NUM_CLASSES
 from .distill_projections import (
     ProjectionLayers,
@@ -11,9 +10,9 @@ from .distill_projections import (
 from .master_model import MasterModel
 
 __all__ = [
-    "DualConvNeXtBackbone",
-    "CrossModalFusion",
-    "DualFPN",
+    "EarlyFusionBackbone",
+    "FPNNeck",
+    "SingleFPN",
     "YOLODetectionHead",
     "DecoupledHead",
     "NUM_CLASSES",

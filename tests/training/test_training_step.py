@@ -31,6 +31,7 @@ class TestTrainingStep:
             box_weight=7.5,
             cls_weight=0.5,
             class_weights=[2.7, 0.5],
+            strides=[4, 8, 16, 32],
         )
 
     @pytest.fixture

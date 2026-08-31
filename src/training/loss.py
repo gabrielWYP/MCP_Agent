@@ -334,7 +334,9 @@ class YOLOv8Loss(nn.Module):
         cls_weight: Weight for classification (Focal) loss.
         class_weights: Per-class weights for classification loss.
         focal_gamma: Focal loss gamma (0 = standard BCE, 2.0 default).
-        strides: FPN level strides.
+        strides: FPN level strides. Required, keyword-only (fusion-redesign
+            D-D) — a forgotten argument is a `TypeError` at the call site
+            instead of a silent, wrong-but-plausible `[8, 16, 32]` default.
         assigner_center_radius: Center-sampling tolerance in stride units
             passed to `TaskAlignedAssigner` (0.0 = legacy strict containment, D9).
         assigner_level_ranges: Per-level GT-size admissibility bins (D8).
@@ -349,7 +351,8 @@ class YOLOv8Loss(nn.Module):
         cls_weight: float = 0.5,
         class_weights: list[float] | None = None,
         focal_gamma: float = 2.0,
-        strides: list[int] | None = None,
+        *,
+        strides: list[int],
         assigner_center_radius: float = 0.0,
         assigner_level_ranges: list[float] | None = None,
         assigner_collect_stats: bool = False,
@@ -359,7 +362,7 @@ class YOLOv8Loss(nn.Module):
         self.box_weight = box_weight
         self.cls_weight = cls_weight
         self.focal_gamma = focal_gamma
-        self.strides = strides or [8, 16, 32]
+        self.strides = list(strides)
 
         if class_weights is None:
             class_weights = [1.0] * num_classes
