@@ -79,29 +79,5 @@ checkpoints/**/*.pt
 !checkpoints/**/*.csv
 !checkpoints/**/*.json
 
-# Heavy model checkpoints
-checkpoints/**/*.pt
-
-# Keep lightweight training artifacts
-!checkpoints/**/*.png
-!checkpoints/**/*.csv
-!checkpoints/**/*.json
-
-# Heavy model checkpoints
-checkpoints/**/*.pt
-
-# Keep lightweight training artifacts
-!checkpoints/**/*.png
-!checkpoints/**/*.csv
-!checkpoints/**/*.json
-
-# Heavy model checkpoints
-checkpoints/**/*.pt
-
-# Keep lightweight training artifacts
-!checkpoints/**/*.png
-!checkpoints/**/*.csv
-!checkpoints/**/*.json
-
-# Heavy model checkpoints
-checkpoints/**/*.pt
+# Partial (incomplete) training runs
+checkpoints/**/.partial/
