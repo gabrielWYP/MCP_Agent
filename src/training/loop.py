@@ -36,20 +36,28 @@ from torch.utils.data import DataLoader
 from .config import TrainingConfig
 from .decode import decode_detections
 from .loss import YOLOv8Loss
+from .fusion_modes import DEFAULT_FUSION_MODE, arch_version_for_mode
 from .machine import derive_grad_accum_steps
 from .metrics import compute_map, generate_training_curves, LossHistory
 from .precision import autocast_ctx, make_scaler
 from .strides import resolve_active_strides
 
-# Checkpoint schema version (fusion-redesign D-C). Every state_dict key
-# changes under the redesign (`backbone.rgb_stem.*` / `backbone.nir_stem.*` /
-# `backbone.shared_stages.*` -> `backbone.stem.*` / `backbone.stages.*`;
-# `fusion.*` disappears; `neck.fpn_rgb.*` / `neck.fpn_nir.*` /
-# `neck.fusion_convs.*` -> `neck.fpn.*`), so a v1 checkpoint is unloadable
-# into the v2 MasterModel. This tag converts a 200-line missing/unexpected-key
-# dump into one actionable sentence — see `scripts/evaluate_checkpoint.py`
-# and `scripts/visualize_damage_predictions.py`.
-CHECKPOINT_ARCH_VERSION = 2
+# Checkpoint schema version, per fusion mode (fusion-redesign D-C). The two
+# `MasterModel` architectures share no state_dict key upstream of the
+# detection head (`backbone.rgb_stem.*` / `backbone.nir_stem.*` /
+# `backbone.shared_stages.*` / `fusion.*` / `neck.fpn_rgb.*` /
+# `neck.fpn_nir.*` / `neck.fusion_convs.*` for
+# `fusion_mode="cross_attention"` vs `backbone.stem.*` /
+# `backbone.stages.*` / `neck.fpn.*` for `fusion_mode="early"`), so a
+# checkpoint of one mode is unloadable into the other. `arch_version`
+# converts a 200-line missing/unexpected-key dump into one actionable
+# sentence — see `scripts/evaluate_checkpoint.py` and
+# `scripts/visualize_damage_predictions.py`.
+#
+# `CHECKPOINT_ARCH_VERSION` remains the early-fusion (default-mode) version,
+# unchanged at 2, so every existing importer keeps its meaning; the
+# per-mode mapping lives in `src/training/fusion_modes.py`.
+CHECKPOINT_ARCH_VERSION = arch_version_for_mode(DEFAULT_FUSION_MODE)
 
 
 class Trainer:
@@ -407,7 +415,9 @@ class Trainer:
                 # rather than only discoverable after it.
                 if self.config.model_type == "master":
                     stem_trainable = any(
-                        p.requires_grad for p in self.model.backbone.stem.parameters()
+                        p.requires_grad
+                        for stem in self.model.backbone.stem_modules.values()
+                        for p in stem.parameters()
                     )
                     self.writer.add_scalar(
                         f"Phase{phase}/backbone_stem_requires_grad", float(stem_trainable), epoch
@@ -440,27 +450,37 @@ class Trainer:
         """Two-group AdamW parameter groups for end-to-end MasterModel
         training (fusion-redesign D-4/D-F).
 
-        Pretrained backbone-stage parameters (`backbone.stages.*`) train at
-        `backbone_lr_mult * lr`. Everything else that is new or must adapt
-        to the redesign — the stem (`backbone.stem.*`), the neck, and the
-        head — trains at the full `lr`. The stem is deliberately in the
-        "new" group, not the pretrained one: it is 4-channel and out of
-        ImageNet distribution by construction (the same D-1 argument
-        applied consistently), even though 3 of its 4 channels start from
-        pretrained weights.
+        Pretrained backbone-stage parameters (`backbone.stages.*`, aliasing
+        `backbone.shared_stages.*` under `fusion_mode="cross_attention"`)
+        train at `backbone_lr_mult * lr`. Everything else that is new or
+        must adapt — the stem(s), the cross-attention fusion module when
+        present, the neck, and the head — trains at the full `lr`. The
+        stem is deliberately in the "new" group, not the pretrained one: it
+        is 4-channel and out of ImageNet distribution by construction (the
+        same D-1 argument applied consistently), even though 3 of its 4
+        channels start from pretrained weights.
+
+        The second group is defined by subtraction (every trainable
+        parameter that is not a backbone stage) rather than by naming
+        modules: with two fusion modes, an explicit module list is one
+        `fusion_mode` away from silently dropping a whole submodule out of
+        the optimizer. Parameter order is unchanged for the early path —
+        `model.parameters()` yields stem, stages, neck, head in registration
+        order, so removing the stages leaves exactly the previous
+        stem/neck/head sequence.
 
         Only `requires_grad=True` parameters are included, so this is safe
         to call under `freeze_stages=0` (every parameter trainable, the
         end-to-end default) or any other freeze configuration.
         """
+        stage_param_ids = {id(p) for p in self.model.backbone.stages.parameters()}
         backbone_stage_params = [
             p for p in self.model.backbone.stages.parameters() if p.requires_grad
         ]
         new_params = [
             p
-            for module in (self.model.backbone.stem, self.model.neck, self.model.head)
-            for p in module.parameters()
-            if p.requires_grad
+            for p in self.model.parameters()
+            if p.requires_grad and id(p) not in stage_param_ids
         ]
         return [
             {"params": backbone_stage_params, "lr": lr * self.config.backbone_lr_mult},
@@ -488,9 +508,18 @@ class Trainer:
                     total_sq += param.grad.detach().float().norm(2).item() ** 2
             return total_sq ** 0.5
 
-        norms = {"backbone_stem": _norm(self.model.backbone.stem)}
+        norms = {
+            f"backbone_{name}": _norm(stem)
+            for name, stem in self.model.backbone.stem_modules.items()
+        }
         for i, stage in enumerate(self.model.backbone.stages):
             norms[f"backbone_stage{i}"] = _norm(stage)
+        # Present only under fusion_mode="cross_attention" — the early path
+        # has no `fusion` submodule, and a constant 0.0 would read as "this
+        # module never gets gradients" rather than "it does not exist".
+        fusion = getattr(self.model, "fusion", None)
+        if fusion is not None:
+            norms["fusion"] = _norm(fusion)
         norms["neck"] = _norm(self.model.neck)
         for i, head in enumerate(self.model.head.heads):
             norms[f"head_level{i}"] = _norm(head)
@@ -817,7 +846,7 @@ class Trainer:
         checkpoint = {
             "epoch": epoch,
             "phase": phase,
-            "arch_version": CHECKPOINT_ARCH_VERSION,
+            "arch_version": arch_version_for_mode(self.config.fusion_mode),
             "model_state_dict": self.model.state_dict(),
             "metrics": metrics,
             "best_map50": self.best_map50,

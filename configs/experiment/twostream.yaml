@@ -1,11 +1,21 @@
-# Experiment config: early-fusion redesign (fusion-redesign).
+# Experiment config: two-stream cross-attention fusion.
+#
+# The pre-redesign architecture, restored as a selectable mode: two
+# modality-specific ConvNeXt stems over shared stages, per-stage cross-modal
+# attention (RGB queries NIR), and two FPNs fused per level. Kept
+# line-for-line comparable with configs/experiment/fusion.yaml — only
+# fusion_mode, the pyramid it forces, and output_dir differ — so a result
+# difference is attributable to the architecture and nothing else.
+#
+# Checkpoints written here carry arch_version=1 and are NOT loadable by the
+# early-fusion path (and vice versa); evaluate them with this same config.
 #
 # WHAT is measured — byte-identical on every machine (fusion-redesign D-H).
 # HOW it runs (device/batch_size/num_workers/pin_memory/precision) lives in
 # a separate configs/machines/*.yaml profile, applied on top of this file:
 #
 #   python -m src.training.train \
-#       --config configs/experiment/fusion.yaml \
+#       --config configs/experiment/twostream.yaml \
 #       --machine configs/machines/gtx1660s.yaml \
 #       --model master --override seed=42
 #
@@ -18,7 +28,7 @@
 rgb_dir: "data/cache/mango/rgb"
 nir_dir: "data/cache/mango/nir"
 labels_dir: "data/annotations/yolo/labels"
-output_dir: "checkpoints/fusion_redesign"
+output_dir: "checkpoints/twostream"
 split_manifest: "data/annotations/yolo/splits.json"
 
 model_type: master
@@ -32,10 +42,10 @@ letterbox_value: 114
 # Architecture (fusion-redesign W1-W5). These match TrainingConfig's
 # defaults exactly — spelled out here so the experiment file is the
 # self-documenting single source of truth, not an implicit default.
-fusion_mode: early                   # single-stream 4ch early fusion; see configs/experiment/twostream.yaml
-in_channels: 4                       # early-fused RGB+NIR; 3 for the H-D control arm
-head_strides: [4, 8, 16, 32]         # includes the reconnected P2 level (D-3)
-assigner_level_ranges: [32, 64, 128] # must be len(head_strides) - 1, enforced at load
+fusion_mode: cross_attention         # two-stream + cross-attention; see configs/experiment/fusion.yaml
+in_channels: 4                       # unused by this mode: the stems are fixed at 3ch RGB / 1ch NIR
+head_strides: [8, 16, 32]            # fixed by DualFPN (P2 is dropped before fusion)
+assigner_level_ranges: [64, 128]     # must be len(head_strides) - 1, enforced at load
 
 # Training schedule (fusion-redesign D-4): end-to-end from epoch 0,
 # pretrained backbone stages at backbone_lr_mult * lr.

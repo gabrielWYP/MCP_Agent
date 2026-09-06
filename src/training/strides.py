@@ -41,6 +41,14 @@ DEFAULT_HEAD_STRIDES: list[int] = [4, 8, 16, 32]
 # exempt instead of an ever-growing allowlist.
 STUDENT_STRIDES: tuple[int, ...] = (8, 16, 32)
 
+# `fusion_mode="cross_attention"` (the restored two-stream path) is fixed to
+# these 3 levels by construction: `DualFPN` drops P2 before its per-level
+# fusion and owns exactly 3 `fusion_convs`. Declared here — next to
+# `STUDENT_STRIDES`, in the one file `tests/test_stride_literals.py` exempts
+# — so the cross-attention path has a named constant to import instead of
+# reintroducing the raw literal this module exists to eliminate.
+CROSS_ATTENTION_HEAD_STRIDES: tuple[int, ...] = STUDENT_STRIDES
+
 
 def validate_strides(
     strides: Sequence[int],

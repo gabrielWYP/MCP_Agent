@@ -1,12 +1,25 @@
 """
-Single-stream ConvNeXt backbone for early-fused RGB+NIR input.
+ConvNeXt backbones for the two `MasterModel` fusion modes.
 
 Supports ConvNeXt-Tiny and ConvNeXt-Small variants (both have identical
 stage channels [96, 192, 384, 768], differing only in block depth).
 
-fusion-redesign (design.md D-A/D-B): the previous dual-stream design
-(`DualConvNeXtBackbone`, two stems, two forward passes through the shared
-stages) is replaced by `EarlyFusionBackbone`: RGB and NIR are stacked into
+Two backbones live here, selected by `TrainingConfig.fusion_mode`
+(`src/training/fusion_modes.py`):
+
+- `EarlyFusionBackbone` — `fusion_mode="early"` (default). One stem over the
+  stacked 4-channel RGB+NIR tensor, one forward pass through the stages.
+- `DualConvNeXtBackbone` — `fusion_mode="cross_attention"`. Two
+  modality-specific stems (3ch RGB, 1ch NIR) over *shared* ConvNeXt stages,
+  two forward passes; returns one feature list per modality for
+  `CrossModalFusion`.
+
+They share no state_dict key (`backbone.stem.*`/`backbone.stages.*` vs
+`backbone.rgb_stem.*`/`backbone.nir_stem.*`/`backbone.shared_stages.*`),
+which is part of why the checkpoint `arch_version` tag exists.
+
+fusion-redesign (design.md D-A/D-B) originally deleted the dual-stream
+design in favour of `EarlyFusionBackbone`: RGB and NIR are stacked into
 one 4-channel tensor before the stem, so there is exactly one stem and one
 forward pass through the stages. The ImageNet-pretrained 3-channel stem is
 loaded into the 4-channel stem via mean-preserving inflation (D-1/D-B):
@@ -90,7 +103,8 @@ def _build_stem(in_channels: int) -> nn.Sequential:
     """
     ConvNeXt stem: Conv2d (4x4, stride 4) + LayerNorm.
     in_channels=4 for the early-fused RGB+NIR input (default); 3 is also
-    supported as the H-D RGB-only control arm.
+    supported as the H-D RGB-only control arm, and 3/1 are the RGB/NIR stems
+    of the cross-attention path's `DualConvNeXtBackbone`.
     """
     return nn.Sequential(
         nn.Conv2d(in_channels, 96, kernel_size=4, stride=4),
@@ -163,6 +177,22 @@ class EarlyFusionBackbone(nn.Module):
             self._load_pretrained_stem()
         else:
             self._init_stem()
+
+    # ------------------------------------------------------------------
+    # Introspection (shared backbone contract)
+    # ------------------------------------------------------------------
+
+    @property
+    def stem_modules(self) -> dict[str, nn.Module]:
+        """The backbone's input stems, keyed by their attribute name.
+
+        Both backbones expose this so `Trainer` never has to branch on
+        `fusion_mode` to build its discriminative parameter groups or its
+        per-module gradient-norm instrumentation. A single-stream backbone
+        has exactly one entry; `DualConvNeXtBackbone` has two. A property,
+        not a submodule — it registers nothing and adds no state_dict key.
+        """
+        return {"stem": self.stem}
 
     # ------------------------------------------------------------------
     # Forward
@@ -264,3 +294,185 @@ class EarlyFusionBackbone(nn.Module):
             "1.norm.bias": pretrained_model.features[0][1].bias,
         }
         self.stem.load_state_dict(pretrained_stem_state, strict=False)
+
+
+class DualConvNeXtBackbone(nn.Module):
+    """
+    Dual-stream ConvNeXt backbone (Tiny or Small) — `fusion_mode="cross_attention"`.
+
+    The two streams share the 4 ConvNeXt stages (shared weights act as
+    regularization for the small dataset). Only the input stems differ
+    to handle 3-channel RGB and 1-channel NIR independently.
+
+    Restored from the pre-redesign architecture (deleted by fusion-redesign
+    W1/D-A) with its module names and weight-init behaviour unchanged, so
+    the two-stream checkpoints trained against it still load key-for-key.
+
+    Args:
+        pretrained (bool): Load ImageNet-1K weights for the shared stages.
+            Both stems are then seeded from the pretrained 3-channel stem
+            (RGB verbatim, NIR channel-averaged).
+        variant (str): Backbone variant — "tiny" (28M params) or "small" (50M params).
+            Both produce identical stage channels [96, 192, 384, 768].
+
+    Returns (forward):
+        rgb_features: list of 4 tensors [S1, S2, S3, S4]
+        nir_features: list of 4 tensors [S1, S2, S3, S4]
+
+        Channel dims: [96, 192, 384, 768]
+        Spatial dims (for 640x640 input): [160x160, 80x80, 40x40, 20x20]
+    """
+
+    # Both Tiny and Small have identical stage channel dimensions
+    STAGE_CHANNELS = [96, 192, 384, 768]
+
+    def __init__(self, pretrained: bool = True, variant: str = "tiny"):
+        super().__init__()
+
+        if variant not in SUPPORTED_VARIANTS:
+            raise ValueError(
+                f"Unsupported variant '{variant}'. Choose from {SUPPORTED_VARIANTS}"
+            )
+
+        self.variant = variant
+
+        # --- Stems (different per modality) ---
+        self.rgb_stem = _build_stem(in_channels=3)
+        self.nir_stem = _build_stem(in_channels=1)  # NIR is grayscale
+
+        # --- Shared stages ---
+        if variant == "tiny":
+            self.shared_stages = _build_convnext_tiny_body(pretrained=pretrained)
+        else:
+            self.shared_stages = _build_convnext_small_body(pretrained=pretrained)
+
+        if pretrained:
+            self._load_pretrained_rgb_stem()
+            self._load_pretrained_nir_stem()
+        else:
+            self._init_nir_stem()
+
+    # ------------------------------------------------------------------
+    # Introspection (shared backbone contract)
+    # ------------------------------------------------------------------
+
+    @property
+    def stages(self) -> nn.ModuleList:
+        """Alias for `shared_stages` — the pretrained ConvNeXt stage stack.
+
+        `Trainer._discriminative_param_groups` and the D-F gradient-norm
+        instrumentation address "the pretrained stages" by this one name on
+        both backbones. A plain property, so the registered submodule (and
+        therefore every `backbone.shared_stages.*` state_dict key) is
+        untouched.
+        """
+        return self.shared_stages
+
+    @property
+    def stem_modules(self) -> dict[str, nn.Module]:
+        """The two modality-specific stems, keyed by attribute name."""
+        return {"rgb_stem": self.rgb_stem, "nir_stem": self.nir_stem}
+
+    # ------------------------------------------------------------------
+    # Forward
+    # ------------------------------------------------------------------
+
+    def forward(
+        self, rgb: torch.Tensor, nir: torch.Tensor
+    ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+        """
+        Args:
+            rgb: (N, 3, H, W)
+            nir: (N, 1, H, W)  — grayscale NIR image
+
+        Returns:
+            rgb_features: [S1, S2, S3, S4]
+            nir_features: [S1, S2, S3, S4]
+
+        Precision scoping (fusion-redesign D-I): ConvNeXt stage 4 was
+        reported numerically fragile under CUDA autocast in this dual-stream
+        setup, so this forward used to force `autocast(enabled=False)`
+        unconditionally. That guard is scoped to fp16 only: it is a no-op
+        under fp32 (nothing to disable) and, critically, a no-op under bf16
+        as well — bf16 carries fp32's exponent range, so the fp16 overflow
+        mechanism the original comment describes does not apply, and H-BF16
+        (see design.md) specifically needs bf16 to reach these stages rather
+        than being silently forced back to fp32.
+        """
+        device_type = rgb.device.type
+        fp16_ambient = (
+            torch.is_autocast_enabled(device_type)
+            and torch.get_autocast_dtype(device_type) == torch.float16
+        )
+        ctx = (
+            torch.amp.autocast(device_type=device_type, enabled=False)
+            if fp16_ambient
+            else nullcontext()
+        )
+        with ctx:
+            # Pass through modality-specific stems
+            rgb_in = rgb.float() if fp16_ambient else rgb
+            nir_in = nir.float() if fp16_ambient else nir
+            rgb_x = self.rgb_stem(rgb_in)   # (N, 96, H/4, W/4)
+            nir_x = self.nir_stem(nir_in)   # (N, 96, H/4, W/4)
+
+            rgb_features, nir_features = [], []
+
+            # Pass through shared stages: same weights, different activations
+            for stage in self.shared_stages:
+                rgb_x = stage(rgb_x)
+                nir_x = stage(nir_x)
+                rgb_features.append(rgb_x)
+                nir_features.append(nir_x)
+
+        return rgb_features, nir_features
+
+    # ------------------------------------------------------------------
+    # Weight initialization helpers
+    # ------------------------------------------------------------------
+
+    def _init_nir_stem(self):
+        """Initialize NIR stem with Kaiming normal (standard for conv layers)."""
+        nn.init.kaiming_normal_(
+            self.nir_stem[0].weight, mode="fan_out", nonlinearity="relu"
+        )
+        if self.nir_stem[0].bias is not None:
+            nn.init.zeros_(self.nir_stem[0].bias)
+
+    def _load_pretrained_rgb_stem(self):
+        """
+        Copy the pretrained ConvNeXt stem weights into rgb_stem.
+        The pretrained stem expects 3-channel input, which matches RGB.
+        Works for both Tiny and Small variants (identical stem architecture).
+        """
+        if self.variant == "tiny":
+            pretrained_model = convnext_tiny(weights=ConvNeXt_Tiny_Weights.IMAGENET1K_V1)
+        else:
+            pretrained_model = convnext_small(weights=ConvNeXt_Small_Weights.IMAGENET1K_V1)
+        pretrained_stem_state = {
+            "0.weight": pretrained_model.features[0][0].weight,
+            "0.bias":   pretrained_model.features[0][0].bias,
+            "1.norm.weight": pretrained_model.features[0][1].weight,
+            "1.norm.bias":   pretrained_model.features[0][1].bias,
+        }
+        self.rgb_stem.load_state_dict(pretrained_stem_state, strict=False)
+
+    def _load_pretrained_nir_stem(self):
+        """Initialize the 1-channel NIR stem from RGB ImageNet stem weights.
+
+        Averaging pretrained RGB kernels gives the NIR stream low-level edge and
+        texture priors while keeping the stem trainable for 850 nm reflectance.
+        """
+        if self.variant == "tiny":
+            pretrained_model = convnext_tiny(weights=ConvNeXt_Tiny_Weights.IMAGENET1K_V1)
+        else:
+            pretrained_model = convnext_small(weights=ConvNeXt_Small_Weights.IMAGENET1K_V1)
+
+        rgb_weight = pretrained_model.features[0][0].weight
+        pretrained_stem_state = {
+            "0.weight": rgb_weight.mean(dim=1, keepdim=True),
+            "0.bias": pretrained_model.features[0][0].bias,
+            "1.norm.weight": pretrained_model.features[0][1].weight,
+            "1.norm.bias": pretrained_model.features[0][1].bias,
+        }
+        self.nir_stem.load_state_dict(pretrained_stem_state, strict=False)
