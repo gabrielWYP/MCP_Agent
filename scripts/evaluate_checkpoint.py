@@ -42,8 +42,17 @@ from src.models.master.master_model import MasterModel
 from src.models.student.student_model import StudentModel
 from src.training.config import TrainingConfig
 from src.training.dataset import YOLODataset, build_dataloader, collate_fn
-from src.training.loop import CHECKPOINT_ARCH_VERSION, Trainer
-from src.training.strides import resolve_active_strides, resolve_from_checkpoint
+from src.training.fusion_modes import (
+    FUSION_MODE_CROSS_ATTENTION,
+    accepted_arch_versions,
+    fusion_mode_for_arch_version,
+)
+from src.training.loop import Trainer
+from src.training.strides import (
+    CROSS_ATTENTION_HEAD_STRIDES,
+    resolve_active_strides,
+    resolve_from_checkpoint,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -108,27 +117,67 @@ def _apply_overrides(config: TrainingConfig, overrides: list[str]) -> None:
         setattr(config, key, value)
 
 
+def _check_arch_version(checkpoint_path: str, arch_version, fusion_mode: str) -> None:
+    """Raise unless `arch_version` belongs to `fusion_mode`'s architecture.
+
+    `arch_version` 2 is early fusion, 1 (and the untagged `None` written
+    before the tag existed) is the two-stream cross-attention path. Loading
+    either as the other is always wrong, and always caught here rather than
+    by `load_state_dict`.
+    """
+    accepted = accepted_arch_versions(fusion_mode)
+    if arch_version in accepted:
+        return
+    checkpoint_mode = fusion_mode_for_arch_version(arch_version)
+    origin = (
+        f"which is a fusion_mode='{checkpoint_mode}' checkpoint"
+        if checkpoint_mode is not None
+        else "which belongs to no known architecture"
+    )
+    raise ValueError(
+        f"Checkpoint at {checkpoint_path} has arch_version={arch_version!r}, "
+        f"{origin}, but the config selects fusion_mode='{fusion_mode}' "
+        f"(accepts arch_version in {sorted(accepted, key=str)}). "
+        "Architecture v1 checkpoints (dual-stream cross-attention fusion) "
+        "are not loadable by MasterModel v2 (early fusion) or vice versa — "
+        "run with the matching config (e.g. configs/experiment/twostream.yaml "
+        "for a v1 checkpoint). See openspec/changes/fusion-redesign."
+    )
+
+
+def _resolve_head_strides(checkpoint: dict, fusion_mode: str) -> list[int]:
+    """Return the strides to rebuild the checkpoint's MasterModel with.
+
+    `fusion_mode="cross_attention"` is fixed at
+    `CROSS_ATTENTION_HEAD_STRIDES` by `DualFPN`'s construction, so there is
+    nothing to read and nothing to guess — which is what makes pre-tag
+    checkpoints (no recorded `config.head_strides`) loadable at all.
+    `fusion_mode="early"` still resolves strides from the checkpoint, and
+    still fails loudly if it recorded none.
+    """
+    if fusion_mode == FUSION_MODE_CROSS_ATTENTION:
+        return list(CROSS_ATTENTION_HEAD_STRIDES)
+    return resolve_from_checkpoint(checkpoint)
+
+
 def _load_model(model_type: str, checkpoint_path: str, config: TrainingConfig, device: torch.device):
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     is_checkpoint_dict = isinstance(checkpoint, dict) and "model_state_dict" in checkpoint
 
     head_strides = None
     if is_checkpoint_dict:
-        # fusion-redesign D-C: every state_dict key changes under the
-        # redesign, so a v1 (dual-stream fusion) checkpoint is unloadable
-        # into the v2 MasterModel. Check `arch_version` before
-        # `load_state_dict` so the failure is one actionable sentence
-        # instead of a 200-line missing/unexpected-key dump.
         arch_version = checkpoint.get("arch_version")
-        if model_type == "master" and arch_version != CHECKPOINT_ARCH_VERSION:
-            raise ValueError(
-                f"Checkpoint at {checkpoint_path} has arch_version={arch_version!r}, "
-                f"expected {CHECKPOINT_ARCH_VERSION}. Architecture v1 checkpoints "
-                "(dual-stream fusion) are not loadable by MasterModel v2 — see "
-                "openspec/changes/fusion-redesign."
-            )
         if model_type == "master":
-            head_strides = resolve_from_checkpoint(checkpoint)
+            # fusion-redesign D-C: the two fusion modes share no
+            # state_dict key upstream of the head, so a checkpoint of one
+            # is unloadable into the other.
+            # Check `arch_version` against the mode the caller's config
+            # selected, BEFORE `load_state_dict`, so the failure is one
+            # actionable sentence instead of a 200-line
+            # missing/unexpected-key dump — and so a two-stream checkpoint
+            # can never be silently evaluated as an early-fusion one.
+            _check_arch_version(checkpoint_path, arch_version, config.fusion_mode)
+            head_strides = _resolve_head_strides(checkpoint, config.fusion_mode)
         state_dict = checkpoint["model_state_dict"]
         logger.info(
             "Loaded checkpoint (epoch=%s, best_map50=%s)",
@@ -144,6 +193,8 @@ def _load_model(model_type: str, checkpoint_path: str, config: TrainingConfig, d
             pretrained_backbone=False,
             backbone_variant=config.backbone_variant,
             head_strides=head_strides,
+            in_channels=config.in_channels,
+            fusion_mode=config.fusion_mode,
         )
     else:
         model = StudentModel(num_classes=config.num_classes)

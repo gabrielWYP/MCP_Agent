@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.training.config import TrainingConfig
 from src.training.loop import CHECKPOINT_ARCH_VERSION
+from src.training.strides import CROSS_ATTENTION_HEAD_STRIDES
 
 
 def _write_synthetic_v1_checkpoint(path: Path) -> None:
@@ -87,3 +88,45 @@ class TestVisualizeDamagePredictionsArchVersionGuard:
 class TestV2CheckpointCarriesArchVersion:
     def test_current_checkpoint_schema_version_is_two(self):
         assert CHECKPOINT_ARCH_VERSION == 2
+
+
+class TestCrossAttentionModeAcceptsV1Checkpoints:
+    """`fusion_mode="cross_attention"` is the mode a v1 checkpoint belongs
+    to, so the same synthetic checkpoint that must be rejected above must be
+    accepted here — otherwise the restored two-stream path could never load
+    `checkpoints/mastermodel_mango` (arch_version absent)."""
+
+    @pytest.fixture
+    def cross_attention_config(self, tmp_path) -> TrainingConfig:
+        return TrainingConfig(
+            model_type="master",
+            output_dir=str(tmp_path),
+            num_classes=2,
+            backbone_variant="tiny",
+            fusion_mode="cross_attention",
+            head_strides=list(CROSS_ATTENTION_HEAD_STRIDES),
+            assigner_level_ranges=[64.0, 128.0],
+        )
+
+    def test_untagged_checkpoint_passes_the_guard(self, v1_checkpoint_path, cross_attention_config):
+        from scripts.evaluate_checkpoint import _check_arch_version
+
+        # Reaches load_state_dict rather than raising on arch_version. (The
+        # synthetic state_dict holds only 3 keys, so the load itself fails —
+        # what matters is that it is no longer the arch_version guard.)
+        _check_arch_version(str(v1_checkpoint_path), None, cross_attention_config.fusion_mode)
+
+    def test_v2_checkpoint_is_rejected_by_the_cross_attention_path(self, cross_attention_config):
+        from scripts.evaluate_checkpoint import _check_arch_version
+
+        with pytest.raises(ValueError, match="arch_version"):
+            _check_arch_version("dummy.pt", CHECKPOINT_ARCH_VERSION, cross_attention_config.fusion_mode)
+
+    def test_head_strides_resolve_without_a_recorded_config(self, cross_attention_config):
+        """Pre-tag checkpoints record no `config.head_strides`; the
+        cross-attention pyramid is fixed by DualFPN, so there is nothing to
+        read and nothing to guess."""
+        from scripts.evaluate_checkpoint import _resolve_head_strides
+
+        resolved = _resolve_head_strides({"config": {}}, cross_attention_config.fusion_mode)
+        assert resolved == list(CROSS_ATTENTION_HEAD_STRIDES)

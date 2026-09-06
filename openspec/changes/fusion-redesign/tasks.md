@@ -165,13 +165,18 @@ Chain strategy: stacked-to-main
 
 ## Phase 13 — Publish negative results (mandatory regardless of outcome)
 
-- [ ] 13.1 Publish V0 measured peaks for all three configs and the fallback step taken, even if the projection held and no fallback was needed.
-- [ ] 13.2 Publish H-A result (confirmed init or the zero-init fallback) with per-stage mean/std.
-- [ ] 13.3 Publish H-B count and H-C static-assertion outcome.
-- [ ] 13.4 Publish H-D result against its pre-registered bar verbatim, **including a REFUTE**: state plainly that crop-level complementarity did not transfer to detection at this data scale if that is the outcome, and do not retract the architecture change on that basis (D1–D4 still hold).
-- [ ] 13.5 Publish H-E result verbatim; if REFUTE, record that P2 is retired to `head_strides:[8,16,32]` as the recommended default going forward, reclaiming its params/activations.
-- [ ] 13.6 Publish H-F pass/fail; a failed run is not reported as a valid hypothesis result anywhere else in the document.
-- [ ] 13.7 Record H-BF16 deferral explicitly (no run performed, bars fixed in advance) if Ampere access did not materialize.
-- [ ] 13.8 State the Q1 limitation verbatim: this change can prove the redesign is **better**, not that it is **sufficient** — do not let a relative win be written up as fitness for use.
-- [ ] 13.9 Record the comparability rule: two runs are comparable only if `experiment_sha256` **and** `effective_batch` match; note the resolved `effective_batch: 8` (Q7).
-- [ ] 13.10 Write `reports/fusion-redesign/validation-report.md` collecting 13.1–13.9; cross-link `reports/damage-map-audit/` as the prior baseline, never as a superseded comparison target.
+Discharged 2026-09-06 in `reports/fusion-redesign/validation-report.md`. The publication
+obligation is met for every item; Phase 12 remains open, so several items publish a
+"NOT RUN" status rather than a result. That distinction is stated in the report and must
+not be collapsed when reading these checkboxes.
+
+- [x] 13.1 Publish V0 measured peaks for all three configs and the fallback step taken, even if the projection held and no fallback was needed. — published as **NOT RUN**: no V0 measurement was taken, which is not the same as a projection holding.
+- [x] 13.2 Publish H-A result (confirmed init or the zero-init fallback) with per-stage mean/std. — published as **NOT RUN**. Adjacent init defect recorded instead: `reg_pred.bias` is zero-initialised, so every level predicts a 1×1 px box at init against level medians of 33/64/169 px.
+- [x] 13.3 Publish H-B count and H-C static-assertion outcome. — published as **NOT RUN**.
+- [x] 13.4 Publish H-D result against its pre-registered bar verbatim, **including a REFUTE**: state plainly that crop-level complementarity did not transfer to detection at this data scale if that is the outcome, and do not retract the architecture change on that basis (D1–D4 still hold). — published as **NOT RUN**. Note: the architecture change was subsequently retracted, but on direct measurement of both architectures against clean labels, not on H-D.
+- [x] 13.5 Publish H-E result verbatim; if REFUTE, record that P2 is retired to `head_strides:[8,16,32]` as the recommended default going forward, reclaiming its params/activations. — published verbatim. Verdict is **NOT COMPUTABLE** (no `σ_d`, one seed). **The conditional instruction is NOT executed**: removing P2 took damage recall 0.5185 → 0.0000 with zero true positives across 100 epochs. `head_strides: [4,8,16,32]` remains the default; the reasoning is in the report.
+- [x] 13.6 Publish H-F pass/fail; a failed run is not reported as a valid hypothesis result anywhere else in the document. — **PASS**, partially discharged: all per-module grad norms non-zero, `oom_skipped = 0`, `nan_skipped = 0`. Both defects the redesign targeted are confirmed closed.
+- [x] 13.7 Record H-BF16 deferral explicitly (no run performed, bars fixed in advance) if Ampere access did not materialize. — recorded; no Ampere hardware, all runs fp32 on Turing.
+- [x] 13.8 State the Q1 limitation verbatim: this change can prove the redesign is **better**, not that it is **sufficient** — do not let a relative win be written up as fitness for use. — stated verbatim; binds in the opposite direction here, since the redesign is not better on the damage class.
+- [x] 13.9 Record the comparability rule: two runs are comparable only if `experiment_sha256` **and** `effective_batch` match; note the resolved `effective_batch: 8` (Q7). — recorded, **with a defect in its implementation**: `--override` values do not enter the hash, so V1 and H-E declare the same `experiment_sha256` while measuring different pyramids.
+- [x] 13.10 Write `reports/fusion-redesign/validation-report.md` collecting 13.1–13.9; cross-link `reports/damage-map-audit/` as the prior baseline, never as a superseded comparison target. — written; cross-linked as the prior baseline.

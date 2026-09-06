@@ -13,9 +13,18 @@ from typing import Any
 
 import yaml
 
+from .fusion_modes import (
+    DEFAULT_FUSION_MODE,
+    FUSION_MODE_CROSS_ATTENTION,
+    validate_fusion_mode,
+)
 from .machine import derive_grad_accum_steps
 from .precision import validate_bf16_support, validate_precision
-from .strides import DEFAULT_HEAD_STRIDES, validate_strides
+from .strides import (
+    CROSS_ATTENTION_HEAD_STRIDES,
+    DEFAULT_HEAD_STRIDES,
+    validate_strides,
+)
 
 
 @dataclass
@@ -68,6 +77,15 @@ class TrainingConfig:
         in_channels: MasterModel backbone stem input channels. 4 (default)
             for the early-fused RGB+NIR input; 3 for the RGB-only H-D
             control arm (fusion-redesign). Ignored for model_type="student".
+        fusion_mode: MasterModel multimodal fusion architecture — "early"
+            (default) or "cross_attention". "early" stacks RGB+NIR into one
+            4-channel tensor before a single ConvNeXt stem (fusion-redesign).
+            "cross_attention" is the restored two-stream path: two
+            modality-specific stems over shared stages, per-stage
+            cross-attention, and two FPNs fused per level. The two share no
+            state_dict key and are tagged with different checkpoint
+            `arch_version`s (2 and 1) — see `src/training/fusion_modes.py`.
+            Ignored for model_type="student".
         head_strides: MasterModel FPN/head pyramid strides, finest-first.
             Default `[4, 8, 16, 32]` includes the reconnected P2 level
             (fusion-redesign D-3). The single source of truth for
@@ -193,6 +211,10 @@ class TrainingConfig:
     # model_type="student".
     in_channels: int = 4
     head_strides: list[int] = field(default_factory=lambda: list(DEFAULT_HEAD_STRIDES))
+    # Fusion architecture (restored two-stream path) — "early" | "cross_attention".
+    # "early" is the default so every existing config, checkpoint and test
+    # keeps the behaviour it has today.
+    fusion_mode: str = DEFAULT_FUSION_MODE
 
     # Training schedule (D-4, fusion-redesign) — MasterModel only.
     schedule: str = "end_to_end"
@@ -225,8 +247,27 @@ class TrainingConfig:
         # for model_type="student": the student backbone is unaffected by
         # this redesign and always uses its own fixed 3-level [8, 16, 32]
         # strides, so head_strides/assigner_level_ranges do not apply to it.
+        # Loud on an unknown mode, for every model_type: a typo must not fall
+        # back to the default and silently train the wrong architecture.
+        # Unlike head_strides this needs no student exemption — the default
+        # is valid for both model types.
+        validate_fusion_mode(self.fusion_mode)
         if self.model_type == "master":
             validate_strides(self.head_strides, self.assigner_level_ranges)
+            # `DualFPN` drops P2 and owns exactly 3 fusion convs, so the
+            # cross-attention path cannot honour any other pyramid. Caught
+            # here rather than inside MasterModel so a config that can never
+            # build a model fails at load time, before a run starts.
+            if (
+                self.fusion_mode == FUSION_MODE_CROSS_ATTENTION
+                and list(self.head_strides) != list(CROSS_ATTENTION_HEAD_STRIDES)
+            ):
+                raise ValueError(
+                    f"fusion_mode='{FUSION_MODE_CROSS_ATTENTION}' requires "
+                    f"head_strides={list(CROSS_ATTENTION_HEAD_STRIDES)} "
+                    f"(DualFPN emits exactly those 3 levels), got "
+                    f"{list(self.head_strides)}."
+                )
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)

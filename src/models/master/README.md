@@ -2,7 +2,35 @@
 
 Arquitectura del modelo maestro para la tesis de **destilamiento de conocimiento cruzado multimodal** aplicado a la detección de daño mecánico temprano en mango (*Mangifera indica*).
 
-> **fusion-redesign**: la arquitectura de dos streams con cross-attention (`DualConvNeXtBackbone` + `CrossModalFusion` + `DualFPN`) fue **reemplazada** por early fusion simple — RGB y NIR se apilan en un tensor de 4 canales antes de un único backbone. Ver `openspec/changes/fusion-redesign/` para la justificación completa (probe RGB+NIR: AUC 0.9171 con solo 3 bloques conv, vs AP50 0.0643 del diseño de dos streams con 9.4M parámetros dedicados a fusión).
+> **Dos modos de fusión, seleccionables por config.** `fusion_mode` admite:
+>
+> | modo | arquitectura | parámetros | `head_strides` |
+> |---|---|---|---|
+> | `early` (por defecto) | `EarlyFusionBackbone` + `SingleFPN` — RGB y NIR concatenados en 4 canales antes de un único backbone | 35.3M | `[4,8,16,32]` |
+> | `cross_attention` | `DualConvNeXtBackbone` + `CrossModalFusion` + `DualFPN` | 46.6M | `[8,16,32]` fijo |
+>
+> **Historia.** `fusion-redesign` (`c9a247f`) reemplazó el diseño de dos streams por early
+> fusion, borrando `fusion.py`. La medición del 2026-09-06 contra etiquetas limpias mostró
+> que esa sustitución **destruyó la detección de daño**: en val y test, todas las
+> configuraciones de early fusion dan AP50 de daño `0.0000` y recall `0.0000`, mientras
+> ambos checkpoints de cross-attention detectan en los dos splits. El `mAP@0.5` agregado
+> **subió** (0.4567 → 0.5019 en val) mientras la clase que este proyecto existe para
+> detectar caía a cero.
+>
+> Por eso el camino de dos streams está restaurado en vez de revertido: los cuatro
+> checkpoints de early fusion siguen cargando y ambas arquitecturas quedan medibles.
+> Números completos en `reports/session-2026-09-06/experiments.md` y
+> `reports/fusion-redesign/validation-report.md`.
+>
+> **Advertencia sobre la evidencia**: una sola semilla, y el mismo checkpoint puntúa
+> AP50 de daño 0.1282 en val y 0.0417 en test. El suelo de ruido de splits de 18 y 20
+> imágenes cubre casi todas las diferencias reportadas. Sirve para elegir arquitectura;
+> no es una cifra publicable sin las tres semillas pre-registradas.
+>
+> **Propiedad conocida de `cross_attention`**: 22 parámetros quedan con `grad is None`
+> (`fusion.fusion_stages.0.*` y los `lateral_convs.0`/`output_convs.0` de ambas FPN),
+> porque `DualFPN` descarta el nivel P2. Es la propiedad original documentada en
+> `proposal.md` D3, conservada verbatim para no romper la compatibilidad de checkpoints.
 
 ---
 

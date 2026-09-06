@@ -241,6 +241,7 @@ def main():
             backbone_variant=config.backbone_variant,
             head_strides=config.head_strides,
             in_channels=config.in_channels,
+            fusion_mode=config.fusion_mode,
         )
         params = model.count_parameters()
         print(f"Model parameters: {params['total']:,} total, {params['backbone']:,} backbone")

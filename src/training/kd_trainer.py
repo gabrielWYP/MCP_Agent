@@ -101,11 +101,15 @@ class KDTrainer(Trainer):
                 f"Teacher checkpoint not found: {ckpt_path}"
             )
 
+        # `fusion_mode` decides the teacher's whole state_dict schema: a
+        # cross-attention checkpoint shares no key with an early-fusion
+        # model, so the teacher must be built in the mode it was trained in.
         teacher = MasterModel(
             num_classes=config.num_classes,
             pretrained_backbone=False,
             backbone_variant=config.backbone_variant,
             head_strides=config.head_strides,
+            fusion_mode=config.fusion_mode,
         )
 
         checkpoint = torch.load(str(ckpt_path), map_location="cpu", weights_only=False)

@@ -5,11 +5,12 @@ One forward + backward + optimizer step per configuration,
 `torch.cuda.reset_peak_memory_stats()` then `torch.cuda.max_memory_allocated()`
 — a real measurement, not the design document's hand-computed projection.
 
-The pre-redesign `master_v1` variant (dual-stream fusion) no longer exists
-in this codebase (`DualConvNeXtBackbone`/`DualFPN`/`fusion.py` were deleted
-in this change) and was already measured in `proposal.md` Round 2 (2.32 GB
-@ batch 1, 4.42 GB @ batch 2, OOM @ batch 8, fp32). This script measures the
-two variants that DO exist post-redesign:
+The pre-redesign `master_v1` variant (dual-stream fusion) was already
+measured in `proposal.md` Round 2 (2.32 GB @ batch 1, 4.42 GB @ batch 2, OOM
+@ batch 8, fp32), so it is not re-measured here. It is reachable again as
+`fusion_mode="cross_attention"` (`DualConvNeXtBackbone`/`CrossModalFusion`/
+`DualFPN`, restored as a selectable mode); this script measures the two
+early-fusion variants:
 
     new_3lvl  — head_strides=[8, 16, 32]  (P2 ablated, matches the old level count)
     new_4lvl  — head_strides=[4, 8, 16, 32]  (the target config, P2 reconnected)

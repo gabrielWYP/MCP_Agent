@@ -50,13 +50,13 @@ import torch
 # Ensure project root is importable
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from scripts.evaluate_checkpoint import _check_arch_version, _resolve_head_strides
 from src.models.master.master_model import MasterModel
 from src.models.student.student_model import StudentModel
 from src.training.config import TrainingConfig
 from src.training.dataset import letterbox
 from src.training.decode import decode_detections
-from src.training.loop import CHECKPOINT_ARCH_VERSION
-from src.training.strides import resolve_from_checkpoint, STUDENT_STRIDES
+from src.training.strides import STUDENT_STRIDES
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -177,30 +177,25 @@ def load_model(
         model: the loaded, eval-mode model.
         strides: the stride list to decode with — `STUDENT_STRIDES` for
             `model_type="student"` (unaffected by fusion-redesign, D-2), or
-            resolved from the checkpoint for `model_type="master"`
-            (fusion-redesign D-D) rather than a hardcoded `[8, 16, 32]` that
-            would silently misalign a 4-level checkpoint's predictions.
+            resolved from the checkpoint (or fixed by the fusion mode) for
+            `model_type="master"` (fusion-redesign D-D) rather than a
+            hardcoded `[8, 16, 32]` that would silently misalign a 4-level
+            checkpoint's predictions.
     """
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     is_checkpoint_dict = isinstance(checkpoint, dict) and "model_state_dict" in checkpoint
 
     head_strides = None
     if is_checkpoint_dict:
-        # fusion-redesign D-C: a v1 (dual-stream fusion) checkpoint is
-        # unloadable into the v2 MasterModel — every state_dict key
-        # changes. Check `arch_version` before `load_state_dict` so the
-        # failure is one actionable sentence, not a 200-line key-mismatch
-        # dump.
         arch_version = checkpoint.get("arch_version")
-        if model_type == "master" and arch_version != CHECKPOINT_ARCH_VERSION:
-            raise ValueError(
-                f"Checkpoint at {checkpoint_path} has arch_version={arch_version!r}, "
-                f"expected {CHECKPOINT_ARCH_VERSION}. Architecture v1 checkpoints "
-                "(dual-stream fusion) are not loadable by MasterModel v2 — see "
-                "openspec/changes/fusion-redesign."
-            )
         if model_type == "master":
-            head_strides = resolve_from_checkpoint(checkpoint)
+            # fusion-redesign D-C: the two fusion modes share no
+            # state_dict key upstream of the head, so a checkpoint of one
+            # is unloadable into the other.
+            # Same guard `scripts/evaluate_checkpoint.py` uses, imported
+            # rather than duplicated so the two scripts cannot drift.
+            _check_arch_version(checkpoint_path, arch_version, config.fusion_mode)
+            head_strides = _resolve_head_strides(checkpoint, config.fusion_mode)
         state_dict = checkpoint["model_state_dict"]
         logger.info(
             "Loaded checkpoint dict (epoch=%s, best_map50=%s)",
@@ -217,6 +212,8 @@ def load_model(
             pretrained_backbone=False,
             backbone_variant=config.backbone_variant,
             head_strides=head_strides,
+            in_channels=config.in_channels,
+            fusion_mode=config.fusion_mode,
         )
         strides = list(model.head_strides)
     else:
