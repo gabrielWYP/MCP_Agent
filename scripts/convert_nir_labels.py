@@ -203,6 +203,7 @@ def main():
     nir_dir = Path(args.nir_dir)
     updated = 0
     skipped = 0
+    negatives = 0
 
     for task in data:
         img_file = extract_label_studio_image_name(task)
@@ -261,11 +262,14 @@ def main():
                 if rgb_bbox is not None:
                     damage_bboxes_rgb.append(rgb_bbox)
 
-        if not damage_bboxes_rgb:
-            skipped += 1
-            continue
-
-        # Read the existing YOLO label to get the mango bbox (class 0)
+        # Read the existing YOLO label to get the mango bbox (class 0).
+        #
+        # This lookup must run BEFORE the empty-damage check. `--output-dir` and
+        # `--splits` point at the same directory in the pipeline, and the file
+        # already holds class-1 boxes produced automatically by NIRSegmenter in
+        # src/annotation/annotation_generator.py. Returning early on an image the
+        # annotator declared damage-free left those automatic boxes in place, so
+        # the image silently stopped being a negative example.
         source_label_path = splits_dir / split / f"{rgb_stem}.txt"
         label_path = output_dir / split / f"{rgb_stem}.txt"
         mango_line = None
@@ -281,6 +285,17 @@ def main():
         if mango_bbox is None:
             logger.warning("No valid mango bbox for %s, skipping damage labels", rgb_stem)
             skipped += 1
+            continue
+
+        if not damage_bboxes_rgb:
+            # The annotator found no damage here. Rewrite the file with the mango
+            # box alone so the image becomes a genuine negative: background
+            # supervision the detector needs to learn what undamaged skin is.
+            label_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(label_path, "w") as f:
+                f.write(mango_line + "\n")
+            negatives += 1
+            logger.info(f"  {rgb_stem}: 0 damage bboxes (negative) → {split}")
             continue
 
         valid_damage_bboxes = [
@@ -303,8 +318,9 @@ def main():
         logger.info(f"  {rgb_stem}: {len(valid_damage_bboxes)} damage bboxes → {split}")
 
     print(f"\n{'='*50}")
-    print(f"Updated: {updated} labels")
-    print(f"Skipped: {skipped} tasks")
+    print(f"Updated:   {updated} labels with damage")
+    print(f"Negatives: {negatives} labels rewritten mango-only (no human damage)")
+    print(f"Skipped:   {skipped} tasks")
     print(f"{'='*50}")
 
     return 0

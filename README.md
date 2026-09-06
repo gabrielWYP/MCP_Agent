@@ -2,7 +2,7 @@
 
 **Tesis de pregrado — Ingeniería de Sistemas**
 
-Pipeline end-to-end de detección de daño en mango usando imágenes RGB+NIR (cámara MAPIR Survey3W), modelos de visión multimodal con backbone ConvNeXtV2, y conocimiento destilado (KD) hacia un modelo estudiante YOLOv8-Nano para despliegue eficiente.
+Pipeline end-to-end de detección de daño en mango usando imágenes RGB+NIR (cámara MAPIR Survey3W), un maestro multimodal de fusión temprana con backbone ConvNeXt-Tiny, y conocimiento destilado (KD) hacia un modelo estudiante YOLOv8-Nano para despliegue eficiente.
 
 ---
 
@@ -12,21 +12,33 @@ El proyecto construye un sistema de detección de daño en frutos de mango usand
 
 - **Imágenes multiespectrales** (RGB + NIR) capturadas con cámara MAPIR Survey3W
 - **Anotación automática** con Florence-2-large + refinamiento manual en Label Studio
-- **Modelo maestro (Teacher)** multimodal: DualConvNeXt + CrossModalFusion + DualFPN + YOLODetectionHead (~50M params)
+- **Modelo maestro (Teacher)** multimodal de fusión temprana: EarlyFusionBackbone (ConvNeXt-Tiny) + SingleFPN + YOLODetectionHead (35.3M params)
 - **Modelo estudiante (Student)** YOLOv8-Nano from scratch (~6.9M params) para recibir conocimiento destilado en capas intermedias
 - **Training loop** YOLOv8 personalizado (TAL assigner, CIoU, Focal Loss) — sin dependencia de ultralytics
 - **Knowledge Distillation** a nivel de features (backbone, FPN, head stems), no solo logits finales
 
 ### Resultados actuales
 
+Última corrida: `fusion-redesign` V1, semilla 42, 2026-08-31 (`checkpoints/fusion_redesign/v1_seed42/`).
+
 | Métrica | Valor |
 |---------|-------|
-| mAP@0.5 (maestro) | **0.3003** |
-| AP mango (clase 0) | 0.57 |
-| AP daño (clase 1) | 0.03–0.08 |
-| Pares de imágenes | 65 RGB+NIR |
-| Bboxes de daño | 186 manuales |
-| Épocas entrenadas | 80 (Fase 1, backbone congelado) |
+| mAP@0.5 (maestro) | 0.5018 (época 42) |
+| AP@0.5 mango (clase 0) | **1.0000** |
+| AP@0.5 daño (clase 1) | **0.0036** |
+| Daño: TP / FP / FN | 15 / 2116 / 16 |
+| Split | 148 train / 18 val / 20 test |
+| Parámetros | 35,276,920 (27,820,128 backbone) |
+| Épocas | 62 de 100 (early stop, `patience=20`) |
+
+> **El mAP de 0.50 no mide lo que parece.** Es `(1.0 + 0.0)/2`: la clase mango satura y la de daño está en cero.
+> Frente al baseline previo al rediseño (`reports/damage-map-audit/master-baseline/metrics.json`, daño AP50 = **0.0643**),
+> la clase daño **retrocedió**. Usar el mAP agregado como métrica de progreso en este proyecto es engañoso;
+> la métrica que importa es `ap50_class_1`.
+
+**Estado de la validación:** las fases 12 y 13 de `openspec/changes/fusion-redesign/tasks.md` están sin ejecutar.
+La semilla 1337 se interrumpió en la época 57 y la 2024 nunca arrancó, así que no hay σ para las barras `2·σ`
+pre-registradas. Los controles H-D (`in_channels=3`) y H-E (`head_strides=[8,16,32]`) siguen pendientes.
 
 ---
 
@@ -35,8 +47,9 @@ El proyecto construye un sistema de detección de daño en frutos de mango usand
 ### 2.1 Modelo Maestro (Teacher) — `src/models/master/`
 
 ```
-RGB ──→ DualConvNeXtSmall ──→ CrossModalFusion ──→ DualFPN ──→ YOLODetectionHead
-NIR ──→ DualConvNeXtSmall ──┘                                    │
+RGB (N,3,640,640) ─┐
+                   ├─ cat(dim=1) ─→ (N,4,640,640) ─→ EarlyFusionBackbone ─→ SingleFPN ─→ 4 × DecoupledHead
+NIR (N,1,640,640) ─┘                                                                        │
                                                                   ├── preds (bboxes + clases)
                                                                   ├── distill_backbone → Proyecciones → KD
                                                                   ├── distill_fpn      → Proyecciones → KD
@@ -44,11 +57,15 @@ NIR ──→ DualConvNeXtSmall ──┘                                    │
                                                                   └── distill_head_reg → Proyecciones → KD
 ```
 
-- **DualConvNeXt**: Dos backbones ConvNeXtV2 independientes para RGB y NIR (pesos compartidos en Fase 1)
-- **CrossModalFusion**: Fusión cross-modal aprendible (concat + convolución 1×1)
-- **DualFPN**: Feature Pyramid Network bidireccional con C2f blocks, salida 3 niveles [P3, P4, P5]
-- **YOLODetectionHead**: Head YOLOv8 decoupled (cls + reg) con bias init calibrado
-- **ProjectionLayers**: Capas de proyección lineal que adaptan features del maestro a las dimensiones del estudiante para KD
+- **Fusión temprana**: RGB y NIR se concatenan en un tensor de 4 canales *antes* del backbone (`master_model.py:130-131`). No hay atención cross-modal en ninguna parte del modelo.
+- **EarlyFusionBackbone**: ConvNeXt-**Tiny** de un solo stream (`torchvision.models.convnext_tiny`, pesos `IMAGENET1K_V1`), con un único stem `Conv2d(4→96, k4, s4)`. El stem preentrenado de 3 canales se adapta a 4: `W[:, :3] = W_imagenet * 0.75` y `W[:, 3] = mean(W_imagenet, dim=1) * 0.75` (`backbone.py:253-256`). Etapas `[96, 192, 384, 768]` a strides `[4, 8, 16, 32]`.
+- **SingleFPN**: FPN top-down clásica (laterales 1×1 + upsample nearest + convs 3×3 de salida), 256 canales, **4 niveles** `[P2, P3, P4, P5]`.
+- **YOLODetectionHead**: 4 heads desacoplados independientes (cls + reg), bias de `cls_pred` inicializado en −4.595 (p=0.01).
+- **ProjectionLayers**: Capas de proyección lineal que adaptan features del maestro a las dimensiones del estudiante para KD.
+
+> **Nota histórica.** `DualConvNeXt`, `CrossModalFusion` y `DualFPN` fueron **eliminados** el 2026-08-30 (commit `c9a247f`,
+> tareas 8.2/7.2 de `openspec/changes/fusion-redesign/`). `src/models/master/fusion.py` ya no existe. Si encuentras
+> documentación —incluida la memoria de tesis— que describa esos módulos, está desactualizada.
 
 ### 2.2 Modelo Estudiante (Student) — `src/models/student/`
 
@@ -93,7 +110,7 @@ annotate_mango_florence.py       convert_nir_labels.py
           ┌────────┴────────┐
           ▼                 ▼
    MasterModel        YOLOv8-Nano Student
-   (Teacher ~50M)     (Student ~6.9M)
+   (Teacher 35.3M)    (Student ~6.9M)
           │                 │
           └────────┬────────┘
                    ▼
@@ -209,7 +226,7 @@ openspec/
 │   ├── annotation/         # Florence-2, bbox projection, NIR segmentation
 │   ├── data_pipeline/      # OCI client y pair discovery para cache RGB/NIR
 │   ├── models/
-│   │   ├── master/         # Teacher: DualConvNeXt, Fusion, DualFPN, YOLODetectionHead
+│   │   ├── master/         # Teacher: EarlyFusionBackbone, SingleFPN, YOLODetectionHead
 │   │   └── student/        # Student: CSPDarknetNano, PANet, YOLOStudentHead
 │   ├── training/           # Training loop: dataset, loss (TAL+BCE+CIoU), metrics, augmentations
 │   ├── storage_logic/      # Object storage (S3/OCI)
