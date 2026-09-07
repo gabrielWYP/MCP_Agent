@@ -175,11 +175,71 @@ their split sizes allow.
 
 ---
 
-## 7. What to do next
+## 7. Three seeds — `σ_d` measured for the first time
 
-1. **Three seeds.** `{42, 1337, 2024}` for the two-stream on clean data. Without `σ_d`
-   nothing here is publishable, and the noise floor measured in §4 is wide enough to
-   swallow most single-seed differences.
+Two-stream, `configs/experiment/twostream.yaml`, `schedule: end_to_end` with all
+46,642,930 parameters trainable, clean labels, reconciled splits, seeds {42, 1337, 2024}.
+Checkpoints `checkpoints/twostream/seed*`, metrics `reports/twostream-3seeds/`.
+
+### Damage, evaluated on clean labels
+
+| seed | val AP50 | val recall | val tp | test AP50 | test recall | test tp |
+|---|---|---|---|---|---|---|
+| 42 | 0.1817 | 0.6296 | 17 | 0.1161 | 0.5385 | 14 |
+| 1337 | 0.1731 | **0.8148** | **22** | **0.1760** | 0.6538 | 17 |
+| 2024 | 0.1340 | 0.2222 | 6 | 0.0108 | 0.1154 | 3 |
+| **mean** | **0.1629** | 0.5556 | | **0.1010** | 0.4359 | |
+| **σ_d** | **0.0254** | 0.3032 | | **0.0836** | 0.2835 | |
+
+### Verdict against the pre-registered bar (`CONFIRM ≥ 2·σ_d` vs early fusion's 0.0000)
+
+- **val: CONFIRM.** 0.1629 against 2σ = 0.0508 — a 6.4 σ separation.
+- **test: does NOT confirm.** 0.1010 against 2σ = 0.1672 — 1.2 σ.
+
+Seed 1337's val recall of **0.8148 (22 of 27 lesions)** is the highest damage recall this
+project has produced. Precision remains 0.02–0.05 everywhere: the model finds damage and
+buries it under hundreds of false positives. No seed changes that.
+
+### A failed hypothesis about the variance
+
+Seed 2024 underperforms badly, and its `best_model.pt` (epoch 31) sits 2 epochs before
+its own trajectory peak (epoch 33, 0.2033). That suggested the broken checkpoint-selection
+criterion — the unweighted two-class mean with `>=` at `loop.py:420` — was manufacturing
+the variance. **It is not.** Selecting instead on val damage AP50 over every saved
+checkpoint picks the *same* three checkpoints:
+
+| seed | candidates (val damage AP50) | selected | resulting test |
+|---|---|---|---|
+| 42 | ep22 **0.1817** · ep30 0.1191 · ep40 0.0930 | ep22 | 0.1161 |
+| 1337 | ep30 0.1339 · ep40 **0.1731** | ep40 | 0.1760 |
+| 2024 | ep30 0.0209 · ep31 **0.1340** · ep40 0.1268 | ep31 | 0.0108 |
+
+The trajectory peaks the fix was meant to capture are themselves noise: seed 2024 scores
+0.0209 at epoch 30, 0.2033 at 33 and 0.1268 at 40. **On an 18-image validation split the
+act of selecting a checkpoint is itself noise-limited**, and no selection criterion
+repairs that. `loop.py` was therefore left unchanged; the `>=` defect is real but it costs
+early-stopping efficiency, not accuracy.
+
+### The improvement is NOT attributable to the label fix
+
+From 0.0637 (old checkpoint, test) to 0.1010 (three-seed mean, test), **three variables
+moved at once**: clean labels, removed split leakage, and a fully unfrozen backbone (the
+old checkpoint trained frozen — Phase 2 never ran).
+
+The only single-variable test of the labels available is §5, and it points the other way:
+holding architecture and schedule fixed, cleaning the labels took early fusion from
+14/62 epochs with true positives to **0/70**. Attributing the two-stream gain to the label
+fix is unsupported by anything measured here.
+
+Isolating it needs one more run: two-stream, current config, **dirty labels**
+(`data/annotations/yolo/labels_backup_20260906_121042`). With σ_d ≈ 0.08 on test, a single
+seed will likely be inconclusive; three would be needed to decide.
+
+---
+
+## 8. What to do next
+
+1. **Isolate the label variable** — the run described immediately above.
 2. **Keep P2.** `head_strides: [4,8,16,32]`. See the validation report's 13.5 — the
    pre-registered instruction to retire it must not be executed.
 3. **Run H-D** (`in_channels=3`), the only remaining test of whether NIR contributes in
