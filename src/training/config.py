@@ -21,7 +21,7 @@ from .fusion_modes import (
 from .machine import derive_grad_accum_steps
 from .precision import validate_bf16_support, validate_precision
 from .strides import (
-    CROSS_ATTENTION_HEAD_STRIDES,
+    CROSS_ATTENTION_SUPPORTED_HEAD_STRIDES,
     DEFAULT_HEAD_STRIDES,
     validate_strides,
 )
@@ -254,19 +254,20 @@ class TrainingConfig:
         validate_fusion_mode(self.fusion_mode)
         if self.model_type == "master":
             validate_strides(self.head_strides, self.assigner_level_ranges)
-            # `DualFPN` drops P2 and owns exactly 3 fusion convs, so the
-            # cross-attention path cannot honour any other pyramid. Caught
-            # here rather than inside MasterModel so a config that can never
-            # build a model fails at load time, before a run starts.
+            # `DualFPN` builds one fusion conv per emitted level, so the
+            # cross-attention path can honour its 3-level default or the
+            # full 4-level pyramid — and nothing else. Caught here rather
+            # than inside MasterModel so a config that can never build a
+            # model fails at load time, before a run starts.
             if (
                 self.fusion_mode == FUSION_MODE_CROSS_ATTENTION
-                and list(self.head_strides) != list(CROSS_ATTENTION_HEAD_STRIDES)
+                and tuple(self.head_strides) not in CROSS_ATTENTION_SUPPORTED_HEAD_STRIDES
             ):
+                supported = [list(s) for s in CROSS_ATTENTION_SUPPORTED_HEAD_STRIDES]
                 raise ValueError(
                     f"fusion_mode='{FUSION_MODE_CROSS_ATTENTION}' requires "
-                    f"head_strides={list(CROSS_ATTENTION_HEAD_STRIDES)} "
-                    f"(DualFPN emits exactly those 3 levels), got "
-                    f"{list(self.head_strides)}."
+                    f"head_strides in {supported} (DualFPN emits one fused "
+                    f"level per entry), got {list(self.head_strides)}."
                 )
 
     def __init_subclass__(cls, **kwargs: Any) -> None:

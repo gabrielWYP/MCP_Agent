@@ -41,13 +41,28 @@ DEFAULT_HEAD_STRIDES: list[int] = [4, 8, 16, 32]
 # exempt instead of an ever-growing allowlist.
 STUDENT_STRIDES: tuple[int, ...] = (8, 16, 32)
 
-# `fusion_mode="cross_attention"` (the restored two-stream path) is fixed to
-# these 3 levels by construction: `DualFPN` drops P2 before its per-level
-# fusion and owns exactly 3 `fusion_convs`. Declared here — next to
-# `STUDENT_STRIDES`, in the one file `tests/test_stride_literals.py` exempts
-# — so the cross-attention path has a named constant to import instead of
-# reintroducing the raw literal this module exists to eliminate.
+# Default pyramid for `fusion_mode="cross_attention"` (the restored
+# two-stream path): 3 levels, P2 dropped before `DualFPN`'s per-level
+# fusion. This is the pre-redesign two-stream checkpoint schema, so the
+# value must not change — every two-stream config and checkpoint written so
+# far depends on it. Declared here — next to `STUDENT_STRIDES`, in the one
+# file `tests/test_stride_literals.py` exempts — so the cross-attention
+# path has a named constant to import instead of reintroducing the raw
+# literal this module exists to eliminate.
 CROSS_ATTENTION_HEAD_STRIDES: tuple[int, ...] = STUDENT_STRIDES
+
+# Pyramids `fusion_mode="cross_attention"` can be built with. `DualFPN` now
+# sizes its `fusion_convs` from the pyramid it is asked to emit and selects
+# the levels to fuse by stride (`select_by_strides`) rather than by a
+# positional slice, so both of these are constructible: the 3-level default
+# above (P2 computed and discarded) and the full 4-level pyramid (P2 emitted
+# and fused, so it finally reaches the loss). Anything else still raises —
+# `MasterModel._resolve_strides` and `TrainingConfig.__post_init__` reject
+# it loudly rather than letting the mismatch surface as a truncating `zip`.
+CROSS_ATTENTION_SUPPORTED_HEAD_STRIDES: tuple[tuple[int, ...], ...] = (
+    CROSS_ATTENTION_HEAD_STRIDES,
+    tuple(ALL_STRIDES),
+)
 
 
 def validate_strides(

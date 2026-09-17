@@ -148,15 +148,21 @@ def _check_arch_version(checkpoint_path: str, arch_version, fusion_mode: str) ->
 def _resolve_head_strides(checkpoint: dict, fusion_mode: str) -> list[int]:
     """Return the strides to rebuild the checkpoint's MasterModel with.
 
-    `fusion_mode="cross_attention"` is fixed at
-    `CROSS_ATTENTION_HEAD_STRIDES` by `DualFPN`'s construction, so there is
-    nothing to read and nothing to guess — which is what makes pre-tag
-    checkpoints (no recorded `config.head_strides`) loadable at all.
+    `fusion_mode="cross_attention"` is no longer fixed at one pyramid —
+    `DualFPN` emits either `CROSS_ATTENTION_HEAD_STRIDES` or the full
+    4-level pyramid — so the checkpoint's own recorded strides are read
+    first, exactly as on the early path. Only when there are none does it
+    fall back to `CROSS_ATTENTION_HEAD_STRIDES`, which is what keeps pre-tag
+    checkpoints (written before `config.head_strides` was persisted, and
+    3-level by construction) loadable at all.
     `fusion_mode="early"` still resolves strides from the checkpoint, and
     still fails loudly if it recorded none.
     """
     if fusion_mode == FUSION_MODE_CROSS_ATTENTION:
-        return list(CROSS_ATTENTION_HEAD_STRIDES)
+        try:
+            return resolve_from_checkpoint(checkpoint)
+        except KeyError:
+            return list(CROSS_ATTENTION_HEAD_STRIDES)
     return resolve_from_checkpoint(checkpoint)
 
 
