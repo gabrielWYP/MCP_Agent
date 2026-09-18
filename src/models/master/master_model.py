@@ -40,7 +40,9 @@ restored as a selectable mode (not a revert):
         ↓
     DualFPN (two FPNs + per-level fusion)
         ↓
-    pyramid [P3, P4, P5] — `head_strides` is fixed at (8, 16, 32) here
+    pyramid — levels named by `head_strides`, default [P3, P4, P5];
+    [P2, P3, P4, P5] is also supported here (see
+    `CROSS_ATTENTION_SUPPORTED_HEAD_STRIDES`)
         ↓
     YOLODetectionHead (anchor-free, decoupled)
 
@@ -78,6 +80,7 @@ from src.training.fusion_modes import (
 )
 from src.training.strides import (
     CROSS_ATTENTION_HEAD_STRIDES,
+    CROSS_ATTENTION_SUPPORTED_HEAD_STRIDES,
     DEFAULT_HEAD_STRIDES,
     validate_strides,
 )
@@ -98,9 +101,11 @@ class MasterModel(nn.Module):
             over, finest-first. `fusion_mode="early"`: defaults to
             `[4, 8, 16, 32]` — includes the reconnected P2 level
             (fusion-redesign D-3); pass `[8, 16, 32]` for the pre-redesign
-            3-level pyramid. `fusion_mode="cross_attention"`: fixed at
-            `CROSS_ATTENTION_HEAD_STRIDES` by `DualFPN`'s construction; any
-            other value raises.
+            3-level pyramid. `fusion_mode="cross_attention"`: defaults to
+            `CROSS_ATTENTION_HEAD_STRIDES` (`[8, 16, 32]`, the pre-redesign
+            two-stream schema) and also accepts `[4, 8, 16, 32]`, which
+            emits the P2 level `DualFPN` computes either way — see
+            `CROSS_ATTENTION_SUPPORTED_HEAD_STRIDES`. Any other value raises.
         backbone_variant (str): ConvNeXt variant — "tiny" or "small".
         in_channels (int): Backbone stem input channels, `fusion_mode="early"`
             only. 4 (default) for the early-fused RGB+NIR input; 3 for the
@@ -176,6 +181,7 @@ class MasterModel(nn.Module):
                 in_channels=self.STAGE_CHANNELS,
                 out_channels=fpn_channels,
                 dropout=fpn_dropout,
+                emit_strides=tuple(strides),
             )
 
         # --- YOLO-style detection head (compatible with YOLO Nano student) ---
@@ -190,21 +196,27 @@ class MasterModel(nn.Module):
         """Return the pyramid strides for `fusion_mode`, failing loudly on a
         combination the architecture cannot honour.
 
-        `DualFPN` drops P2 and owns exactly 3 fusion convs, so the
-        cross-attention path is fixed at `CROSS_ATTENTION_HEAD_STRIDES`. An
-        unsupported `head_strides` there would otherwise surface as a `zip`
-        that silently truncates the pyramid — the failure class
+        `DualFPN` sizes its fusion convs from the pyramid it is asked to
+        emit, so the cross-attention path accepts any member of
+        `CROSS_ATTENTION_SUPPORTED_HEAD_STRIDES` and defaults to
+        `CROSS_ATTENTION_HEAD_STRIDES`. Anything else still raises here: an
+        unsupported `head_strides` would otherwise surface as a `zip` that
+        silently truncates the pyramid — the failure class
         `src/training/strides.py` exists to eliminate.
         """
         if fusion_mode == FUSION_MODE_CROSS_ATTENTION:
-            fixed = list(CROSS_ATTENTION_HEAD_STRIDES)
-            if head_strides is not None and list(head_strides) != fixed:
+            if head_strides is None:
+                return list(CROSS_ATTENTION_HEAD_STRIDES)
+            requested = tuple(head_strides)
+            if requested not in CROSS_ATTENTION_SUPPORTED_HEAD_STRIDES:
+                supported = [list(s) for s in CROSS_ATTENTION_SUPPORTED_HEAD_STRIDES]
                 raise ValueError(
-                    f"fusion_mode='{FUSION_MODE_CROSS_ATTENTION}' supports only "
-                    f"head_strides={fixed} (DualFPN drops P2 and has exactly "
-                    f"{len(fixed)} fusion convs), got {list(head_strides)}."
+                    f"fusion_mode='{FUSION_MODE_CROSS_ATTENTION}' supports "
+                    f"head_strides in {supported} (DualFPN builds one fusion "
+                    f"conv per emitted level over the [P2, P3, P4, P5] "
+                    f"pyramid), got {list(head_strides)}."
                 )
-            return fixed
+            return list(requested)
         if head_strides is not None:
             return list(head_strides)
         return list(DEFAULT_HEAD_STRIDES)
@@ -256,7 +268,8 @@ class MasterModel(nn.Module):
             backbone_features, nir_features = self.fusion(rgb_features, nir_features)
 
             # --- Dual FPN ---
-            pyramid = self.neck(backbone_features, nir_features)  # [P3..P5]
+            # levels named by self.head_strides
+            pyramid = self.neck(backbone_features, nir_features)
 
         # --- YOLO Detection Head ---
         head_output = self.head(pyramid)

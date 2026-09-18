@@ -7,6 +7,8 @@ path (two stems over shared stages -> per-stage cross-attention -> DualFPN).
 What these tests pin down:
 - Both modes forward to the SAME 7-key output dict, with per-level shapes
   matching their own `head_strides`.
+- The two-stream path emits either its 3-level default or the full 4-level
+  pyramid, and the stride-4 level it emits actually receives gradient.
 - The early path's state_dict key set is unchanged by the restoration —
   the four existing `arch_version=2` checkpoints must keep loading.
 - The two key sets are disjoint, which is exactly why `arch_version` maps
@@ -72,6 +74,7 @@ class TestForwardPerMode:
             ("early", None, [4, 8, 16, 32]),
             ("early", [8, 16, 32], [8, 16, 32]),
             ("cross_attention", None, list(CROSS_ATTENTION_HEAD_STRIDES)),
+            ("cross_attention", [4, 8, 16, 32], [4, 8, 16, 32]),
         ],
     )
     def test_output_keys_and_level_shapes(self, fusion_mode, head_strides, expected_strides):
@@ -115,6 +118,68 @@ class TestForwardPerMode:
             p.grad is not None and p.grad.abs().sum() > 0
             for p in model.fusion.parameters()
         )
+
+
+class TestCrossAttentionPyramidLevels:
+    """`DualFPN` used to compute P2 in both modality streams and discard
+    both copies (`fused_features[0].grad is None`, recorded as a verified
+    defect in reports/damage-map-audit/h7-mechanism.md). It now emits the
+    pyramid it is asked for, so P2 can reach the head and the loss.
+    """
+
+    def test_default_pyramid_is_unchanged(self):
+        """Regression guard: the default two-stream model must stay
+        byte-for-byte the 3-level one every existing config and checkpoint
+        was built with."""
+        model = _build("cross_attention")
+
+        assert model.head_strides == list(CROSS_ATTENTION_HEAD_STRIDES)
+        assert model.neck.emit_strides == CROSS_ATTENTION_HEAD_STRIDES
+        assert len(model.neck.fusion_convs) == len(CROSS_ATTENTION_HEAD_STRIDES)
+
+    def test_four_level_pyramid_builds_one_fusion_conv_per_level(self):
+        model = _build("cross_attention", [4, 8, 16, 32])
+
+        assert model.head_strides == [4, 8, 16, 32]
+        assert model.neck.emit_strides == (4, 8, 16, 32)
+        assert len(model.neck.fusion_convs) == 4
+
+    def test_four_level_forward_returns_one_map_per_stride(self):
+        model = _build("cross_attention", [4, 8, 16, 32]).eval()
+
+        rgb, nir = _inputs()
+        with torch.no_grad():
+            pyramid = model(rgb, nir)["distill_fpn"]
+
+        assert len(pyramid) == 4
+        for level, stride in zip(pyramid, [4, 8, 16, 32]):
+            side = IMAGE_SIZE // stride
+            assert level.shape == (1, 256, side, side)
+
+    def test_the_stride_four_level_receives_gradient(self):
+        """The whole point of the change: P2 is fused by `fusion_convs[0]`
+        and that conv must actually train."""
+        model = _build("cross_attention", [4, 8, 16, 32])
+
+        rgb, nir = _inputs()
+        model(rgb, nir)["preds"][0].sum().backward()
+
+        stride_four_weight = model.neck.fusion_convs[0][0].weight
+        assert stride_four_weight.grad is not None
+        assert stride_four_weight.grad.abs().sum() > 0
+
+    def test_the_default_pyramid_still_leaves_stride_four_unfused(self):
+        """The 3-level default keeps its documented cost: both streams
+        compute P2 and neither copy reaches a fusion conv, so
+        `fusion_convs[0]` is the stride-8 level, not stride 4."""
+        model = _build("cross_attention").eval()
+
+        assert model.neck.emit_strides[0] == 8
+
+        rgb, nir = _inputs()
+        with torch.no_grad():
+            finest = model(rgb, nir)["distill_fpn"][0]
+        assert finest.shape[-1] == IMAGE_SIZE // 8
 
 
 class TestStateDictSchema:
@@ -162,15 +227,26 @@ class TestInvalidCombinations:
         with pytest.raises(ValueError, match="fusion_mode"):
             TrainingConfig(fusion_mode="dual")
 
-    def test_config_rejects_cross_attention_with_a_four_level_pyramid(self):
+    def test_config_accepts_cross_attention_with_a_four_level_pyramid(self):
+        """`DualFPN` now sizes its fusion convs from the requested pyramid,
+        so the 4-level two-stream arm is a loadable config, not an error."""
+        config = TrainingConfig(fusion_mode="cross_attention")
+        assert config.head_strides == [4, 8, 16, 32]
+
+    def test_config_rejects_a_cross_attention_pyramid_dualfpn_cannot_emit(self):
         with pytest.raises(ValueError, match="head_strides"):
-            TrainingConfig(fusion_mode="cross_attention")
+            TrainingConfig(
+                fusion_mode="cross_attention",
+                head_strides=[16, 32],
+                assigner_level_ranges=[128.0],
+            )
 
     def test_cross_attention_rejects_unsupported_head_strides(self):
-        """DualFPN drops P2 and owns exactly 3 fusion convs — a 4-level
-        request must raise, not silently truncate via zip."""
+        """Only the 3-level default and the full 4-level pyramid are
+        constructible — anything else must raise, not silently truncate
+        via zip."""
         with pytest.raises(ValueError, match="head_strides"):
-            _build("cross_attention", [4, 8, 16, 32])
+            _build("cross_attention", [16, 32])
 
     def test_cross_attention_rejects_the_rgb_only_control_arm(self):
         with pytest.raises(ValueError, match="in_channels"):

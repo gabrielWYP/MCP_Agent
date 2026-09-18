@@ -1,0 +1,24 @@
+{
+  "best_map50": 0.5302730370312929,
+  "checkpoint": "checkpoints/final_runs/.partial/20260901T200124175077Z-09e1a06a8a694babb5c492a95b16383a/estudiante/best_model_20260901T200124175077Z_mAP0p5303/best_model.pt",
+  "command": [
+    "./myLinuxVenv/bin/python",
+    "-m",
+    "src.training.train",
+    "--config",
+    "configs/training_student.yaml",
+    "--model",
+    "student",
+    "--machine",
+    "configs/machines/rtx3080.yaml",
+    "--override",
+    "output_dir=checkpoints/final_runs/.partial/20260901T200124175077Z-09e1a06a8a694babb5c492a95b16383a/.stage_tmp/estudiante"
+  ],
+  "device": "cuda",
+  "effective_batch": 8,
+  "experiment_sha256": "94ec4ff5e98173a38b73e753abffe3b4dbda2a7dc09cf7d8d2d63ae4654797a2",
+  "output_dir": "checkpoints/final_runs/.partial/20260901T200124175077Z-09e1a06a8a694babb5c492a95b16383a/estudiante/best_model_20260901T200124175077Z_mAP0p5303",
+  "precision": "fp32",
+  "stage_key": "estudiante",
+  "stage_label": "Estudiante"
+}

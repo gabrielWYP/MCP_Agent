@@ -5,19 +5,20 @@ FPN necks for the two `MasterModel` fusion modes.
   single early-fused backbone stream, emitting the levels named by
   `head_strides`.
 - `DualFPN` — `fusion_mode="cross_attention"`. Two `SingleFPN`s (one per
-  modality) fused per level via a 1x1 conv, emitting [P3, P4, P5].
+  modality) fused per level via a 1x1 conv, emitting the levels named by
+  `emit_strides`.
 
 fusion-redesign (design.md D-D) originally deleted `DualFPN`: with only one
 backbone stream there is only one FPN. It is restored here for the
-cross-attention path alone, verbatim — its `fusion_convs` count and module
-names are part of the two-stream checkpoint schema.
+cross-attention path alone — its module names are part of the two-stream
+checkpoint schema, and its default `fusion_convs` count still is.
 
 `SingleFPN` is shared by both and kept unchanged — it already builds the
-full [P2, P3, P4, P5] pyramid. `DualFPN` computes P2 in both of its internal
-FPNs and discards both copies before fusion (`fused_features[0].grad is
-None`, verified in proposal.md D3) because `YOLODetectionHead` only consumes
-strides [8, 16, 32] on that path — a known cost of the cross-attention
-architecture, kept as-is so its checkpoints stay loadable.
+full [P2, P3, P4, P5] pyramid. `DualFPN` used to compute P2 in both of its
+internal FPNs and discard both copies before fusion (`fused_features[0].grad
+is None`, verified in proposal.md D3). It no longer has to: `emit_strides`
+decides which of the computed levels are fused and returned, so the P2 both
+streams already pay for can reach the head and the loss.
 
 `FPNNeck` reconnects P2 by default: it wraps
 `SingleFPN` and emits exactly the levels named by the configured
@@ -28,13 +29,17 @@ pyramid level is discarded without a gradient path to the loss.
 Output channels: 256 per level (unchanged).
 """
 
+from typing import Sequence
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from src.training.strides import (
+    ALL_STRIDES,
     CROSS_ATTENTION_HEAD_STRIDES,
     STRIDE_TO_LEVEL,
+    select_by_strides,
     validate_strides,
 )
 
@@ -170,16 +175,35 @@ class DualFPN(nn.Module):
     This is lightweight (1x1 conv) but fully learnable, letting the model
     decide how to weight RGB vs NIR information at each pyramid level.
 
-    The emitted pyramid is fixed at 3 levels
-    (`src.training.strides.CROSS_ATTENTION_HEAD_STRIDES`): P2 is dropped
-    before fusion and there are exactly 3 `fusion_convs`. `MasterModel`
-    rejects any other `head_strides` under this mode rather than letting the
-    mismatch surface as a `zip` that silently truncates.
+    The emitted pyramid is configurable, not fixed at 3 levels: `DualFPN`
+    emits exactly the levels named by `emit_strides`, finest-first, and owns
+    exactly `len(emit_strides)` `fusion_convs` — the count always equals the
+    number of emitted levels, so a level can never be fused without a conv
+    or built without a consumer.
+
+    Two pyramids are supported
+    (`src.training.strides.CROSS_ATTENTION_SUPPORTED_HEAD_STRIDES`):
+
+    - `(8, 16, 32)` — the default and the pre-redesign two-stream
+      checkpoint schema. Both internal FPNs still compute P2 and both copies
+      are discarded before fusion.
+    - `(4, 8, 16, 32)` — P2 is fused and emitted, so the finest level
+      reaches the head and receives gradient instead of being computed twice
+      and thrown away.
+
+    Levels are selected by stride (`select_by_strides`), never by a
+    positional slice: a mismatch between the requested pyramid and the
+    computed one raises instead of surfacing as a `zip` that silently
+    truncates. `MasterModel` still rejects any `emit_strides` outside the
+    supported pair before construction is reached.
 
     Args:
         in_channels (list[int]): Stage channels from backbone.
         out_channels (int): Output channels per pyramid level (default 256).
         dropout (float): Dropout after fusion conv (regularization).
+        emit_strides (Sequence[int] | None): Strides to fuse and emit,
+            finest-first. Defaults to `CROSS_ATTENTION_HEAD_STRIDES`
+            (`(8, 16, 32)`), so every existing call site is unchanged.
     """
 
     def __init__(
@@ -187,11 +211,17 @@ class DualFPN(nn.Module):
         in_channels: list[int] = None,
         out_channels: int = 256,
         dropout: float = 0.1,
+        emit_strides: Sequence[int] | None = None,
     ):
         super().__init__()
 
         if in_channels is None:
             in_channels = [96, 192, 384, 768]
+
+        if emit_strides is None:
+            emit_strides = CROSS_ATTENTION_HEAD_STRIDES
+        validate_strides(emit_strides)
+        self.emit_strides = tuple(emit_strides)
 
         self.fpn_rgb = SingleFPN(in_channels, out_channels)
         self.fpn_nir = SingleFPN(in_channels, out_channels)
@@ -204,8 +234,8 @@ class DualFPN(nn.Module):
                 nn.ReLU(inplace=True),
                 nn.Dropout2d(p=dropout),
             )
-            # one per emitted pyramid level (P3, P4, P5 — P2 dropped)
-            for _ in CROSS_ATTENTION_HEAD_STRIDES
+            # Exactly one per emitted pyramid level.
+            for _ in self.emit_strides
         ])
 
     def forward(
@@ -219,16 +249,23 @@ class DualFPN(nn.Module):
             nir_features:   [S1, S2, S3, S4] — original NIR backbone features
 
         Returns:
-            pyramid: [P3, P4, P5] — unified multi-scale feature pyramid
+            pyramid: the levels named by `self.emit_strides`, finest-first,
+                each at `out_channels`. Index `k` corresponds to
+                `self.emit_strides[k]`.
         """
         # Build per-modality pyramids
         rgb_pyramid = self.fpn_rgb(fused_features)   # [P2..P5] at 256ch
         nir_pyramid = self.fpn_nir(nir_features)     # [P2..P5] at 256ch
 
-        # Fuse per level (skip P2 — head expects CROSS_ATTENTION_HEAD_STRIDES)
+        # Select the levels to fuse by stride, not by position: a positional
+        # slice silently truncates when the requested pyramid and the
+        # computed one disagree.
+        rgb_levels = select_by_strides(rgb_pyramid, ALL_STRIDES, self.emit_strides)
+        nir_levels = select_by_strides(nir_pyramid, ALL_STRIDES, self.emit_strides)
+
         unified_pyramid = []
         for rgb_level, nir_level, fusion_conv in zip(
-            rgb_pyramid[1:], nir_pyramid[1:], self.fusion_convs
+            rgb_levels, nir_levels, self.fusion_convs
         ):
             # Concatenate along channel dim: (N, 512, H, W)
             combined = torch.cat([rgb_level, nir_level], dim=1)
@@ -236,4 +273,4 @@ class DualFPN(nn.Module):
             fused_level = fusion_conv(combined)
             unified_pyramid.append(fused_level)
 
-        return unified_pyramid  # [P3, P4, P5] at 256ch
+        return unified_pyramid
