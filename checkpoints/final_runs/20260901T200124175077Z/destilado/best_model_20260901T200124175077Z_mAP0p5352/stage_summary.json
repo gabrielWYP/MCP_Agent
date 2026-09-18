@@ -1,0 +1,23 @@
+{
+  "best_map50": 0.5351533330976963,
+  "checkpoint": "checkpoints/final_runs/.partial/20260901T200124175077Z-09e1a06a8a694babb5c492a95b16383a/destilado/best_model_20260901T200124175077Z_mAP0p5352/best_model.pt",
+  "command": [
+    "./myLinuxVenv/bin/python",
+    "-m",
+    "src.training.kd_train",
+    "--config",
+    "configs/kd_training.yaml",
+    "--machine",
+    "configs/machines/rtx3080.yaml",
+    "--override",
+    "output_dir=checkpoints/final_runs/.partial/20260901T200124175077Z-09e1a06a8a694babb5c492a95b16383a/.stage_tmp/destilado",
+    "teacher_checkpoint=checkpoints/final_runs/.partial/20260901T200124175077Z-09e1a06a8a694babb5c492a95b16383a/maestro/best_model_20260901T200124175077Z_mAP0p5073/best_model.pt"
+  ],
+  "device": "cuda",
+  "effective_batch": 8,
+  "experiment_sha256": null,
+  "output_dir": "checkpoints/final_runs/.partial/20260901T200124175077Z-09e1a06a8a694babb5c492a95b16383a/destilado/best_model_20260901T200124175077Z_mAP0p5352",
+  "precision": "fp32",
+  "stage_key": "destilado",
+  "stage_label": "Destilado"
+}

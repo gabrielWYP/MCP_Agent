@@ -1,0 +1,24 @@
+{
+  "best_map50": 0.5087180845439434,
+  "checkpoint": "maestro/best_model_20260901T234436331584Z_mAP0p5087/best_model.pt",
+  "command": [
+    "./myLinuxVenv/bin/python",
+    "-m",
+    "src.training.train",
+    "--config",
+    "configs/training_mango.yaml",
+    "--model",
+    "master",
+    "--machine",
+    "configs/machines/rtx3080.yaml",
+    "--override",
+    "output_dir=checkpoints/final_runs/.partial/20260901T234436331584Z-fd0ef98f12a5427dbb375a42445bf0a9/.stage_tmp/maestro"
+  ],
+  "device": "cuda",
+  "effective_batch": 8,
+  "experiment_sha256": "c7f3df4cb0e97d17981eef379674ef7a8442d7091f6a60800236903f6a8742e1",
+  "output_dir": "maestro/best_model_20260901T234436331584Z_mAP0p5087",
+  "precision": "fp32",
+  "stage_key": "maestro",
+  "stage_label": "Maestro"
+}

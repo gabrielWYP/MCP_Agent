@@ -1,0 +1,18 @@
+{
+  "best_map50": 0.523129791021347,
+  "checkpoint": "checkpoints/final_runs/.partial/20260826T224117154204Z-0c7f67a4a5c54bcc8799a6df2aed5bd3/estudiante/best_model_20260826T224117154204Z_mAP0p5231/best_model.pt",
+  "command": [
+    "/home/gabo/MCP_Agent/myLinuxVenv/bin/python",
+    "-m",
+    "src.training.train",
+    "--config",
+    "configs/training_student.yaml",
+    "--model",
+    "student",
+    "--override",
+    "output_dir=checkpoints/final_runs/.partial/20260826T224117154204Z-0c7f67a4a5c54bcc8799a6df2aed5bd3/.stage_tmp/estudiante"
+  ],
+  "output_dir": "checkpoints/final_runs/.partial/20260826T224117154204Z-0c7f67a4a5c54bcc8799a6df2aed5bd3/estudiante/best_model_20260826T224117154204Z_mAP0p5231",
+  "stage_key": "estudiante",
+  "stage_label": "Estudiante"
+}

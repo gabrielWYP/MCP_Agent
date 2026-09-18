@@ -1,0 +1,24 @@
+{
+  "best_map50": 0.5209365859627724,
+  "checkpoint": "estudiante/best_model_20260901T234436331584Z_mAP0p5209/best_model.pt",
+  "command": [
+    "./myLinuxVenv/bin/python",
+    "-m",
+    "src.training.train",
+    "--config",
+    "configs/training_student.yaml",
+    "--model",
+    "student",
+    "--machine",
+    "configs/machines/rtx3080.yaml",
+    "--override",
+    "output_dir=checkpoints/final_runs/.partial/20260901T234436331584Z-fd0ef98f12a5427dbb375a42445bf0a9/.stage_tmp/estudiante"
+  ],
+  "device": "cuda",
+  "effective_batch": 8,
+  "experiment_sha256": "94ec4ff5e98173a38b73e753abffe3b4dbda2a7dc09cf7d8d2d63ae4654797a2",
+  "output_dir": "estudiante/best_model_20260901T234436331584Z_mAP0p5209",
+  "precision": "fp32",
+  "stage_key": "estudiante",
+  "stage_label": "Estudiante"
+}

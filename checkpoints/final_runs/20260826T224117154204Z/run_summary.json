@@ -1,0 +1,59 @@
+{
+  "results": [
+    {
+      "best_map50": 0.44378310441970825,
+      "checkpoint": "checkpoints/final_runs/.partial/20260826T224117154204Z-0c7f67a4a5c54bcc8799a6df2aed5bd3/maestro/best_model_20260826T224117154204Z_mAP0p4438/best_model.pt",
+      "command": [
+        "/home/gabo/MCP_Agent/myLinuxVenv/bin/python",
+        "-m",
+        "src.training.train",
+        "--config",
+        "configs/training_mango.yaml",
+        "--model",
+        "master",
+        "--override",
+        "output_dir=checkpoints/final_runs/.partial/20260826T224117154204Z-0c7f67a4a5c54bcc8799a6df2aed5bd3/.stage_tmp/maestro"
+      ],
+      "output_dir": "checkpoints/final_runs/.partial/20260826T224117154204Z-0c7f67a4a5c54bcc8799a6df2aed5bd3/maestro/best_model_20260826T224117154204Z_mAP0p4438",
+      "stage_key": "maestro",
+      "stage_label": "Maestro"
+    },
+    {
+      "best_map50": 0.523129791021347,
+      "checkpoint": "checkpoints/final_runs/.partial/20260826T224117154204Z-0c7f67a4a5c54bcc8799a6df2aed5bd3/estudiante/best_model_20260826T224117154204Z_mAP0p5231/best_model.pt",
+      "command": [
+        "/home/gabo/MCP_Agent/myLinuxVenv/bin/python",
+        "-m",
+        "src.training.train",
+        "--config",
+        "configs/training_student.yaml",
+        "--model",
+        "student",
+        "--override",
+        "output_dir=checkpoints/final_runs/.partial/20260826T224117154204Z-0c7f67a4a5c54bcc8799a6df2aed5bd3/.stage_tmp/estudiante"
+      ],
+      "output_dir": "checkpoints/final_runs/.partial/20260826T224117154204Z-0c7f67a4a5c54bcc8799a6df2aed5bd3/estudiante/best_model_20260826T224117154204Z_mAP0p5231",
+      "stage_key": "estudiante",
+      "stage_label": "Estudiante"
+    },
+    {
+      "best_map50": 0.5198333077132702,
+      "checkpoint": "checkpoints/final_runs/.partial/20260826T224117154204Z-0c7f67a4a5c54bcc8799a6df2aed5bd3/destilado/best_model_20260826T224117154204Z_mAP0p5198/best_model.pt",
+      "command": [
+        "/home/gabo/MCP_Agent/myLinuxVenv/bin/python",
+        "-m",
+        "src.training.kd_train",
+        "--config",
+        "configs/kd_training.yaml",
+        "--override",
+        "output_dir=checkpoints/final_runs/.partial/20260826T224117154204Z-0c7f67a4a5c54bcc8799a6df2aed5bd3/.stage_tmp/destilado",
+        "teacher_checkpoint=checkpoints/final_runs/.partial/20260826T224117154204Z-0c7f67a4a5c54bcc8799a6df2aed5bd3/maestro/best_model_20260826T224117154204Z_mAP0p4438/best_model.pt"
+      ],
+      "output_dir": "checkpoints/final_runs/.partial/20260826T224117154204Z-0c7f67a4a5c54bcc8799a6df2aed5bd3/destilado/best_model_20260826T224117154204Z_mAP0p5198",
+      "stage_key": "destilado",
+      "stage_label": "Destilado"
+    }
+  ],
+  "run_dir": "checkpoints/final_runs/20260826T224117154204Z",
+  "run_id": "20260826T224117154204Z"
+}
