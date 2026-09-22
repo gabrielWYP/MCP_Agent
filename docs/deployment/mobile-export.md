@@ -23,7 +23,7 @@ Everything runs on CPU. Prefix the commands below with `CUDA_VISIBLE_DEVICES=""`
 ```
 
 - **Checkpoints:** the script accepts plain-student or KD checkpoints (`model_state_dict`) and raw state_dicts. It strips legacy `kd_proj_*` keys, then loads everything else with `strict=True`. It rejects teacher checkpoints.
-- **Outputs:** `exports/student_fp32.tflite` (git-ignored) and the sidecar `exports/student_fp32.json`. The sidecar is the app's contract: input, preprocessing, outputs, anchors, decode and NMS settings, the source checkpoint's sha256, and tool versions.
+- **Outputs:** `exports/student_fp32.tflite` and the sidecar `exports/student_fp32.json` (the whole `exports/` directory is git-ignored; ship both files with the app). The sidecar is the app's contract: input, preprocessing, outputs, anchors, decode and NMS settings, the source checkpoint's sha256, and tool versions.
 - **Smoke test:** `--random-init` exports an untrained student to test the pipeline.
 - **Precision:** `--precision` only accepts `fp32`. It is where FP16 and INT8 will be added.
 
