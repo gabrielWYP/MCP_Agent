@@ -26,7 +26,7 @@ from src.models.master.distill_projections import ProjectionLayers, fpn_projecti
 class TestLengthGuard:
     def test_matching_length_succeeds(self):
         proj = ProjectionLayers(teacher_channels=[256, 256, 256], student_channels=[128, 256, 256])
-        features = [torch.randn(1, 256, 8, 8) for _ in range(3)]
+        features = [torch.randn(1, c, 8, 8) for c in (128, 256, 256)]
         out = proj(features)
         assert len(out) == 3
 
@@ -36,7 +36,7 @@ class TestLengthGuard:
         preset must raise, not silently distill P2/P3/P4 into student
         P3/P4/P5 via zip-truncation."""
         proj = fpn_projections()
-        four_level_features = [torch.randn(1, 256, s, s) for s in (160, 80, 40, 20)]
+        four_level_features = [torch.randn(1, 128, s, s) for s in (160, 80, 40, 20)]
         with pytest.raises(AssertionError, match="expected 3"):
             proj(four_level_features)
 
@@ -44,3 +44,24 @@ class TestLengthGuard:
         proj = ProjectionLayers(teacher_channels=[256, 256, 256], student_channels=[128, 256, 256])
         with pytest.raises(AssertionError):
             proj([torch.randn(1, 256, 8, 8), torch.randn(1, 256, 4, 4)])
+
+
+class TestDirection:
+    """The adapters map STUDENT → TEACHER channels (FitNets regressor), so
+    the frozen teacher feature can be the MSE target. The previous
+    teacher → student direction put a trainable module on the target side,
+    which permits a trivial collapse of both sides of the loss."""
+
+    def test_consumes_student_channels_and_emits_teacher_channels(self):
+        proj = ProjectionLayers(teacher_channels=[384, 768], student_channels=[128, 256])
+        out = proj([torch.randn(2, 128, 8, 8), torch.randn(2, 256, 4, 4)])
+        assert [tuple(o.shape) for o in out] == [(2, 384, 8, 8), (2, 768, 4, 4)]
+
+    def test_teacher_shaped_input_is_rejected(self):
+        proj = fpn_projections()
+        with pytest.raises(RuntimeError):
+            proj([torch.randn(1, 256, s, s) for s in (8, 4, 2)])
+
+    def test_presets_are_conv_only_by_default(self):
+        proj = fpn_projections()
+        assert not any(isinstance(m, torch.nn.BatchNorm2d) for m in proj.modules())

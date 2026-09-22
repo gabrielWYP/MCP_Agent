@@ -3,16 +3,32 @@ Knowledge Distillation Trainer — subclass of Trainer with frozen teacher.
 
 Extends the base Trainer with:
     - Frozen MasterModel teacher loaded from checkpoint
-    - 4 ProjectionLayers groups attached to StudentModel as submodules
-    - Overridden _train_epoch with KD forward pass (teacher → project → MSE)
+    - 4 trainable student → teacher adapter groups (`self.kd_adapters`,
+      FitNets-style 1x1 regressors) owned by the trainer, NOT the student
+    - Overridden _train_epoch with KD forward pass
+      (student → adapter → MSE against frozen teacher features)
     - Inherited _validate (student-only), fit, checkpoint, early stopping
 
 Teacher is stored as a plain attribute (NOT nn.Module submodule) so it is
 naturally excluded from optimizer.param_groups and model.state_dict().
+
+The adapters are kept out of `self.model` on purpose: they are training-only,
+so the student's `model_state_dict` stays loadable into a bare
+`StudentModel` (RGB-only inference/export never sees them). They reach the
+optimizer through `_auxiliary_param_groups` and the checkpoint through
+`_auxiliary_checkpoint_state` (key `kd_adapters_state_dict`).
+
+History: the adapters used to map TEACHER → student channels, were attached
+to the student as `kd_proj_*` submodules, and ran inside the teacher's
+`torch.no_grad()` block. They were in the optimizer but never received a
+gradient, so they stayed at random init for the whole run. Merely moving
+them out of `no_grad` would not be enough: a trainable projection on the
+teacher side can shrink the regression target itself (trivial collapse).
 """
 
 from __future__ import annotations
 
+import itertools
 from pathlib import Path
 
 import torch
@@ -42,12 +58,12 @@ from src.models.master.distill_projections import (
 class KDTrainer(Trainer):
     """Knowledge distillation trainer with frozen teacher.
 
-    Attaches 4 projection groups to the student model as registered submodules,
-    loads a frozen MasterModel teacher, and overrides _train_epoch to compute
-    both detection loss and per-level MSE distillation loss.
+    Owns 4 student → teacher adapter groups (`self.kd_adapters`), loads a
+    frozen MasterModel teacher, and overrides _train_epoch to compute both
+    detection loss and per-level MSE distillation loss.
 
     Args:
-        model: StudentModel instance (projections attached before super().__init__).
+        model: StudentModel instance (left unmodified — no KD submodules).
         config: KDConfig with teacher_checkpoint and KD hyperparameters.
         train_loader: Training data loader.
         val_loader: Validation data loader.
@@ -60,14 +76,16 @@ class KDTrainer(Trainer):
         train_loader: DataLoader,
         val_loader: DataLoader,
     ):
-        # Attach projection layers BEFORE super().__init__() so they are
-        # moved to device by self.model.to(device) in Trainer.__init__.
-        model.kd_proj_backbone = backbone_projections()
-        model.kd_proj_fpn = fpn_projections()
-        model.kd_proj_head_cls = head_projections()
-        model.kd_proj_head_reg = head_projections()
-
         super().__init__(model, config, train_loader, val_loader)
+
+        # Student → teacher adapters (FitNets regressors). Trainer-owned,
+        # NOT student submodules: see the module docstring.
+        self.kd_adapters = nn.ModuleDict({
+            "backbone": backbone_projections(),
+            "fpn": fpn_projections(),
+            "head_cls": head_projections(),
+            "head_reg": head_projections(),
+        }).to(self.device)
 
         # Load frozen teacher — stored as plain attribute, NOT a submodule.
         # This ensures teacher params are excluded from:
@@ -81,6 +99,14 @@ class KDTrainer(Trainer):
             level_weights=config.distill_levels,
             temperature=config.kd_temperature,
         ).to(self.device)
+
+    def _auxiliary_param_groups(self, lr: float) -> list[dict]:
+        """Adapters train at the student's base LR, in their own group."""
+        return [{"params": list(self.kd_adapters.parameters()), "lr": lr}]
+
+    def _auxiliary_checkpoint_state(self) -> dict:
+        """Persist the adapters next to (not inside) `model_state_dict`."""
+        return {"kd_adapters_state_dict": self.kd_adapters.state_dict()}
 
     @staticmethod
     def _load_teacher(config: KDConfig) -> MasterModel:
@@ -128,8 +154,9 @@ class KDTrainer(Trainer):
     def _train_epoch(self, optimizer: AdamW, epoch: int, phase: int) -> dict:
         """Run one KD training epoch.
 
-        Teacher forward under no_grad → project features → student forward →
-        det_loss + kd_weight * kd_loss → backward → grad clip → step.
+        Teacher forward under no_grad → student forward → student features
+        through the trainable adapters → det_loss + kd_weight * kd_loss →
+        backward → grad clip → step.
 
         D-G (fusion-redesign), mirrored from `Trainer._train_epoch`: this
         method used to catch OOM and NaN/Inf, print a warning, and
@@ -159,6 +186,7 @@ class KDTrainer(Trainer):
             oom_skipped/nan_skipped/steps_taken counters.
         """
         self.model.train()
+        self.kd_adapters.train()
         self.teacher.eval()  # Ensure teacher stays in eval mode
 
         total_cls = 0.0
@@ -188,9 +216,7 @@ class KDTrainer(Trainer):
                         # "RGB-only" feature set — it carries NIR information
                         # too (design.md D-5). [2:] still selects S3, S4;
                         # channels [384, 768] are unchanged.
-                        proj_backbone = self.model.kd_proj_backbone(
-                            t_out["distill_backbone"][2:]
-                        )
+                        t_backbone = t_out["distill_backbone"][2:]
                         # fusion-redesign D-3/§5: the teacher may emit more
                         # pyramid/head levels than the student's fixed 3
                         # (default head_strides=[4,8,16,32] vs the student's
@@ -207,12 +233,19 @@ class KDTrainer(Trainer):
                         head_reg_for_student = select_by_strides(
                             t_out["distill_head_reg"], teacher_strides, STUDENT_STRIDES
                         )
-                        proj_fpn = self.model.kd_proj_fpn(fpn_for_student)
-                        proj_head_cls = self.model.kd_proj_head_cls(head_cls_for_student)
-                        proj_head_reg = self.model.kd_proj_head_reg(head_reg_for_student)
 
                     # --- Student forward (RGB only) ---
                     s_out = self.model(rgb)
+
+                    # --- Adapters (student → teacher channels) ---
+                    # Deliberately OUTSIDE the no_grad block above: the KD
+                    # loss is the adapters' only gradient source.
+                    adapted_student = {
+                        "backbone": self.kd_adapters["backbone"](s_out["distill_backbone"]),
+                        "fpn": self.kd_adapters["fpn"](s_out["distill_fpn"]),
+                        "head_cls": self.kd_adapters["head_cls"](s_out["distill_head_cls"]),
+                        "head_reg": self.kd_adapters["head_reg"](s_out["distill_head_reg"]),
+                    }
 
                     # --- Detection loss ---
                     targets = {"bboxes": bboxes, "labels": labels}
@@ -220,18 +253,12 @@ class KDTrainer(Trainer):
 
                     # --- KD loss ---
                     kd_teacher = {
-                        "backbone": proj_backbone,
-                        "fpn": proj_fpn,
-                        "head_cls": proj_head_cls,
-                        "head_reg": proj_head_reg,
+                        "backbone": t_backbone,
+                        "fpn": fpn_for_student,
+                        "head_cls": head_cls_for_student,
+                        "head_reg": head_reg_for_student,
                     }
-                    kd_student = {
-                        "backbone": s_out["distill_backbone"],
-                        "fpn": s_out["distill_fpn"],
-                        "head_cls": s_out["distill_head_cls"],
-                        "head_reg": s_out["distill_head_reg"],
-                    }
-                    kd_loss, kd_per_level = self.kd_criterion(kd_teacher, kd_student)
+                    kd_loss, kd_per_level = self.kd_criterion(kd_teacher, adapted_student)
 
                     # --- Total loss ---
                     loss = det_loss + self.config.kd_weight * kd_loss
@@ -252,7 +279,10 @@ class KDTrainer(Trainer):
                     loss.backward()
 
                 # Gradient clipping
-                nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip)
+                nn.utils.clip_grad_norm_(
+                    itertools.chain(self.model.parameters(), self.kd_adapters.parameters()),
+                    self.config.grad_clip,
+                )
 
                 if self.config.precision == "fp16":
                     self.scaler.step(optimizer)

@@ -52,7 +52,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from scripts.evaluate_checkpoint import _check_arch_version, _resolve_head_strides
 from src.models.master.master_model import MasterModel
-from src.models.student.student_model import StudentModel
+from src.models.student.student_model import StudentModel, strip_legacy_kd_adapter_keys
 from src.training.config import TrainingConfig
 from src.training.dataset import letterbox
 from src.training.decode import decode_detections
@@ -219,6 +219,9 @@ def load_model(
     else:
         model = StudentModel(num_classes=config.num_classes)
         strides = list(STUDENT_STRIDES)
+        # Pre-fix KD checkpoints stored the training-only adapters inside
+        # `model_state_dict`; they are not part of the student.
+        state_dict = strip_legacy_kd_adapter_keys(state_dict)
 
     model.load_state_dict(state_dict, strict=True)
     model.to(device)
