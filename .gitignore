@@ -81,3 +81,8 @@ checkpoints/**/*.pt
 
 # Partial (incomplete) training runs
 checkpoints/**/.partial/
+
+# Mobile export toolchain venv (see requirements-export.txt) and export
+# outputs; binaries and metadata sidecars embed local paths and timestamps.
+/.venv-export/
+/exports/
