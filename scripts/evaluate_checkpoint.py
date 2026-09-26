@@ -292,9 +292,9 @@ def main() -> int:
     )
     logger.info("Device: %s", device)
     logger.info(
-        "Config: model=%s split=%s conf_threshold=%.3f nms_enabled=%s decode_per_class=%s "
+        "Config: model=%s split=%s conf_threshold=%.3f eval_conf_threshold=%.3f nms_enabled=%s decode_per_class=%s "
         "assigner_center_radius=%.2f",
-        model_type, args.split, config.conf_threshold, config.nms_enabled,
+        model_type, args.split, config.conf_threshold, config.eval_conf_threshold, config.nms_enabled,
         config.decode_per_class, config.assigner_center_radius,
     )
 
