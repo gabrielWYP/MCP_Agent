@@ -21,6 +21,7 @@ from torch.optim import AdamW
 from torch.utils.data import DataLoader
 
 from .config import TrainingConfig
+from .fusion_modes import fusion_pos_encoding_from_checkpoint
 from .kd_config import KDConfig
 from .kd_loss import KDLoss
 from .loop import Trainer
@@ -101,18 +102,23 @@ class KDTrainer(Trainer):
                 f"Teacher checkpoint not found: {ckpt_path}"
             )
 
+        checkpoint = torch.load(str(ckpt_path), map_location="cpu", weights_only=False)
+
         # `fusion_mode` decides the teacher's whole state_dict schema: a
         # cross-attention checkpoint shares no key with an early-fusion
         # model, so the teacher must be built in the mode it was trained in.
+        # `fusion_pos_encoding` adds no key, so strict loading cannot catch
+        # it — it is read from the teacher checkpoint's own recorded config
+        # (absent -> False), never from the student's KD config.
         teacher = MasterModel(
             num_classes=config.num_classes,
             pretrained_backbone=False,
             backbone_variant=config.backbone_variant,
             head_strides=config.head_strides,
             fusion_mode=config.fusion_mode,
+            fusion_pos_encoding=fusion_pos_encoding_from_checkpoint(checkpoint),
         )
 
-        checkpoint = torch.load(str(ckpt_path), map_location="cpu", weights_only=False)
         teacher.load_state_dict(checkpoint["model_state_dict"])
 
         # Freeze all teacher parameters

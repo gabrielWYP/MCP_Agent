@@ -50,7 +50,11 @@ import torch
 # Ensure project root is importable
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from scripts.evaluate_checkpoint import _check_arch_version, _resolve_head_strides
+from scripts.evaluate_checkpoint import (
+    _check_arch_version,
+    _resolve_fusion_pos_encoding,
+    _resolve_head_strides,
+)
 from src.models.master.master_model import MasterModel
 from src.models.student.student_model import StudentModel
 from src.training.config import TrainingConfig
@@ -186,6 +190,7 @@ def load_model(
     is_checkpoint_dict = isinstance(checkpoint, dict) and "model_state_dict" in checkpoint
 
     head_strides = None
+    fusion_pos_encoding = config.fusion_pos_encoding
     if is_checkpoint_dict:
         arch_version = checkpoint.get("arch_version")
         if model_type == "master":
@@ -196,6 +201,7 @@ def load_model(
             # rather than duplicated so the two scripts cannot drift.
             _check_arch_version(checkpoint_path, arch_version, config.fusion_mode)
             head_strides = _resolve_head_strides(checkpoint, config.fusion_mode)
+            fusion_pos_encoding = _resolve_fusion_pos_encoding(checkpoint, config)
         state_dict = checkpoint["model_state_dict"]
         logger.info(
             "Loaded checkpoint dict (epoch=%s, best_map50=%s)",
@@ -214,6 +220,7 @@ def load_model(
             head_strides=head_strides,
             in_channels=config.in_channels,
             fusion_mode=config.fusion_mode,
+            fusion_pos_encoding=fusion_pos_encoding,
         )
         strides = list(model.head_strides)
     else:

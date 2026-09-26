@@ -46,6 +46,7 @@ from src.training.fusion_modes import (
     FUSION_MODE_CROSS_ATTENTION,
     accepted_arch_versions,
     fusion_mode_for_arch_version,
+    fusion_pos_encoding_from_checkpoint,
 )
 from src.training.loop import Trainer
 from src.training.strides import (
@@ -166,11 +167,32 @@ def _resolve_head_strides(checkpoint: dict, fusion_mode: str) -> list[int]:
     return resolve_from_checkpoint(checkpoint)
 
 
+def _resolve_fusion_pos_encoding(checkpoint: dict, config: TrainingConfig) -> bool:
+    """Return the `fusion_pos_encoding` to rebuild the checkpoint's
+    MasterModel with.
+
+    The encoding adds no state_dict key, so `strict=True` cannot catch a
+    mismatch — the checkpoint's recorded config is the source of truth
+    (absent -> False for checkpoints that predate the field), and a
+    disagreeing caller config is overridden with a warning rather than
+    silently evaluating a different forward pass.
+    """
+    resolved = fusion_pos_encoding_from_checkpoint(checkpoint)
+    if resolved != config.fusion_pos_encoding:
+        logger.warning(
+            "Checkpoint records fusion_pos_encoding=%s but the config says %s; "
+            "using the checkpoint's value.",
+            resolved, config.fusion_pos_encoding,
+        )
+    return resolved
+
+
 def _load_model(model_type: str, checkpoint_path: str, config: TrainingConfig, device: torch.device):
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     is_checkpoint_dict = isinstance(checkpoint, dict) and "model_state_dict" in checkpoint
 
     head_strides = None
+    fusion_pos_encoding = config.fusion_pos_encoding
     if is_checkpoint_dict:
         arch_version = checkpoint.get("arch_version")
         if model_type == "master":
@@ -184,6 +206,7 @@ def _load_model(model_type: str, checkpoint_path: str, config: TrainingConfig, d
             # can never be silently evaluated as an early-fusion one.
             _check_arch_version(checkpoint_path, arch_version, config.fusion_mode)
             head_strides = _resolve_head_strides(checkpoint, config.fusion_mode)
+            fusion_pos_encoding = _resolve_fusion_pos_encoding(checkpoint, config)
         state_dict = checkpoint["model_state_dict"]
         logger.info(
             "Loaded checkpoint (epoch=%s, best_map50=%s)",
@@ -201,6 +224,7 @@ def _load_model(model_type: str, checkpoint_path: str, config: TrainingConfig, d
             head_strides=head_strides,
             in_channels=config.in_channels,
             fusion_mode=config.fusion_mode,
+            fusion_pos_encoding=fusion_pos_encoding,
         )
     else:
         model = StudentModel(num_classes=config.num_classes)
