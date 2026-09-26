@@ -144,7 +144,16 @@ class TrainingConfig:
     class_weights: list[float] = field(default_factory=lambda: [0.5, 1.5])
 
     # Decode (src/training/decode.py::decode_detections) — see training-loop spec.
+    # `conf_threshold` is the deployment operating point: the visualizer's
+    # default and the threshold the reported precision/recall/F1/TP/FP/FN
+    # are measured at.
     conf_threshold: float = 0.25
+    # Decode threshold for AP evaluation (`Trainer.evaluate`). AP integrates
+    # the precision-recall curve over every ranked prediction, so the decode
+    # must keep low-score candidates: decoding at `conf_threshold` truncated
+    # the curve at the recall reached at 0.25 and scored AP 0.0 for any epoch
+    # whose scores all fell below it. 0.001 is the COCO/YOLO validation value.
+    eval_conf_threshold: float = 0.001
     nms_iou_threshold: float = 0.5
     nms_enabled: bool = True
     decode_per_class: bool = True
@@ -252,6 +261,13 @@ class TrainingConfig:
         # Unlike head_strides this needs no student exemption — the default
         # is valid for both model types.
         validate_fusion_mode(self.fusion_mode)
+        if not 0.0 <= self.eval_conf_threshold <= self.conf_threshold:
+            raise ValueError(
+                f"eval_conf_threshold ({self.eval_conf_threshold}) must be in "
+                f"[0, conf_threshold={self.conf_threshold}]: the precision/recall "
+                "operating point is read off the AP decode, so that decode must "
+                "keep every prediction scoring at or above conf_threshold."
+            )
         if self.model_type == "master":
             validate_strides(self.head_strides, self.assigner_level_ranges)
             # `DualFPN` builds one fusion conv per emitted level, so the

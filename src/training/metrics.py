@@ -260,12 +260,14 @@ def compute_map(
 ) -> dict:
     """Compute mAP metrics across a dataset.
 
-    AP itself (`_compute_ap_at_iou`) ranks all predictions by score and is
-    threshold-independent by construction; `score_threshold` only gates the
-    classwise precision/recall/F1/TP-FP-FN operating point, which must match
-    whatever confidence threshold the decode path used to produce
-    `pred_boxes`/`pred_scores`/`pred_labels` (training-loop spec:
-    "Configurable Confidence and NMS Thresholds").
+    AP (`_compute_ap_at_iou`) ranks the predictions it is given by score, so
+    it is only as complete as the decode that produced them: predictions
+    decoded at a threshold t yield a precision-recall curve that stops at
+    the recall reached at t, and AP 0.0 when nothing scores above t.
+    `Trainer.evaluate` therefore decodes at `eval_conf_threshold` (0.001)
+    for AP. `score_threshold` only gates the classwise
+    precision/recall/F1/TP-FP-FN operating point, read off that same list
+    (training-loop spec: "Configurable Confidence and NMS Thresholds").
 
     Args:
         pred_boxes: List of (P_i, 4) predicted boxes per image (cxcywh normalized).
@@ -276,9 +278,8 @@ def compute_map(
         num_classes: Number of classes.
         iou_threshold: IoU threshold for mAP@IoU computation.
         score_threshold: Confidence threshold for the precision/recall/F1
-            operating point. Must match the decode path's `conf_threshold`
-            (previously hardcoded to 0.25 here, independent of the caller's
-            actual decode configuration).
+            operating point (the config's `conf_threshold`). Must be at or
+            above the threshold the predictions were decoded at.
 
     Returns:
         Dict with mAP, AP, and classwise precision/recall/F1 at IoU=0.5 and
