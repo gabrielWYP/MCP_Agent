@@ -20,11 +20,51 @@ Why RGB as Query?
     we train the RGB stream to actively seek NIR information, which means
     the RGB features become richer representations of what NIR would reveal.
     This is the core of cross-modal distillation.
+
+Positional encoding (`pos_encoding=True`, opt-in):
+    RGB and NIR are pixel-aligned, so the useful correspondence is
+    positional — but attention logits depend on token content only, and the
+    trained two-stream checkpoint collapsed to near-uniform attention
+    (entropy / log(num_keys) 0.89-0.999 per stage), feeding NIR in as one
+    global vector. The flag adds a fixed 2D sinusoidal encoding of the
+    pooled token grid to the normalized query and key sequences (not to the
+    value), so logits can depend on relative position. It is computed per
+    forward and registers no parameter or buffer: the state_dict is
+    identical with the flag on or off. Default off keeps every existing
+    checkpoint bit-identical in behaviour.
+    See reports/fusion-gradient-collapse/diagnosis.md.
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+def sinusoidal_2d_position_encoding(
+    side: int, channels: int, device: torch.device | None = None
+) -> torch.Tensor:
+    """Fixed 2D sinusoidal encoding of a `side` x `side` token grid.
+
+    Half of the channels encode the row, half the column; each half is the
+    standard 1D Transformer encoding (sin/cos pairs over geometrically
+    spaced frequencies, temperature 10000) at integer positions. Rows of the
+    result follow `flatten(2)`'s row-major token order (index = y * side + x).
+
+    Returns:
+        (side * side, channels) float32 tensor with entries in [-1, 1].
+    """
+    assert channels % 4 == 0, (
+        f"channels ({channels}) must be divisible by 4 for a 2D sin/cos encoding"
+    )
+    quarter = channels // 4
+    positions = torch.arange(side, dtype=torch.float32, device=device)
+    freqs = 1.0 / (10000.0 ** (torch.arange(quarter, dtype=torch.float32, device=device) / quarter))
+    angles = positions[:, None] * freqs[None, :]                     # (side, C/4)
+    enc_1d = torch.cat([angles.sin(), angles.cos()], dim=1)           # (side, C/2)
+
+    enc_y = enc_1d[:, None, :].expand(side, side, channels // 2)      # varies along rows
+    enc_x = enc_1d[None, :, :].expand(side, side, channels // 2)      # varies along columns
+    return torch.cat([enc_y, enc_x], dim=2).reshape(side * side, channels)
 
 
 class StageAttentionFusion(nn.Module):
@@ -43,9 +83,20 @@ class StageAttentionFusion(nn.Module):
         channels (int): Number of channels at this stage (96/192/384/768).
         num_heads (int): Number of attention heads. Must divide channels evenly.
         dropout (float): Dropout on attention weights (regularization).
+        max_tokens_side (int): Pool the spatial grid to at most this side.
+        pos_encoding (bool): Add a fixed 2D sinusoidal encoding of the token
+            grid to the normalized query and key (see module docstring).
+            Adds no state_dict key.
     """
 
-    def __init__(self, channels: int, num_heads: int = 8, dropout: float = 0.1, max_tokens_side: int = 20):
+    def __init__(
+        self,
+        channels: int,
+        num_heads: int = 8,
+        dropout: float = 0.1,
+        max_tokens_side: int = 20,
+        pos_encoding: bool = False,
+    ):
         super().__init__()
 
         assert channels % num_heads == 0, (
@@ -53,6 +104,7 @@ class StageAttentionFusion(nn.Module):
         )
 
         self.max_tokens_side = max_tokens_side  # pool spatial dims to at most this size
+        self.pos_encoding = pos_encoding
 
         # Project RGB and NIR to a common attention dimension
         # We keep embed_dim == channels to preserve spatial resolution info
@@ -123,10 +175,18 @@ class StageAttentionFusion(nn.Module):
             rgb_norm = self.norm_rgb(rgb_seq_fp32)
             nir_norm = self.norm_nir(nir_seq_fp32)
 
+            # Position enters the logits only: added to Q and K, never to V,
+            # so what is transported is still pure NIR content.
+            query, key = rgb_norm, nir_norm
+            if self.pos_encoding:
+                pos = sinusoidal_2d_position_encoding(pool_size, C, device=rgb_norm.device)
+                query = query + pos
+                key = key + pos
+
             # Cross-attention: Q from RGB, K/V from NIR
             attn_out, attn_weights = self.attn(
-                query=rgb_norm,
-                key=nir_norm,
+                query=query,
+                key=key,
                 value=nir_norm,
             )
 
@@ -180,6 +240,9 @@ class CrossModalFusion(nn.Module):
         num_heads_per_stage (list[int]): Attention heads per stage.
             Defaults to [4, 8, 8, 8] — fewer heads at early stages (lower channels).
         dropout (float): Attention dropout.
+        max_tokens_side (int): Token-grid side cap, forwarded to every stage.
+        pos_encoding (bool): Positional encoding on Q/K, forwarded to every
+            stage. Adds no state_dict key.
 
     Returns (forward):
         fused_features: list of 4 fused tensors [F1, F2, F3, F4]
@@ -194,6 +257,7 @@ class CrossModalFusion(nn.Module):
         num_heads_per_stage: list[int] = None,
         dropout: float = 0.1,
         max_tokens_side: int = 20,
+        pos_encoding: bool = False,
     ):
         super().__init__()
 
@@ -210,6 +274,7 @@ class CrossModalFusion(nn.Module):
                 num_heads=heads,
                 dropout=dropout,
                 max_tokens_side=max_tokens_side,
+                pos_encoding=pos_encoding,
             )
             for ch, heads in zip(stage_channels, num_heads_per_stage)
         ])

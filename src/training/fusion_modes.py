@@ -92,3 +92,39 @@ def fusion_mode_for_arch_version(arch_version: int | None) -> str | None:
         if version == arch_version:
             return mode
     return None
+
+
+def validate_fusion_pos_encoding(fusion_pos_encoding: bool, fusion_mode: str) -> None:
+    """Raise `ValueError` unless `fusion_pos_encoding` is a bool that
+    `fusion_mode` can honour.
+
+    Strictly a bool: a YAML string like `"false"` is truthy and would
+    silently enable the encoding. True is rejected on the early path, which
+    has no cross-attention to encode position into.
+    """
+    if not isinstance(fusion_pos_encoding, bool):
+        raise ValueError(
+            f"fusion_pos_encoding must be a bool, got {fusion_pos_encoding!r} "
+            f"({type(fusion_pos_encoding).__name__})."
+        )
+    if fusion_pos_encoding and fusion_mode != FUSION_MODE_CROSS_ATTENTION:
+        raise ValueError(
+            f"fusion_pos_encoding=True requires fusion_mode="
+            f"'{FUSION_MODE_CROSS_ATTENTION}' (the only mode with "
+            f"cross-attention), got fusion_mode={fusion_mode!r}."
+        )
+
+
+def fusion_pos_encoding_from_checkpoint(checkpoint: dict) -> bool:
+    """Return the `fusion_pos_encoding` a checkpoint was trained with.
+
+    The encoding adds no state_dict key, so a checkpoint trained with it
+    loads strict into a model built without it (and vice versa) and would
+    silently run the wrong forward. The Trainer records its whole config
+    under `"config"`; that recorded value is the only trustworthy source.
+    Checkpoints written before the field existed (including the untagged
+    `checkpoints/mastermodel_mango`) record none and were trained without
+    it, so absence resolves to False.
+    """
+    config_dict = checkpoint.get("config") or {}
+    return bool(config_dict.get("fusion_pos_encoding", False))

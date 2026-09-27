@@ -17,6 +17,7 @@ from .fusion_modes import (
     DEFAULT_FUSION_MODE,
     FUSION_MODE_CROSS_ATTENTION,
     validate_fusion_mode,
+    validate_fusion_pos_encoding,
 )
 from .machine import derive_grad_accum_steps
 from .precision import validate_bf16_support, validate_precision
@@ -86,6 +87,14 @@ class TrainingConfig:
             state_dict key and are tagged with different checkpoint
             `arch_version`s (2 and 1) — see `src/training/fusion_modes.py`.
             Ignored for model_type="student".
+        fusion_pos_encoding: Add a fixed 2D sinusoidal positional encoding
+            to the cross-attention query/key (`StageAttentionFusion`).
+            Default False keeps the pre-existing behaviour. Adds no
+            state_dict key, so loaders read it back from the checkpoint's
+            recorded config (absent -> False) rather than trusting the
+            caller's config. Only valid with fusion_mode="cross_attention";
+            ignored for model_type="student". See
+            reports/fusion-gradient-collapse/diagnosis.md.
         head_strides: MasterModel FPN/head pyramid strides, finest-first.
             Default `[4, 8, 16, 32]` includes the reconnected P2 level
             (fusion-redesign D-3). The single source of truth for
@@ -224,6 +233,9 @@ class TrainingConfig:
     # "early" is the default so every existing config, checkpoint and test
     # keeps the behaviour it has today.
     fusion_mode: str = DEFAULT_FUSION_MODE
+    # Positional encoding on the cross-attention Q/K — opt-in, so every
+    # existing config and checkpoint keeps the behaviour it has today.
+    fusion_pos_encoding: bool = False
 
     # Training schedule (D-4, fusion-redesign) — MasterModel only.
     schedule: str = "end_to_end"
@@ -269,6 +281,7 @@ class TrainingConfig:
                 "keep every prediction scoring at or above conf_threshold."
             )
         if self.model_type == "master":
+            validate_fusion_pos_encoding(self.fusion_pos_encoding, self.fusion_mode)
             validate_strides(self.head_strides, self.assigner_level_ranges)
             # `DualFPN` builds one fusion conv per emitted level, so the
             # cross-attention path can honour its 3-level default or the

@@ -242,6 +242,7 @@ def main():
             head_strides=config.head_strides,
             in_channels=config.in_channels,
             fusion_mode=config.fusion_mode,
+            fusion_pos_encoding=config.fusion_pos_encoding,
         )
         params = model.count_parameters()
         print(f"Model parameters: {params['total']:,} total, {params['backbone']:,} backbone")
