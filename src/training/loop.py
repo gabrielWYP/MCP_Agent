@@ -772,8 +772,9 @@ class Trainer:
 
             B = rgb.shape[0]
             for b in range(B):
+                # AP needs the full ranked list, not just the operating point.
                 pred_boxes_b, pred_scores_b, pred_labels_b = self._decode_predictions(
-                    preds, cls_preds, b
+                    preds, cls_preds, b, conf_threshold=self.config.eval_conf_threshold
                 )
                 all_pred_boxes.append(pred_boxes_b)
                 all_pred_scores.append(pred_scores_b)
@@ -804,8 +805,13 @@ class Trainer:
         cls_preds: list[torch.Tensor],
         batch_idx: int,
         config: TrainingConfig,
+        conf_threshold: float | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Config-driven decode, usable without a full `Trainer` instance.
+
+        `conf_threshold` defaults to `config.conf_threshold` (the operating
+        point); `evaluate()` passes `config.eval_conf_threshold` instead so AP
+        sees the full ranked prediction list.
 
         Thin wrapper over `decode.decode_detections` (D3) — the single
         source of truth for decode semantics shared with
@@ -821,7 +827,7 @@ class Trainer:
             num_classes=config.num_classes,
             image_size=config.image_size,
             strides=tuple(resolve_active_strides(config)),
-            conf_threshold=config.conf_threshold,
+            conf_threshold=config.conf_threshold if conf_threshold is None else conf_threshold,
             nms_iou_threshold=config.nms_iou_threshold,
             nms_enabled=config.nms_enabled,
             per_class_candidates=config.decode_per_class,
@@ -835,6 +841,7 @@ class Trainer:
         preds: list[torch.Tensor],
         cls_preds: list[torch.Tensor],
         batch_idx: int,
+        conf_threshold: float | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Decode model predictions for a single image in the batch.
 
@@ -843,7 +850,9 @@ class Trainer:
             pred_scores: (P,) confidence scores.
             pred_labels: (P,) class IDs.
         """
-        return self._decode_predictions_static(preds, cls_preds, batch_idx, self.config)
+        return self._decode_predictions_static(
+            preds, cls_preds, batch_idx, self.config, conf_threshold=conf_threshold
+        )
 
     def _save_checkpoint(
         self,

@@ -118,6 +118,11 @@ class MasterModel(nn.Module):
             `fusion_mode="cross_attention"` only.
         fpn_dropout (float): `DualFPN` per-level fusion dropout —
             `fusion_mode="cross_attention"` only.
+        fusion_pos_encoding (bool): Add a fixed 2D sinusoidal positional
+            encoding to the cross-attention query/key (see
+            `src/models/master/fusion.py`). Default False keeps the
+            pre-existing behaviour; adds no state_dict key either way.
+            `fusion_mode="cross_attention"` only — True raises on "early".
     """
 
     # ConvNeXt stage channels (identical for Tiny and Small)
@@ -134,6 +139,7 @@ class MasterModel(nn.Module):
         fusion_mode: str = DEFAULT_FUSION_MODE,
         fusion_dropout: float = 0.1,
         fpn_dropout: float = 0.1,
+        fusion_pos_encoding: bool = False,
     ):
         super().__init__()
 
@@ -146,6 +152,13 @@ class MasterModel(nn.Module):
         self.in_channels = in_channels
 
         if fusion_mode == FUSION_MODE_EARLY:
+            if fusion_pos_encoding:
+                raise ValueError(
+                    "fusion_pos_encoding=True encodes position into the "
+                    f"cross-attention fusion, which only fusion_mode="
+                    f"'{FUSION_MODE_CROSS_ATTENTION}' has; fusion_mode="
+                    f"'{FUSION_MODE_EARLY}' would silently ignore it."
+                )
             # --- 1. Single-stream early-fusion backbone ---
             self.backbone = EarlyFusionBackbone(
                 pretrained=pretrained_backbone,
@@ -175,6 +188,7 @@ class MasterModel(nn.Module):
             self.fusion = CrossModalFusion(
                 stage_channels=self.STAGE_CHANNELS,
                 dropout=fusion_dropout,
+                pos_encoding=fusion_pos_encoding,
             )
             # --- 3. Dual FPN neck (two FPNs + per-level fusion) ---
             self.neck = DualFPN(
