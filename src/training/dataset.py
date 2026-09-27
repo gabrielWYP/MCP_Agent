@@ -71,6 +71,23 @@ def letterbox(
     return padded, scale, pad_x, pad_y
 
 
+def normalize_rgb(image: np.ndarray) -> torch.Tensor:
+    """Normalize an RGB image with ImageNet stats and convert it to CHW.
+
+    Module-level so inference/export code (src/export/) reuses the exact
+    eval-time normalization instead of re-deriving it.
+
+    Args:
+        image: (H, W, 3) uint8 RGB image.
+
+    Returns:
+        Tensor[3, H, W] float32 normalized.
+    """
+    img = image.astype(np.float32) / 255.0
+    img = (img - np.array(IMAGENET_MEAN)) / np.array(IMAGENET_STD)
+    return torch.from_numpy(img.transpose(2, 0, 1)).float()
+
+
 def _scale_bboxes_letterbox(
     bboxes: np.ndarray,
     scale: float,
@@ -515,9 +532,7 @@ class YOLODataset(Dataset):
         Returns:
             Tensor[3, H, W] float32 normalized.
         """
-        img = image.astype(np.float32) / 255.0
-        img = (img - np.array(IMAGENET_MEAN)) / np.array(IMAGENET_STD)
-        return torch.from_numpy(img.transpose(2, 0, 1)).float()
+        return normalize_rgb(image)
 
     def _normalize_nir(self, image: np.ndarray) -> torch.Tensor:
         """Normalize NIR grayscale image with dataset stats.

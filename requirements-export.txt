@@ -1,0 +1,26 @@
+# Mobile export toolchain for the RGB-only student (scripts/export_student.py,
+# scripts/check_export_parity.py). Lives in its own venv because litert-torch
+# (the renamed ai-edge-torch) pins its own torch range (torch<2.14).
+#
+#   uv venv .venv-export --python 3.12
+#   uv pip install --python .venv-export/bin/python \
+#       --index-strategy unsafe-best-match -r requirements-export.txt
+#
+# CPU-only torch wheels: the export venv never needs CUDA.
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+litert-torch==0.9.4          # PyTorch -> .tflite converter (formerly ai-edge-torch)
+litert-converter==0.4.0
+ai-edge-litert==2.2.0        # LiteRT interpreter used by the parity check
+ai-edge-quantizer==0.9.0     # pulled by litert-torch; needed for the future INT8 step
+torch==2.13.0+cpu
+torchvision==0.28.0+cpu      # src/training/decode.py uses torchvision.ops.batched_nms
+numpy==2.5.3
+
+# Minimal repo deps imported by src/export (StudentModel, dataset letterbox /
+# normalization, decode, TrainingConfig).
+albumentations==2.0.8
+opencv-python-headless==5.0.0.93
+pyyaml==6.0.3
+
+pytest==9.1.1
