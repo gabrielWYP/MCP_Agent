@@ -175,14 +175,14 @@ P_i (256ch)
 
 ### 4. `ProjectionLayers` — `distill_projections.py`
 
-Proyecciones 1×1 aprendibles para alinear dimensiones maestro → estudiante en feature-level distillation. `forward()` valida explícitamente `len(teacher_features) == self.num_levels` — un mismatch (p. ej. el maestro emitiendo 4 niveles contra un preset de 3) levanta un error identificando ambos conteos en vez de truncar el `zip` en silencio.
+Adaptadores 1×1 aprendibles (estilo FitNets) que proyectan las features del **estudiante → espacio de canales del maestro**; el target del MSE es la feature congelada del maestro (bajo `no_grad`, detached). Los adaptadores pertenecen a `KDTrainer` (`kd_adapters`), no al `StudentModel`: no aparecen en su `state_dict` y se guardan en el checkpoint bajo `kd_adapters_state_dict`. `forward()` valida explícitamente `len(student_features) == self.num_levels` — un mismatch (p. ej. el maestro emitiendo 4 niveles contra un preset de 3) levanta un error identificando ambos conteos en vez de truncar el `zip` en silencio.
 
 Presets incluidos (sin cambios de canales — fusion-redesign W7):
 - `fpn_projections()` — 3 niveles, para distilación a nivel de FPN
 - `backbone_projections()` — `[384, 768]` (S3, S4), para distilación a nivel de backbone
 - `head_projections()` — 3 niveles, para distilación a nivel de head
 
-`KDTrainer` selecciona los 3 niveles del maestro que coinciden **por stride** (no por posición) con los del estudiante antes de pasarlos a estos presets — ver `src/training/strides.select_by_strides`.
+`KDTrainer` selecciona los 3 niveles del maestro que coinciden **por stride** (no por posición) con los del estudiante antes de usarlos como target — ver `src/training/strides.select_by_strides`.
 
 ---
 

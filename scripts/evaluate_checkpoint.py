@@ -39,7 +39,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.models.master.master_model import MasterModel
-from src.models.student.student_model import StudentModel
+from src.models.student.student_model import StudentModel, strip_legacy_kd_adapter_keys
 from src.training.config import TrainingConfig
 from src.training.dataset import YOLODataset, build_dataloader, collate_fn
 from src.training.fusion_modes import (
@@ -204,6 +204,9 @@ def _load_model(model_type: str, checkpoint_path: str, config: TrainingConfig, d
         )
     else:
         model = StudentModel(num_classes=config.num_classes)
+        # Pre-fix KD checkpoints stored the training-only adapters inside
+        # `model_state_dict`; they are not part of the student.
+        state_dict = strip_legacy_kd_adapter_keys(state_dict)
 
     model.load_state_dict(state_dict, strict=True)
     model.to(device)

@@ -153,73 +153,29 @@ def test_forward_7keys(student_model, batch_input):
 
 
 def test_projection_compatibility(student_model, batch_input):
-    """All distill outputs pass through ProjectionLayers without shape errors."""
+    """All student distill outputs pass through the student → teacher KD
+    adapters, landing in the teacher's channel space at unchanged spatial
+    size (FitNets direction: the frozen teacher feature is the target)."""
     with torch.no_grad():
         out = student_model(batch_input)
 
-    # Backbone projections: student_channels = [128, 256]
-    bb_proj = backbone_projections()
-    bb_proj.eval()
-    # Create dummy teacher features with expected channels [384, 768]
-    teacher_bb = [
-        torch.randn(BATCH_SIZE, 384, 40, 40),
-        torch.randn(BATCH_SIZE, 768, 20, 20),
+    # (adapter, student distill key, teacher channels per level)
+    cases = [
+        (backbone_projections(), "distill_backbone", [384, 768]),
+        (fpn_projections(), "distill_fpn", [256, 256, 256]),
+        (head_projections(), "distill_head_cls", [256, 256, 256]),
+        (head_projections(), "distill_head_reg", [256, 256, 256]),
     ]
-    with torch.no_grad():
-        projected_bb = bb_proj(teacher_bb)
-    for i, (proj, student_feat) in enumerate(
-        zip(projected_bb, out["distill_backbone"])
-    ):
-        assert proj.shape == student_feat.shape, (
-            f"backbone proj[{i}]: teacher proj {tuple(proj.shape)} "
-            f"!= student {tuple(student_feat.shape)}"
-        )
-
-    # FPN projections: student_channels = [128, 256, 256]
-    fpn_proj = fpn_projections()
-    fpn_proj.eval()
-    teacher_fpn = [
-        torch.randn(BATCH_SIZE, 256, 80, 80),
-        torch.randn(BATCH_SIZE, 256, 40, 40),
-        torch.randn(BATCH_SIZE, 256, 20, 20),
-    ]
-    with torch.no_grad():
-        projected_fpn = fpn_proj(teacher_fpn)
-    for i, (proj, student_feat) in enumerate(
-        zip(projected_fpn, out["distill_fpn"])
-    ):
-        assert proj.shape == student_feat.shape, (
-            f"fpn proj[{i}]: teacher proj {tuple(proj.shape)} "
-            f"!= student {tuple(student_feat.shape)}"
-        )
-
-    # Head projections: student_channels = [64, 128, 256]
-    head_proj = head_projections()
-    head_proj.eval()
-    teacher_head = [
-        torch.randn(BATCH_SIZE, 256, 80, 80),
-        torch.randn(BATCH_SIZE, 256, 40, 40),
-        torch.randn(BATCH_SIZE, 256, 20, 20),
-    ]
-    with torch.no_grad():
-        projected_head_cls = head_proj(teacher_head)
-        projected_head_reg = head_proj(teacher_head)
-    for i, (proj_cls, proj_reg, student_cls, student_reg) in enumerate(
-        zip(
-            projected_head_cls,
-            projected_head_reg,
-            out["distill_head_cls"],
-            out["distill_head_reg"],
-        )
-    ):
-        assert proj_cls.shape == student_cls.shape, (
-            f"head cls proj[{i}]: teacher proj {tuple(proj_cls.shape)} "
-            f"!= student {tuple(student_cls.shape)}"
-        )
-        assert proj_reg.shape == student_reg.shape, (
-            f"head reg proj[{i}]: teacher proj {tuple(proj_reg.shape)} "
-            f"!= student {tuple(student_reg.shape)}"
-        )
+    for adapter, key, teacher_channels in cases:
+        adapter.eval()
+        with torch.no_grad():
+            adapted = adapter(out[key])
+        for i, (a, s_feat, t_ch) in enumerate(zip(adapted, out[key], teacher_channels)):
+            expected = (s_feat.shape[0], t_ch, *s_feat.shape[2:])
+            assert tuple(a.shape) == expected, (
+                f"{key}[{i}]: adapted student {tuple(a.shape)} != "
+                f"teacher-space shape {expected}"
+            )
 
     print("  Projection compatibility: all 3 levels verified")
 

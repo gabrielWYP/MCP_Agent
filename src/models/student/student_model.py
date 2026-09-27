@@ -19,7 +19,8 @@ Pipeline:
         ↓
     7-key output dict
 
-Channel contract (all dims locked to ProjectionLayers defaults):
+Channel contract (all dims locked to the KD adapter presets' input side;
+the adapters themselves are owned by `KDTrainer`, not by this model):
     distill_backbone:  [128, 256]       → backbone_projections student_channels
     distill_fpn:       [128, 256, 256]  → fpn_projections student_channels
     distill_head_cls:  [64, 128, 256]   → head_projections student_channels
@@ -35,6 +36,27 @@ from torch import Tensor
 from src.models.student.backbone import CSPDarknetNano
 from src.models.student.neck import PANet
 from src.models.student.head import YOLOStudentHead, NUM_CLASSES
+
+# Prefix of the training-only KD adapters that `KDTrainer` used to attach to
+# the student as submodules (`kd_proj_backbone`, `kd_proj_fpn`,
+# `kd_proj_head_cls`, `kd_proj_head_reg`). KD checkpoints written before the
+# adapters moved to the trainer carry them inside `model_state_dict`; they
+# are not part of the student architecture and never needed for inference.
+LEGACY_KD_ADAPTER_PREFIX = "kd_proj_"
+
+
+def strip_legacy_kd_adapter_keys(state_dict: dict[str, Tensor]) -> dict[str, Tensor]:
+    """Return `state_dict` without legacy `kd_proj_*` KD adapter entries.
+
+    Lets an old KD checkpoint load into a bare `StudentModel` with
+    `strict=True` — every remaining key is still checked. A no-op for any
+    checkpoint written since the adapters became trainer-owned.
+    """
+    return {
+        key: value
+        for key, value in state_dict.items()
+        if not key.startswith(LEGACY_KD_ADAPTER_PREFIX)
+    }
 
 
 class StudentModel(nn.Module):

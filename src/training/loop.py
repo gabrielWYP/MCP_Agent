@@ -284,16 +284,17 @@ class Trainer:
 
         # Optimizer
         if discriminative:
-            optimizer = AdamW(
-                self._discriminative_param_groups(lr),
-                weight_decay=self.config.weight_decay,
-            )
+            param_groups = self._discriminative_param_groups(lr)
         else:
-            optimizer = AdamW(
-                filter(lambda p: p.requires_grad, self.model.parameters()),
-                lr=lr,
-                weight_decay=self.config.weight_decay,
-            )
+            param_groups = [
+                {"params": [p for p in self.model.parameters() if p.requires_grad], "lr": lr}
+            ]
+        param_groups += self._auxiliary_param_groups(lr)
+        optimizer = AdamW(
+            param_groups,
+            lr=lr,
+            weight_decay=self.config.weight_decay,
+        )
 
         # Scheduler: warmup + cosine annealing
         warmup_epochs = self.config.warmup_epochs
@@ -445,6 +446,22 @@ class Trainer:
             if self.patience_counter >= self.config.patience:
                 print(f"  Early stopping at epoch {epoch} (patience={self.config.patience})")
                 break
+
+    def _auxiliary_param_groups(self, lr: float) -> list[dict]:
+        """Extra optimizer parameter groups for trainable modules that are
+        NOT part of `self.model` (and therefore not of its state_dict).
+
+        Empty for the base trainer. `KDTrainer` overrides it to add its
+        training-only distillation adapters, which must be optimized
+        alongside the student but must never be saved into (or required
+        by) the student's `model_state_dict`.
+        """
+        return []
+
+    def _auxiliary_checkpoint_state(self) -> dict:
+        """Extra top-level checkpoint entries for modules outside
+        `self.model` (see `_auxiliary_param_groups`). Empty by default."""
+        return {}
 
     def _discriminative_param_groups(self, lr: float) -> list[dict]:
         """Two-group AdamW parameter groups for end-to-end MasterModel
@@ -862,6 +879,7 @@ class Trainer:
             "config": self.config.__dict__,
             "experiment_sha256": self.experiment_sha256,
         }
+        checkpoint.update(self._auxiliary_checkpoint_state())
         if train_metrics is not None:
             checkpoint["oom_skipped"] = train_metrics.get("oom_skipped")
             checkpoint["nan_skipped"] = train_metrics.get("nan_skipped")

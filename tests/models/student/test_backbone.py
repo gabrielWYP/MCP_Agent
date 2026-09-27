@@ -103,14 +103,14 @@ def test_backbone_projection_compatibility():
     x = torch.randn(BATCH_SIZE, 3, INPUT_H, INPUT_W)
     with torch.no_grad():
         _, distill = backbone(x)
-        # backbone_projections expects teacher features [S3, S4]
-        # with channels [384, 768]. We verify the student output channels
-        # match the projection's expected student_channels by checking
-        # the projection layer output shapes would be compatible.
-        # Here we just verify the student channels match the contract.
+        # backbone_projections is a student → teacher adapter: it consumes
+        # the student's [S3, S4] ([128, 256] ch) and emits the teacher's
+        # S3/S4 channel widths ([384, 768]).
         s3, s4 = distill
         assert s3.shape[1] == 128, f"S3 must be 128ch for backbone_projections"
         assert s4.shape[1] == 256, f"S4 must be 256ch for backbone_projections"
+        adapted = proj(list(distill))
+        assert [a.shape[1] for a in adapted] == [384, 768]
 
     print("  Projection compatibility: OK")
 

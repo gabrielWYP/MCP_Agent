@@ -1,8 +1,11 @@
 """
 Knowledge Distillation loss — per-level weighted MSE.
 
-Computes MSE between projected teacher features and student features
-at four distillation levels: backbone, fpn, head_cls, head_reg.
+Computes MSE between adapted student features (student → teacher channels,
+FitNets-style) and the frozen teacher features at four distillation levels:
+backbone, fpn, head_cls, head_reg. The teacher side is the regression
+target and is always detached, so gradients flow only into the student and
+its adapters.
 
 Each level contains a list of tensors (one per sub-level / scale).
 The loss averages MSE across all sub-levels within each group,
@@ -46,9 +49,10 @@ class KDLoss(nn.Module):
 
         Args:
             teacher_feats: Dict with keys {backbone, fpn, head_cls, head_reg},
-                each mapping to a list of tensors from the projected teacher.
+                each mapping to a list of frozen teacher tensors (the
+                regression targets; detached here).
             student_feats: Dict with same keys, each mapping to a list of
-                tensors from the student model.
+                adapted student tensors (already in teacher channel space).
 
         Returns:
             total_loss: Scalar weighted sum of per-level MSE losses.

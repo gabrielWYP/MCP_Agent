@@ -7,8 +7,8 @@ The teacher (`MasterModel`) defaults to 4 levels (`head_strides=[4, 8, 16,
 `distill_fpn`/`distill_head_cls`/`distill_head_reg` against the student's
 3-level projection presets would silently distill P2/P3/P4 into student
 P3/P4/P5. This test builds a real 4-level teacher and a real student and
-asserts the projections receive exactly the P3/P4/P5-shaped features, not
-P2/P3/P4.
+asserts the KD loss receives exactly the P3/P4/P5-shaped teacher features as
+its regression targets, not P2/P3/P4.
 """
 
 import sys
@@ -44,7 +44,7 @@ class _FakeLoader:
         return (_fake_batch(1) for _ in range(self.n_batches))
 
 
-def test_kd_projections_receive_p3_p4_p5_shapes_not_p2_p3_p4(tmp_path):
+def test_kd_targets_are_p3_p4_p5_shapes_not_p2_p3_p4(tmp_path):
     # 4-level teacher (default head_strides), matching the shipped default.
     teacher = MasterModel(
         num_classes=_NUM_CLASSES, pretrained_backbone=False, backbone_variant="tiny",
@@ -74,13 +74,13 @@ def test_kd_projections_receive_p3_p4_p5_shapes_not_p2_p3_p4(tmp_path):
     expected_fpn_shapes = [_IMAGE_SIZE // s for s in (8, 16, 32)]
 
     captured = {}
-    real_fpn_forward = trainer.model.kd_proj_fpn.forward
+    real_kd_forward = trainer.kd_criterion.forward
 
-    def _capturing_fpn_forward(teacher_features):
-        captured["fpn_spatial_sizes"] = [f.shape[-1] for f in teacher_features]
-        return real_fpn_forward(teacher_features)
+    def _capturing_kd_forward(teacher_feats, student_feats):
+        captured["fpn_spatial_sizes"] = [f.shape[-1] for f in teacher_feats["fpn"]]
+        return real_kd_forward(teacher_feats, student_feats)
 
-    trainer.model.kd_proj_fpn.forward = _capturing_fpn_forward
+    trainer.kd_criterion.forward = _capturing_kd_forward
 
     optimizer = torch.optim.AdamW(trainer.model.parameters(), lr=1e-3)
     trainer._train_epoch(optimizer, epoch=1, phase=1)
