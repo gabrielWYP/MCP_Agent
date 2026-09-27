@@ -27,6 +27,12 @@ from .strides import (
     validate_strides,
 )
 
+# Class index of the damage class in every label file ([mango, damage]).
+DAMAGE_CLASS_ID = 1
+# Validation metrics `selection_metric` may name. Both are AP@0.5 on the val
+# split: "map50" is the two-class mean, "damage_ap50" is class DAMAGE_CLASS_ID.
+SELECTION_METRICS = frozenset({"map50", "damage_ap50"})
+
 
 @dataclass
 class TrainingConfig:
@@ -186,6 +192,15 @@ class TrainingConfig:
     warmup_epochs: int = 3
     patience: int = 15
 
+    # Checkpoint selection + early stopping metric (see SELECTION_METRICS).
+    # "map50" is the unweighted two-class mean every recorded checkpoint was
+    # selected on, kept as the default so existing configs are unchanged.
+    # "damage_ap50" selects on the damage-class AP50 alone: under "map50" the
+    # mango AP (~0.9) dominates the mean, so the epoch with the best damage AP
+    # can go unsaved (twostream seed 42: val damage AP50 0.2077 at epoch 35,
+    # never written to best_model.pt).
+    selection_metric: str = "map50"
+
     # Logging
     log_interval: int = 10
     save_interval: int = 5
@@ -273,6 +288,11 @@ class TrainingConfig:
         # Unlike head_strides this needs no student exemption — the default
         # is valid for both model types.
         validate_fusion_mode(self.fusion_mode)
+        if self.selection_metric not in SELECTION_METRICS:
+            raise ValueError(
+                f"Invalid selection_metric '{self.selection_metric}'. "
+                f"Must be one of: {sorted(SELECTION_METRICS)}"
+            )
         if not 0.0 <= self.eval_conf_threshold <= self.conf_threshold:
             raise ValueError(
                 f"eval_conf_threshold ({self.eval_conf_threshold}) must be in "

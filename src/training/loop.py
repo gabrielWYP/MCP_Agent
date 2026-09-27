@@ -33,7 +33,7 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, LambdaLR
 from torch.utils.data import DataLoader
 
-from .config import TrainingConfig
+from .config import DAMAGE_CLASS_ID, TrainingConfig
 from .decode import decode_detections
 from .loss import YOLOv8Loss
 from .fusion_modes import DEFAULT_FUSION_MODE, arch_version_for_mode
@@ -128,6 +128,9 @@ class Trainer:
         # Tracking
         self.loss_history = LossHistory()
         self.best_map50 = 0.0
+        # Best value of `config.selection_metric` so far. -inf so the first
+        # epoch always saves, even at score 0.0; ties keep the earlier epoch.
+        self.best_score = float("-inf")
         self.patience_counter = 0
         self.global_step = 0
         self.history_epoch = 0
@@ -427,12 +430,16 @@ class Trainer:
                         if name.startswith("grad_norm_"):
                             self.writer.add_scalar(f"Phase{phase}/{name}", value, epoch)
 
-            # Checkpoint: best mAP (use >= to save on first epoch even if mAP=0)
-            if map50 >= self.best_map50:
+            # Checkpoint + early stopping on `config.selection_metric`.
+            # `best_map50` stays the mAP@0.5 of the saved checkpoint, whatever
+            # metric selected it, since run artifacts are named after it.
+            score = self._selection_score(val_metrics)
+            if score > self.best_score:
+                self.best_score = score
                 self.best_map50 = map50
                 self.patience_counter = 0
                 self._save_checkpoint(epoch, phase, val_metrics, "best_model.pt", train_metrics=train_metrics)
-                print(f"    ✓ New best mAP@0.5: {map50:.4f}")
+                print(f"    ✓ New best {self.config.selection_metric}: {score:.4f}")
             else:
                 self.patience_counter += 1
 
@@ -462,6 +469,12 @@ class Trainer:
         """Extra top-level checkpoint entries for modules outside
         `self.model` (see `_auxiliary_param_groups`). Empty by default."""
         return {}
+
+    def _selection_score(self, val_metrics: dict) -> float:
+        """Value of `config.selection_metric` in one epoch's val metrics."""
+        if self.config.selection_metric == "damage_ap50":
+            return val_metrics.get("per_class_ap_50", {}).get(DAMAGE_CLASS_ID, 0.0)
+        return val_metrics.get("map50", 0.0)
 
     def _discriminative_param_groups(self, lr: float) -> list[dict]:
         """Two-group AdamW parameter groups for end-to-end MasterModel
@@ -876,6 +889,8 @@ class Trainer:
             "model_state_dict": self.model.state_dict(),
             "metrics": metrics,
             "best_map50": self.best_map50,
+            "selection_metric": self.config.selection_metric,
+            "best_score": self.best_score,
             "config": self.config.__dict__,
             "experiment_sha256": self.experiment_sha256,
         }

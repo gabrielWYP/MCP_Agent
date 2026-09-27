@@ -9,6 +9,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
 from pathlib import Path
 
@@ -63,6 +64,13 @@ def parse_args() -> argparse.Namespace:
 
 def main():
     args = parse_args()
+
+    # Without a root handler, INFO records from library modules are dropped,
+    # including the per-sample augmentation bbox-drop summaries
+    # (src/training/augmentations.py) that show how many damage boxes the
+    # spatial transforms discard. Configured here, not at import time, so
+    # importing this module never reconfigures a caller's logging.
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
     # Load config
     config = KDConfig.from_yaml(args.config)
