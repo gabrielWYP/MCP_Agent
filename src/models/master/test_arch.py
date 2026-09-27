@@ -54,9 +54,17 @@ print('  reg_preds:', [tuple(p.shape) for p in out['reg_preds']])
 print('  distill_cls:', [tuple(f.shape) for f in out['distill_cls']])
 print('  distill_reg:', [tuple(f.shape) for f in out['distill_reg']])
 
-print('Testing distill projections (backbone: teacher S3,S4 -> student)...')
+print('Testing distill projections (backbone: student -> teacher S3,S4)...')
 proj = backbone_projections().to(device)
-projected = proj(features[2:])  # S3, S4 — channels [384, 768], unchanged by the redesign
+teacher_feats = features[2:]  # S3, S4 — channels [384, 768], unchanged by the redesign
+student_feats = [
+    torch.randn(t.shape[0], s_ch, *t.shape[2:], device=device)
+    for t, s_ch in zip(teacher_feats, [128, 256])  # YOLO Nano intermediates
+]
+projected = proj(student_feats)
+assert [p.shape for p in projected] == [t.shape for t in teacher_feats], (
+    "Adapters must map student features onto the teacher's S3/S4 shapes"
+)
 print('  Projected:', [tuple(p.shape) for p in projected])
 
 # ── Modelo completo ──────────────────────────────────────────────────
