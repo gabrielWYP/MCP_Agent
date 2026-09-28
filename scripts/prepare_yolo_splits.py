@@ -5,6 +5,13 @@ The current training pipeline needs a stable train/val/test assignment before
 running Florence-2 and before converting Label Studio NIR boxes. Both downstream
 steps write labels into split-specific directories, so this script creates the
 split map and empty YOLO files up front.
+
+Append mode (``--append-export``) adds the images of a NEW Label Studio export
+to an existing ``--manifest`` without moving any stem that is already assigned:
+only the new stems are shuffled (with the same seed and ratios), the merged
+manifest is rewritten, and empty label files for the new stems alone are created
+under the staging directory ``--append-labels-dir``. Append mode never prunes or
+rewrites anything under ``--labels-dir`` and never writes Label Studio tasks.
 """
 
 from __future__ import annotations
@@ -126,6 +133,86 @@ def write_empty_label_files(split_map: dict[str, list[str]], labels_dir: Path) -
         for stem in stems:
             label_path = split_dir / f"{stem}.txt"
             label_path.touch(exist_ok=True)
+
+
+def append_to_split_map(
+    existing: dict[str, list[str]],
+    new_stems: list[str],
+    config: SplitConfig,
+) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
+    """Assign ``new_stems`` to splits without moving any existing stem.
+
+    Only the new stems are shuffled, using ``assign_splits`` on their sorted
+    list, so the result is deterministic for a given seed and independent of
+    the existing manifest. Existing stems always keep their split.
+
+    Args:
+        existing: Current split manifest (split -> stems).
+        new_stems: Stems to add. Must be non-empty and disjoint from every
+            split of ``existing``.
+        config: Ratios and seed used to split the new stems.
+
+    Returns:
+        A ``(merged, added)`` tuple. ``merged`` is the full manifest with the
+        new stems included; ``added`` holds only the new stems per split. Both
+        always contain every key in ``SPLITS`` with sorted lists.
+
+    Raises:
+        ValueError: If ``new_stems`` is empty, if ``existing`` has keys other
+            than ``SPLITS``, or if any new stem already appears in ``existing``.
+    """
+    if not new_stems:
+        raise ValueError("No new stems to append.")
+
+    unknown_splits = sorted(set(existing) - set(SPLITS))
+    if unknown_splits:
+        raise ValueError(f"Existing manifest has unknown split key(s): {unknown_splits}")
+
+    already_assigned = {
+        stem: split for split in SPLITS for stem in existing.get(split, [])
+    }
+    overlap = sorted(set(new_stems) & set(already_assigned))
+    if overlap:
+        details = [f"{stem} ({already_assigned[stem]})" for stem in overlap]
+        raise ValueError(
+            f"{len(overlap)} new stem(s) already present in the existing manifest: {details}"
+        )
+
+    assigned = assign_splits(sorted(set(new_stems)), config)
+    added = {split: sorted(assigned.get(split, [])) for split in SPLITS}
+    merged = {
+        split: sorted(list(existing.get(split, [])) + added[split]) for split in SPLITS
+    }
+    return merged, added
+
+
+def write_new_label_files(added: dict[str, list[str]], labels_dir: Path) -> None:
+    """Create empty YOLO label files for newly appended stems only.
+
+    Never deletes, prunes or overwrites anything. All target paths are checked
+    before any file is created, so a collision leaves the directory untouched.
+
+    Args:
+        added: Split -> stems to create ``labels_dir/<split>/<stem>.txt`` for.
+        labels_dir: Root directory (typically a staging directory).
+
+    Raises:
+        FileExistsError: If any target label file already exists.
+    """
+    targets = [
+        labels_dir / split / f"{stem}.txt"
+        for split, stems in added.items()
+        for stem in stems
+    ]
+    existing = sorted(str(path) for path in targets if path.exists())
+    if existing:
+        raise FileExistsError(
+            f"Refusing to overwrite {len(existing)} existing label file(s): {existing}"
+        )
+
+    for path in targets:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch(exist_ok=False)
 
 
 @dataclass(frozen=True)
@@ -596,7 +683,33 @@ def parse_args() -> argparse.Namespace:
             "(default: reports/damage-map-audit/w0-reconcile.md)."
         ),
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--append-export",
+        default=None,
+        help=(
+            "Append mode: Label Studio export JSON containing ONLY the new images. "
+            "Their paired stems are split with the current ratios/seed and merged into "
+            "the existing --manifest; existing stems never move. Does not touch "
+            "--labels-dir or --label-studio-tasks. Requires --append-labels-dir."
+        ),
+    )
+    parser.add_argument(
+        "--append-labels-dir",
+        default=None,
+        help=(
+            "With --append-export: staging directory where empty label files are "
+            "created for the new stems only (<dir>/<split>/<stem>.txt). Never "
+            "overwrites existing files."
+        ),
+    )
+    args = parser.parse_args()
+    if args.append_export and args.reconcile:
+        parser.error("--append-export and --reconcile are mutually exclusive.")
+    if args.append_export and not args.append_labels_dir:
+        parser.error("--append-labels-dir is required when --append-export is given.")
+    if args.append_labels_dir and not args.append_export:
+        parser.error("--append-labels-dir requires --append-export.")
+    return args
 
 
 def _run_reconcile(args: argparse.Namespace) -> int:
@@ -671,6 +784,71 @@ def _run_reconcile(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_append(args: argparse.Namespace) -> int:
+    """Handle ``--append-export`` mode. Returns a process exit code.
+
+    Never touches ``--labels-dir`` or ``--label-studio-tasks``. Label files are
+    created in the staging directory before the manifest is rewritten, so a
+    collision aborts without modifying the manifest.
+    """
+    manifest_path = Path(args.manifest)
+    export_path = Path(args.append_export)
+    staging_dir = Path(args.append_labels_dir)
+
+    if not manifest_path.exists():
+        logger.error("Manifest not found: %s", manifest_path)
+        return 1
+    if not export_path.exists():
+        logger.error("Append export not found: %s", export_path)
+        return 1
+
+    existing = json.loads(manifest_path.read_text())
+
+    export_stems = load_reviewed_rgb_stems(export_path)
+    paired_stems = set(discover_paired_rgb_stems(Path(args.rgb_dir), Path(args.nir_dir)))
+    unpaired = sorted(export_stems - paired_stems)
+    if unpaired:
+        logger.warning(
+            "Excluding %d export stem(s) without an RGB/NIR pair on disk: %s",
+            len(unpaired),
+            unpaired,
+        )
+    new_stems = sorted(export_stems & paired_stems)
+
+    split_config = SplitConfig(
+        train_ratio=args.train_ratio,
+        val_ratio=args.val_ratio,
+        test_ratio=args.test_ratio,
+        seed=args.seed,
+    )
+    try:
+        merged, added = append_to_split_map(existing, new_stems, split_config)
+        write_new_label_files(added, staging_dir)
+    except (ValueError, FileExistsError) as error:
+        logger.error("Append aborted, manifest unchanged: %s", error)
+        return 1
+
+    write_split_manifest(merged, manifest_path)
+
+    logger.info(
+        "Appended %d stem(s): train=+%d val=+%d test=+%d",
+        len(new_stems),
+        len(added["train"]),
+        len(added["val"]),
+        len(added["test"]),
+    )
+    logger.info(
+        "Resulting splits: train=%d val=%d test=%d total=%d",
+        len(merged["train"]),
+        len(merged["val"]),
+        len(merged["test"]),
+        sum(len(merged[split]) for split in SPLITS),
+    )
+    logger.info("Split manifest: %s", manifest_path)
+    logger.info("Staged label files: %s", staging_dir)
+    return 0
+
+
 def main() -> int:
     """Run split preparation."""
     args = parse_args()
@@ -680,6 +858,8 @@ def main() -> int:
 
     if args.reconcile:
         return _run_reconcile(args)
+    if args.append_export:
+        return _run_append(args)
 
     stems = discover_paired_rgb_stems(rgb_dir, nir_dir)
     if args.reviewed_export:
