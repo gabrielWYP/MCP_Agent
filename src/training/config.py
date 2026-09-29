@@ -13,12 +13,19 @@ from typing import Any
 
 import yaml
 
+from src.models.master.norms import (
+    DEFAULT_GN_GROUPS,
+    DEFAULT_NECK_HEAD_NORM,
+    validate_neck_head_norm,
+)
+
 from .fusion_modes import (
     DEFAULT_FUSION_MODE,
     FUSION_MODE_CROSS_ATTENTION,
     validate_fusion_mode,
     validate_fusion_pos_encoding,
 )
+from .label_resolution import LABEL_RESOLUTION_MANIFEST, LABEL_RESOLUTION_SPLIT_DIR, LABEL_RESOLUTIONS
 from .machine import derive_grad_accum_steps
 from .precision import validate_bf16_support, validate_precision
 from .strides import (
@@ -46,6 +53,12 @@ class TrainingConfig:
         split_manifest: Path to the split manifest (splits.json) used to
             fail-fast if a split's directory contents diverge from it. Set to
             None to skip this guard (e.g., synthetic/unsplit test fixtures).
+        label_resolution: "split_dir" (default) keeps the historical
+            directory-defined splits guarded by `split_manifest`;
+            "manifest" makes `split_manifest` the source of truth and
+            resolves each stem's label across the split subdirectories of
+            `labels_dir` (needed for grouped k-fold manifests, which
+            regroup the canonical label files without copying them).
         backbone_variant: ConvNeXt variant ("tiny" or "small").
         num_classes: Number of detection classes.
         image_size: Input image size (square).
@@ -60,7 +73,17 @@ class TrainingConfig:
         cls_weight: Classification loss weight.
         class_weights: Per-class BCE weights [mango, danado].
         warmup_epochs: Linear warmup epochs per phase.
-        patience: Early stopping patience (epochs without mAP improvement).
+        patience: Early stopping patience (epochs without an improvement in
+            `selection_metric`).
+        conf_threshold: Operating-point confidence threshold. Gates the
+            classwise precision/recall/F1/TP-FP-FN stats and is the decode
+            threshold for visualization.
+        eval_conf_threshold: Decode threshold used by validation/test
+            evaluation so AP integrates the complete PR curve. Must be
+            <= `conf_threshold`.
+        selection_metric: Validation metric that drives best-checkpoint
+            selection and early-stopping patience. One of
+            `SELECTION_METRICS`.
         log_interval: Steps between TensorBoard logs.
         save_interval: Epochs between periodic checkpoints.
         precision: One of "fp32" | "fp16" | "bf16". Replaces the old
@@ -122,6 +145,21 @@ class TrainingConfig:
             stem is intentionally NOT in this group — it is 4-channel and
             out of ImageNet distribution by construction, so it trains at
             the full (non-discriminated) rate alongside the neck and head.
+        use_ema: Keep an exponential moving average of the weights
+            (`src/training/ema.py`), updated after every optimizer step.
+            When on, validation, best-checkpoint selection and early
+            stopping use the EMA weights, and checkpoints store them as
+            `model_state_dict` (live weights under `live_model_state_dict`).
+            Off by default so existing runs are unchanged.
+        ema_decay: Asymptotic EMA decay, in (0, 1).
+        ema_tau: EMA warm-up time constant in optimizer steps (> 0):
+            `d = ema_decay * (1 - exp(-updates / ema_tau))`. ~200 suits the
+            ~800-step budget of a 60-epoch run on this dataset.
+        neck_head_norm: "bn" (default) | "gn". Norm layer used in the neck
+            and head (never the LayerNorm backbone); see
+            `src/models/master/norms.py`. Master model only.
+        gn_groups: GroupNorm group-count upper bound; the largest divisor of
+            the channel count <= `gn_groups` is used.
     """
 
     # Paths
@@ -130,6 +168,7 @@ class TrainingConfig:
     labels_dir: str = "data/annotations/yolo/labels"
     output_dir: str = "checkpoints/mastermodel"
     split_manifest: str | None = "data/annotations/yolo/splits.json"
+    label_resolution: str = LABEL_RESOLUTION_SPLIT_DIR
 
     # Model
     backbone_variant: str = "tiny"
@@ -256,6 +295,16 @@ class TrainingConfig:
     schedule: str = "end_to_end"
     backbone_lr_mult: float = 0.1
 
+    # Weight EMA (src/training/ema.py). Off by default for backward
+    # compatibility.
+    use_ema: bool = False
+    ema_decay: float = 0.999
+    ema_tau: float = 200.0
+
+    # Neck/head normalization (src/models/master/norms.py) — MasterModel only.
+    neck_head_norm: str = DEFAULT_NECK_HEAD_NORM
+    gn_groups: int = DEFAULT_GN_GROUPS
+
     def __post_init__(self) -> None:
         valid_types = {"master", "student"}
         if self.model_type not in valid_types:
@@ -272,6 +321,13 @@ class TrainingConfig:
         # value is intentionally discarded here — grad_accum_steps is
         # derived on demand by the trainer, never stored as a config field.
         derive_grad_accum_steps(self.effective_batch, self.batch_size)
+        if self.label_resolution not in LABEL_RESOLUTIONS:
+            raise ValueError(
+                f"Invalid label_resolution '{self.label_resolution}'. "
+                f"Must be one of: {LABEL_RESOLUTIONS}"
+            )
+        if self.label_resolution == LABEL_RESOLUTION_MANIFEST and self.split_manifest is None:
+            raise ValueError("label_resolution='manifest' requires split_manifest to be set.")
         valid_schedules = {"two_phase", "end_to_end"}
         if self.schedule not in valid_schedules:
             raise ValueError(
@@ -300,6 +356,11 @@ class TrainingConfig:
                 "operating point is read off the AP decode, so that decode must "
                 "keep every prediction scoring at or above conf_threshold."
             )
+        if not 0.0 < self.ema_decay < 1.0:
+            raise ValueError(f"ema_decay must be in (0, 1), got {self.ema_decay}.")
+        if not self.ema_tau > 0.0:
+            raise ValueError(f"ema_tau must be > 0, got {self.ema_tau}.")
+        validate_neck_head_norm(self.neck_head_norm, self.gn_groups)
         if self.model_type == "master":
             validate_fusion_pos_encoding(self.fusion_pos_encoding, self.fusion_mode)
             validate_strides(self.head_strides, self.assigner_level_ranges)

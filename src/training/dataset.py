@@ -27,10 +27,74 @@ from .augmentations import (
     get_train_transforms,
     get_val_transforms,
 )
+from .label_resolution import (
+    LABEL_RESOLUTION_MANIFEST,
+    LABEL_RESOLUTION_SPLIT_DIR,
+    LABEL_RESOLUTIONS,
+)
 
 # ImageNet RGB normalization stats
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
+
+# How a split's images and labels are resolved: see `label_resolution.py`.
+MANIFEST_SPLITS: tuple[str, ...] = ("train", "val", "test")
+
+
+def build_label_index(labels_dir: str | Path) -> dict[str, list[Path]]:
+    """Map every label stem under `labels_dir/<subdir>/*.txt` to its file(s).
+
+    Only immediate subdirectories are scanned (the canonical layout is
+    `labels_dir/{train,val,test}/<stem>.txt`). A stem appearing in more than
+    one subdirectory maps to several paths, which callers must treat as
+    ambiguous rather than silently pick one.
+    """
+    labels_dir = Path(labels_dir)
+    index: dict[str, list[Path]] = {}
+    if not labels_dir.is_dir():
+        return index
+    for sub in sorted(p for p in labels_dir.iterdir() if p.is_dir()):
+        for label_path in sorted(sub.glob("*.txt")):
+            index.setdefault(label_path.stem, []).append(label_path)
+    return index
+
+
+def resolve_label_paths(labels_dir: str | Path, stems: list[str]) -> dict[str, Path]:
+    """Resolve each stem to exactly one label file under `labels_dir`'s split subdirs.
+
+    Raises:
+        FileNotFoundError: if any stem has no label file.
+        ValueError: if any stem has a label file in more than one subdirectory
+            (a stray copy from an earlier shuffle — the leakage shape guarded
+            against by `YOLODataset._verify_manifest_alignment`).
+    """
+    index = build_label_index(labels_dir)
+    missing = sorted(stem for stem in stems if stem not in index)
+    ambiguous = {stem: index[stem] for stem in sorted(stems) if len(index.get(stem, [])) > 1}
+    if missing:
+        raise FileNotFoundError(
+            f"No label file under {labels_dir}/<split>/ for {len(missing)} stem(s): {missing}"
+        )
+    if ambiguous:
+        details = {stem: [str(p) for p in paths] for stem, paths in ambiguous.items()}
+        raise ValueError(
+            f"Ambiguous label files under {labels_dir} (same stem in several split "
+            f"subdirectories): {details}. Run `scripts/prepare_yolo_splits.py --reconcile` first."
+        )
+    return {stem: index[stem][0] for stem in stems}
+
+
+def check_manifest_disjoint(manifest: dict[str, list[str]], source: str | Path = "manifest") -> None:
+    """Raise if any stem appears in more than one of the manifest's splits."""
+    seen: dict[str, str] = {}
+    overlaps: dict[str, list[str]] = {}
+    for split in MANIFEST_SPLITS:
+        for stem in manifest.get(split, []):
+            if stem in seen and seen[stem] != split:
+                overlaps.setdefault(stem, [seen[stem]]).append(split)
+            seen.setdefault(stem, split)
+    if overlaps:
+        raise ValueError(f"Split manifest {source} is not disjoint: {overlaps}")
 
 
 def letterbox(
@@ -160,6 +224,9 @@ class YOLODataset(Dataset):
         nir_mean: NIR normalization mean.
         nir_std: NIR normalization std.
         letterbox_value: Padding pixel value.
+        manifest_path: Optional split manifest (splits.json schema).
+        label_resolution: "split_dir" (default) or "manifest" — see
+            `LABEL_RESOLUTIONS`. "manifest" requires `manifest_path`.
     """
 
     def __init__(
@@ -174,10 +241,19 @@ class YOLODataset(Dataset):
         nir_std: float = 0.0546,
         letterbox_value: int = 114,
         manifest_path: str | Path | None = None,
+        label_resolution: str = LABEL_RESOLUTION_SPLIT_DIR,
     ):
+        if label_resolution not in LABEL_RESOLUTIONS:
+            raise ValueError(
+                f"Invalid label_resolution '{label_resolution}'. Must be one of: {LABEL_RESOLUTIONS}"
+            )
+        if label_resolution == LABEL_RESOLUTION_MANIFEST and manifest_path is None:
+            raise ValueError("label_resolution='manifest' requires a manifest_path.")
         self.rgb_dir = Path(rgb_dir)
         self.nir_dir = Path(nir_dir)
-        self.labels_dir = Path(labels_dir) / split
+        self.labels_root = Path(labels_dir)
+        self.labels_dir = self.labels_root / split
+        self.label_resolution = label_resolution
         self.split = split
         self.image_size = image_size
         self.nir_mean = nir_mean
@@ -210,6 +286,9 @@ class YOLODataset(Dataset):
         Returns:
             List of dicts with keys: rgb_path, nir_path, label_path, image_id.
         """
+        if self.label_resolution == LABEL_RESOLUTION_MANIFEST:
+            return self._load_pairs_from_manifest()
+
         if self.manifest_path is not None:
             self._verify_manifest_alignment()
 
@@ -239,6 +318,45 @@ class YOLODataset(Dataset):
                 "image_id": idx,
             })
 
+        return pairs
+
+    def _load_pairs_from_manifest(self) -> list[dict]:
+        """Build pairs for exactly the stems listed in `manifest[split]`.
+
+        Fails loudly (never skips) on a non-disjoint manifest, a stem without
+        an RGB/NIR pair, or a stem whose label file is missing/ambiguous —
+        a k-fold evaluation must see every manifest image exactly once.
+        `image_id` keeps the same meaning as in split_dir mode (index into
+        the sorted RGB listing).
+        """
+        if not self.manifest_path.exists():
+            raise FileNotFoundError(f"Split manifest not found: {self.manifest_path}")
+        manifest = json.loads(self.manifest_path.read_text())
+        check_manifest_disjoint(manifest, self.manifest_path)
+        stems = list(manifest.get(self.split, []))
+        label_paths = resolve_label_paths(self.labels_root, stems)
+
+        rgb_index = {path.stem: idx for idx, path in enumerate(sorted(self.rgb_dir.glob("*.jpg")))}
+        pairs = []
+        missing_images = []
+        for stem in sorted(stems):
+            rgb_path = self.rgb_dir / f"{stem}.jpg"
+            nir_path = self.nir_dir / f"{stem.replace('_rgb', '_nir')}.jpg"
+            if stem not in rgb_index or not nir_path.exists():
+                missing_images.append(stem)
+                continue
+            pairs.append({
+                "rgb_path": rgb_path,
+                "nir_path": nir_path,
+                "label_path": label_paths[stem],
+                "image_id": rgb_index[stem],
+            })
+        if missing_images:
+            raise FileNotFoundError(
+                f"Manifest {self.manifest_path} split '{self.split}' lists stems without an "
+                f"RGB/NIR pair in {self.rgb_dir} / {self.nir_dir}: {missing_images}"
+            )
+        pairs.sort(key=lambda pair: pair["image_id"])
         return pairs
 
     def _verify_manifest_alignment(self) -> None:
@@ -283,8 +401,18 @@ class YOLODataset(Dataset):
         """
         loaded = self.get_class_counts()
 
+        if self.label_resolution == LABEL_RESOLUTION_MANIFEST:
+            # The split is the manifest, not a directory: recount from the
+            # resolved label files, independent of image pairing.
+            manifest = json.loads(self.manifest_path.read_text())
+            label_files = list(
+                resolve_label_paths(self.labels_root, list(manifest.get(self.split, []))).values()
+            )
+        else:
+            label_files = list(self.labels_dir.glob("*.txt"))
+
         on_disk: dict[int, int] = {}
-        for label_path in self.labels_dir.glob("*.txt"):
+        for label_path in label_files:
             _, labels = self._load_labels(label_path)
             for lbl in labels:
                 on_disk[int(lbl)] = on_disk.get(int(lbl), 0) + 1
@@ -293,7 +421,7 @@ class YOLODataset(Dataset):
             "loaded": loaded,
             "on_disk": on_disk,
             "image_count": len(self.pairs),
-            "label_file_count": sum(1 for _ in self.labels_dir.glob("*.txt")),
+            "label_file_count": len(label_files),
         }
 
     def _load_labels(self, path: Path) -> tuple[np.ndarray, np.ndarray]:

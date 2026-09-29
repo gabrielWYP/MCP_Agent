@@ -17,13 +17,14 @@ Features:
     - Fatal (counted, not silently skipped) OOM/NaN batch-skip guards (D-G)
     - Gradient clipping
     - CosineAnnealingWarmRestarts with linear warmup
-    - Early stopping on val mAP@0.5
+    - Early stopping on a configurable val metric (`config.selection_metric`)
     - Best checkpoint + periodic checkpointing
     - TensorBoard logging, including per-module gradient norms (D-F)
 """
 
 from __future__ import annotations
 
+import logging
 import time
 from pathlib import Path
 
@@ -35,6 +36,7 @@ from torch.utils.data import DataLoader
 
 from .config import DAMAGE_CLASS_ID, TrainingConfig
 from .decode import decode_detections
+from .ema import ModelEMA
 from .loss import YOLOv8Loss
 from .fusion_modes import DEFAULT_FUSION_MODE, arch_version_for_mode
 from .machine import derive_grad_accum_steps
@@ -59,6 +61,34 @@ from .strides import resolve_active_strides
 # per-mode mapping lives in `src/training/fusion_modes.py`.
 CHECKPOINT_ARCH_VERSION = arch_version_for_mode(DEFAULT_FUSION_MODE)
 
+logger = logging.getLogger(__name__)
+
+
+def resolve_selection_value(metrics: dict, selection_metric: str) -> tuple[float, str]:
+    """Return `(value, metric_name)` for best-checkpoint selection/patience.
+
+    `selection_metric` is validated by `TrainingConfig.__post_init__`
+    (see `config.SELECTION_METRICS`). "damage_ap50" reads
+    `per_class_ap_50[DAMAGE_CLASS_ID]`; when that AP is undefined — the key
+    is absent, or the split has no damage GT (tp + fn == 0, where
+    `_compute_ap_at_iou` reports a meaningless 0.0) — this falls back to
+    "map50" with a warning instead of selecting and early-stopping on a
+    constant 0.0. The returned name is the metric actually used, so callers
+    can log the fallback.
+    """
+    if selection_metric == "damage_ap50":
+        per_class_ap = metrics.get("per_class_ap_50", {})
+        counts = metrics.get("per_class_counts", {}).get(DAMAGE_CLASS_ID)
+        has_gt = counts is None or (counts.get("tp", 0) + counts.get("fn", 0)) > 0
+        if DAMAGE_CLASS_ID in per_class_ap and has_gt:
+            return float(per_class_ap[DAMAGE_CLASS_ID]), selection_metric
+        logger.warning(
+            "selection_metric='damage_ap50' is undefined for this split "
+            "(no class-%d AP or no class-%d GT); falling back to 'map50'.",
+            DAMAGE_CLASS_ID, DAMAGE_CLASS_ID,
+        )
+    return float(metrics.get("map50", 0.0)), "map50"
+
 
 class Trainer:
     """Two-phase training loop for MasterModel.
@@ -71,6 +101,10 @@ class Trainer:
             entrypoints (`scripts/evaluate_checkpoint.py`) can omit it.
         val_loader: Validation data loader.
     """
+
+    # Weight EMA shadow (set in `__init__` when `config.use_ema`). Declared
+    # at class level so instances built without `__init__` still read None.
+    ema: ModelEMA | None = None
 
     def __init__(
         self,
@@ -93,6 +127,13 @@ class Trainer:
         else:
             self.device = torch.device(config.device)
         self.model.to(self.device)
+
+        # Weight EMA (src/training/ema.py). Only built when there is
+        # something to train: an eval-only Trainer (train_loader=None, e.g.
+        # scripts/evaluate_checkpoint.py) evaluates the weights it was given.
+        self.ema = None
+        if config.use_ema and train_loader is not None:
+            self.ema = ModelEMA(self.model, decay=config.ema_decay, tau=config.ema_tau)
 
         # Gradient accumulation (D-H): effective_batch is the experimental
         # constant; batch_size is a memory knob. Derived, never read from a
@@ -127,6 +168,9 @@ class Trainer:
 
         # Tracking
         self.loss_history = LossHistory()
+        # `best_map50` is the mAP@0.5 of the checkpoint currently saved as
+        # best_model.pt (read by run_artifacts for stage naming);
+        # `best_score` is what selection/patience compare against.
         self.best_map50 = 0.0
         # Best value of `config.selection_metric` so far. -inf so the first
         # epoch always saves, even at score 0.0; ties keep the earlier epoch.
@@ -147,6 +191,12 @@ class Trainer:
             self.writer = SummaryWriter(log_dir=str(self.output_dir / "logs"))
         except ImportError:
             print("[Trainer] TensorBoard not available, skipping logging.")
+
+    @property
+    def eval_model(self) -> nn.Module:
+        """Weights validation, selection and early stopping run on: the EMA
+        shadow when `use_ema` is on, otherwise the live model."""
+        return self.ema.module if self.ema is not None else self.model
 
     def fit(self) -> dict:
         """Run training.
@@ -229,6 +279,8 @@ class Trainer:
 
         return {
             "best_map50": self.best_map50,
+            "selection_metric": self.config.selection_metric,
+            "best_score": self.best_score,
             "loss_history": {
                 "epoch": self.loss_history.epoch,
                 "phase": self.loss_history.phase,
@@ -433,13 +485,16 @@ class Trainer:
             # Checkpoint + early stopping on `config.selection_metric`.
             # `best_map50` stays the mAP@0.5 of the saved checkpoint, whatever
             # metric selected it, since run artifacts are named after it.
-            score = self._selection_score(val_metrics)
+            score, selection_name = self._selection_score(val_metrics)
             if score > self.best_score:
                 self.best_score = score
                 self.best_map50 = map50
                 self.patience_counter = 0
                 self._save_checkpoint(epoch, phase, val_metrics, "best_model.pt", train_metrics=train_metrics)
-                print(f"    ✓ New best {self.config.selection_metric}: {score:.4f}")
+                print(
+                    f"    ✓ New best {selection_name}: {score:.4f} "
+                    f"(mAP@0.5={map50:.4f})"
+                )
             else:
                 self.patience_counter += 1
 
@@ -470,11 +525,10 @@ class Trainer:
         `self.model` (see `_auxiliary_param_groups`). Empty by default."""
         return {}
 
-    def _selection_score(self, val_metrics: dict) -> float:
-        """Value of `config.selection_metric` in one epoch's val metrics."""
-        if self.config.selection_metric == "damage_ap50":
-            return val_metrics.get("per_class_ap_50", {}).get(DAMAGE_CLASS_ID, 0.0)
-        return val_metrics.get("map50", 0.0)
+    def _selection_score(self, val_metrics: dict) -> tuple[float, str]:
+        """`(value, metric_name)` of `config.selection_metric` in one epoch's
+        val metrics; see `resolve_selection_value` for the map50 fallback."""
+        return resolve_selection_value(val_metrics, self.config.selection_metric)
 
     def _discriminative_param_groups(self, lr: float) -> list[dict]:
         """Two-group AdamW parameter groups for end-to-end MasterModel
@@ -617,6 +671,10 @@ class Trainer:
             else:
                 optimizer.step()
             optimizer.zero_grad(set_to_none=True)
+            # Once per optimizer step (never per micro-batch), so gradient
+            # accumulation does not shorten the EMA horizon.
+            if self.ema is not None:
+                self.ema.update(self.model)
             steps_taken += 1
 
         for batch in self.train_loader:
@@ -748,7 +806,37 @@ class Trainer:
             Dict with map50, map_50_95, per_class_ap_50, per_class_ap_50_95,
             per_class precision/recall/f1, and per_class_counts.
         """
-        self.model.eval()
+        predictions = self.collect_predictions()
+        return compute_map(
+            pred_boxes=predictions["pred_boxes"],
+            pred_scores=predictions["pred_scores"],
+            pred_labels=predictions["pred_labels"],
+            gt_boxes=predictions["gt_boxes"],
+            gt_labels=predictions["gt_labels"],
+            num_classes=self.config.num_classes,
+            # Predictions were decoded at `eval_conf_threshold` (full PR
+            # curve for AP); P/R/F1/TP/FP/FN are still reported at the
+            # `conf_threshold` operating point, comparable to past reports.
+            score_threshold=self.config.conf_threshold,
+        )
+
+    @torch.no_grad()
+    def collect_predictions(self) -> dict[str, list[torch.Tensor]]:
+        """Run inference over `val_loader` and return per-image preds and GT.
+
+        Predictions are decoded at `eval_conf_threshold`. Exposed separately
+        from `evaluate()` so callers can pool predictions from several
+        loaders (e.g. out-of-fold k-fold evaluation) before a single
+        `compute_map` call.
+
+        Runs on `self.eval_model` — the EMA weights when `use_ema` is on.
+
+        Returns:
+            Dict of equal-length per-image lists: pred_boxes, pred_scores,
+            pred_labels, gt_boxes, gt_labels (boxes cxcywh normalized).
+        """
+        model = self.eval_model
+        model.eval()
 
         all_pred_boxes = []
         all_pred_scores = []
@@ -762,9 +850,9 @@ class Trainer:
 
             with autocast_ctx(self.device.type, self.config.precision):
                 if self.config.model_type == "student":
-                    output = self.model(rgb)
+                    output = model(rgb)
                 else:
-                    output = self.model(rgb, nir)
+                    output = model(rgb, nir)
 
             # Decode predictions for mAP computation
             preds = output["preds"]  # list of (B, nc+4, H, W)
@@ -786,18 +874,13 @@ class Trainer:
                 all_gt_boxes.append(gt_bboxes)
                 all_gt_labels.append(gt_labels_batch)
 
-        # Compute mAP
-        metrics = compute_map(
-            pred_boxes=all_pred_boxes,
-            pred_scores=all_pred_scores,
-            pred_labels=all_pred_labels,
-            gt_boxes=all_gt_boxes,
-            gt_labels=all_gt_labels,
-            num_classes=self.config.num_classes,
-            score_threshold=self.config.conf_threshold,
-        )
-
-        return metrics
+        return {
+            "pred_boxes": all_pred_boxes,
+            "pred_scores": all_pred_scores,
+            "pred_labels": all_pred_labels,
+            "gt_boxes": all_gt_boxes,
+            "gt_labels": all_gt_labels,
+        }
 
     @staticmethod
     def _decode_predictions_static(
@@ -845,6 +928,8 @@ class Trainer:
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Decode model predictions for a single image in the batch.
 
+        `conf_threshold` defaults to `config.conf_threshold`.
+
         Returns:
             pred_boxes: (P, 4) cxcywh normalized.
             pred_scores: (P,) confidence scores.
@@ -880,13 +965,22 @@ class Trainer:
         (`scripts/evaluate_checkpoint.py`,
         `scripts/visualize_damage_predictions.py`) instead of a 200-line
         missing/unexpected-key dump.
+
+        Weight EMA: `model_state_dict` always holds the weights validation
+        ran on — the EMA weights when `use_ema` is on — so every loader
+        (`evaluate_checkpoint.py`, `aggregate_kfold.py`, the KD teacher)
+        picks them up unchanged. The live weights are kept under
+        `live_model_state_dict` (with `ema_updates`) so training can be
+        resumed. Checkpoints without these keys are pre-EMA and load as
+        before.
         """
         path = self.output_dir / filename
         checkpoint = {
             "epoch": epoch,
             "phase": phase,
             "arch_version": arch_version_for_mode(self.config.fusion_mode),
-            "model_state_dict": self.model.state_dict(),
+            "model_state_dict": self.eval_model.state_dict(),
+            "use_ema": self.ema is not None,
             "metrics": metrics,
             "best_map50": self.best_map50,
             "selection_metric": self.config.selection_metric,
@@ -895,6 +989,9 @@ class Trainer:
             "experiment_sha256": self.experiment_sha256,
         }
         checkpoint.update(self._auxiliary_checkpoint_state())
+        if self.ema is not None:
+            checkpoint["live_model_state_dict"] = self.model.state_dict()
+            checkpoint["ema_updates"] = self.ema.updates
         if train_metrics is not None:
             checkpoint["oom_skipped"] = train_metrics.get("oom_skipped")
             checkpoint["nan_skipped"] = train_metrics.get("nan_skipped")

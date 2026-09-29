@@ -56,6 +56,9 @@ backbone_lr_mult: 0.1
 weight_decay: 0.0005
 warmup_epochs: 5
 patience: 20
+# best_model.pt selection and early-stopping patience follow the damage-class
+# AP@0.5: mAP@0.5 is saturated by mango (AP=1.0) and hides damage progress.
+selection_metric: damage_ap50
 
 # The experimental constant (Q7, fusion-redesign) — fixed before V1 and
 # immutable afterwards. Physical batch_size is a machine-profile memory
@@ -84,7 +87,11 @@ seed: 42
 
 # Decode (src/training/decode.py::decode_detections) — carried unchanged
 # from training_mango.yaml so the mango guardrail comparison stays valid.
+# conf_threshold is the operating point for P/R/F1/TP/FP/FN (and
+# visualization). AP is computed on detections decoded at the much lower
+# eval_conf_threshold so the PR curve is complete (standard mAP practice).
 conf_threshold: 0.25
+eval_conf_threshold: 0.001
 nms_iou_threshold: 0.5
 nms_enabled: true
 decode_per_class: true

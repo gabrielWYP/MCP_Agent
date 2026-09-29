@@ -44,6 +44,7 @@ from .loop import Trainer
 from .precision import autocast_ctx
 from .strides import STUDENT_STRIDES, select_by_strides
 from src.models.master.master_model import MasterModel
+from src.models.master.norms import DEFAULT_GN_GROUPS, DEFAULT_NECK_HEAD_NORM
 from src.models.master.distill_projections import (
     backbone_projections,
     fpn_projections,
@@ -136,6 +137,10 @@ class KDTrainer(Trainer):
         # `fusion_pos_encoding` adds no key, so strict loading cannot catch
         # it — it is read from the teacher checkpoint's own recorded config
         # (absent -> False), never from the student's KD config.
+        # The neck/head norm is part of the state_dict schema too; read it
+        # from the teacher's own recorded config (pre-field checkpoints are
+        # BatchNorm, the default).
+        teacher_config = checkpoint.get("config") or {}
         teacher = MasterModel(
             num_classes=config.num_classes,
             pretrained_backbone=False,
@@ -143,6 +148,8 @@ class KDTrainer(Trainer):
             head_strides=config.head_strides,
             fusion_mode=config.fusion_mode,
             fusion_pos_encoding=fusion_pos_encoding_from_checkpoint(checkpoint),
+            neck_head_norm=teacher_config.get("neck_head_norm", DEFAULT_NECK_HEAD_NORM),
+            gn_groups=teacher_config.get("gn_groups", DEFAULT_GN_GROUPS),
         )
 
         teacher.load_state_dict(checkpoint["model_state_dict"])
@@ -295,6 +302,9 @@ class KDTrainer(Trainer):
                     self.scaler.update()
                 else:
                     optimizer.step()
+                # Same once-per-optimizer-step EMA contract as Trainer.
+                if self.ema is not None:
+                    self.ema.update(self.model)
 
             except RuntimeError as e:
                 if "out of memory" in str(e).lower():

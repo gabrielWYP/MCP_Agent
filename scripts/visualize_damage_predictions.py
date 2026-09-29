@@ -54,8 +54,10 @@ from scripts.evaluate_checkpoint import (
     _check_arch_version,
     _resolve_fusion_pos_encoding,
     _resolve_head_strides,
+    _resolve_neck_head_norm,
 )
 from src.models.master.master_model import MasterModel
+from src.models.master.norms import check_norm_compatible
 from src.models.student.student_model import StudentModel, strip_legacy_kd_adapter_keys
 from src.training.config import TrainingConfig
 from src.training.dataset import letterbox
@@ -213,6 +215,9 @@ def load_model(
         logger.info("Loaded raw state_dict.")
 
     if model_type == "master":
+        neck_head_norm, gn_groups = _resolve_neck_head_norm(
+            checkpoint if is_checkpoint_dict else None, config
+        )
         model = MasterModel(
             num_classes=config.num_classes,
             pretrained_backbone=False,
@@ -221,7 +226,10 @@ def load_model(
             in_channels=config.in_channels,
             fusion_mode=config.fusion_mode,
             fusion_pos_encoding=fusion_pos_encoding,
+            neck_head_norm=neck_head_norm,
+            gn_groups=gn_groups,
         )
+        check_norm_compatible(model, state_dict, source=f"Checkpoint at {checkpoint_path}")
         strides = list(model.head_strides)
     else:
         model = StudentModel(num_classes=config.num_classes)

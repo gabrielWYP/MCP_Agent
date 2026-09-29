@@ -14,20 +14,28 @@ Usage:
 import argparse
 import json
 import logging
+import os
 import re
 import sys
 from pathlib import Path
+from unittest.mock import patch
 
 import cv2
 import torch
 from PIL import Image
 from transformers import AutoProcessor, AutoModelForCausalLM
+from transformers.dynamic_module_utils import get_imports
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+
+def _get_imports_without_flash_attn(filename: str | os.PathLike) -> list[str]:
+    """Return the remote module's imports minus the optional flash_attn."""
+    return [imp for imp in get_imports(filename) if imp != "flash_attn"]
 
 
 def parse_florence_bboxes(text: str, image_w: int, image_h: int, target_class: str = "mango") -> list[dict]:
@@ -175,10 +183,14 @@ def main():
     processor = AutoProcessor.from_pretrained(
         args.model, trust_remote_code=True
     )
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model, trust_remote_code=True, torch_dtype=torch.float16,
-        attn_implementation="eager",
-    ).to(device)
+    # Florence-2's remote modeling file lists flash_attn as a hard import even
+    # though attn_implementation="eager" never uses it; drop it from the
+    # import check so the model loads without installing flash_attn.
+    with patch("transformers.dynamic_module_utils.get_imports", _get_imports_without_flash_attn):
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model, trust_remote_code=True, torch_dtype=torch.float16,
+            attn_implementation="eager",
+        ).to(device)
     model.eval()
     logger.info("Model loaded.")
 

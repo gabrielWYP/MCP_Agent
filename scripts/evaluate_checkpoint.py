@@ -23,6 +23,12 @@ Usage:
     python scripts/evaluate_checkpoint.py --config configs/training_student.yaml \\
         --checkpoint checkpoints/student/best_model.pt --split train \\
         --assigner-stats --override assigner_center_radius=0.0
+
+AP is computed on detections decoded at `eval_conf_threshold` (default
+0.001, complete PR curve); P/R/F1/TP/FP/FN are reported at the
+`conf_threshold` operating point. To reproduce AP numbers reported before
+this split (decoded at the operating point), pass
+`--override eval_conf_threshold=0.25`.
 """
 
 from __future__ import annotations
@@ -39,6 +45,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.models.master.master_model import MasterModel
+from src.models.master.norms import check_norm_compatible
 from src.models.student.student_model import StudentModel, strip_legacy_kd_adapter_keys
 from src.training.config import TrainingConfig
 from src.training.dataset import YOLODataset, build_dataloader, collate_fn
@@ -187,6 +194,27 @@ def _resolve_fusion_pos_encoding(checkpoint: dict, config: TrainingConfig) -> bo
     return resolved
 
 
+def _resolve_neck_head_norm(checkpoint: dict | None, config: TrainingConfig) -> tuple[str, int]:
+    """Return `(neck_head_norm, gn_groups)` to rebuild the model with.
+
+    The neck/head norm is part of the state_dict schema (BatchNorm carries
+    running-stat buffers, GroupNorm does not), so the checkpoint's own
+    recorded choice wins over the eval config — exactly like
+    `head_strides`. Checkpoints written before the field existed record
+    nothing and fall back to the config (default "bn", which is what they
+    were trained with).
+    """
+    recorded = (checkpoint or {}).get("config") or {}
+    norm = recorded.get("neck_head_norm", config.neck_head_norm)
+    groups = recorded.get("gn_groups", config.gn_groups)
+    if norm != config.neck_head_norm:
+        logger.info(
+            "Using the checkpoint's neck_head_norm=%r (config says %r).",
+            norm, config.neck_head_norm,
+        )
+    return norm, groups
+
+
 def _load_model(model_type: str, checkpoint_path: str, config: TrainingConfig, device: torch.device):
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     is_checkpoint_dict = isinstance(checkpoint, dict) and "model_state_dict" in checkpoint
@@ -207,16 +235,25 @@ def _load_model(model_type: str, checkpoint_path: str, config: TrainingConfig, d
             _check_arch_version(checkpoint_path, arch_version, config.fusion_mode)
             head_strides = _resolve_head_strides(checkpoint, config.fusion_mode)
             fusion_pos_encoding = _resolve_fusion_pos_encoding(checkpoint, config)
+        # `model_state_dict` is the weights validation ran on: the EMA
+        # weights for a `use_ema` run (live weights sit under
+        # `live_model_state_dict`, used only to resume training).
         state_dict = checkpoint["model_state_dict"]
         logger.info(
-            "Loaded checkpoint (epoch=%s, best_map50=%s)",
+            "Loaded checkpoint (epoch=%s, best_map50=%s, selection_metric=%s, "
+            "weights=%s)",
             checkpoint.get("epoch", "?"), checkpoint.get("best_map50", "?"),
+            checkpoint.get("selection_metric", "map50 (pre-selection_metric)"),
+            "ema" if checkpoint.get("use_ema") else "live",
         )
     else:
         state_dict = checkpoint
         logger.info("Loaded raw state_dict.")
 
     if model_type == "master":
+        neck_head_norm, gn_groups = _resolve_neck_head_norm(
+            checkpoint if is_checkpoint_dict else None, config
+        )
         model = MasterModel(
             num_classes=config.num_classes,
             pretrained_backbone=False,
@@ -225,7 +262,10 @@ def _load_model(model_type: str, checkpoint_path: str, config: TrainingConfig, d
             in_channels=config.in_channels,
             fusion_mode=config.fusion_mode,
             fusion_pos_encoding=fusion_pos_encoding,
+            neck_head_norm=neck_head_norm,
+            gn_groups=gn_groups,
         )
+        check_norm_compatible(model, state_dict, source=f"Checkpoint at {checkpoint_path}")
     else:
         model = StudentModel(num_classes=config.num_classes)
         # Pre-fix KD checkpoints stored the training-only adapters inside
@@ -319,9 +359,11 @@ def main() -> int:
     )
     logger.info("Device: %s", device)
     logger.info(
-        "Config: model=%s split=%s conf_threshold=%.3f eval_conf_threshold=%.3f nms_enabled=%s decode_per_class=%s "
+        "Config: model=%s split=%s conf_threshold=%.3f (operating point) "
+        "eval_conf_threshold=%.3f (AP decode) nms_enabled=%s decode_per_class=%s "
         "assigner_center_radius=%.2f",
-        model_type, args.split, config.conf_threshold, config.eval_conf_threshold, config.nms_enabled,
+        model_type, args.split, config.conf_threshold, config.eval_conf_threshold,
+        config.nms_enabled,
         config.decode_per_class, config.assigner_center_radius,
     )
 
@@ -347,6 +389,7 @@ def main() -> int:
         nir_std=config.nir_std,
         letterbox_value=config.letterbox_value,
         manifest_path=config.split_manifest,
+        label_resolution=config.label_resolution,
     )
     logger.info("Split '%s': %d images", args.split, len(dataset))
 

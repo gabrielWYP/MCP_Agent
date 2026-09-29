@@ -72,6 +72,7 @@ from .backbone import DualConvNeXtBackbone, EarlyFusionBackbone
 from .fusion import CrossModalFusion
 from .neck import DualFPN, FPNNeck
 from .head import YOLODetectionHead, NUM_CLASSES
+from .norms import DEFAULT_GN_GROUPS, DEFAULT_NECK_HEAD_NORM, validate_neck_head_norm
 from src.training.fusion_modes import (
     DEFAULT_FUSION_MODE,
     FUSION_MODE_CROSS_ATTENTION,
@@ -123,6 +124,12 @@ class MasterModel(nn.Module):
             `src/models/master/fusion.py`). Default False keeps the
             pre-existing behaviour; adds no state_dict key either way.
             `fusion_mode="cross_attention"` only — True raises on "early".
+        neck_head_norm (str): Norm layer for every BatchNorm-style layer in
+            the neck and head — "bn" (default) or "gn". Never applied to the
+            backbone (LayerNorm) or the distillation projections. Today the
+            only such layers are `DualFPN.fusion_convs`, so this is a no-op
+            for `fusion_mode="early"`. See `src/models/master/norms.py`.
+        gn_groups (int): GroupNorm group-count upper bound for "gn".
     """
 
     # ConvNeXt stage channels (identical for Tiny and Small)
@@ -140,8 +147,13 @@ class MasterModel(nn.Module):
         fusion_dropout: float = 0.1,
         fpn_dropout: float = 0.1,
         fusion_pos_encoding: bool = False,
+        neck_head_norm: str = DEFAULT_NECK_HEAD_NORM,
+        gn_groups: int = DEFAULT_GN_GROUPS,
     ):
         super().__init__()
+
+        validate_neck_head_norm(neck_head_norm, gn_groups)
+        self.neck_head_norm = neck_head_norm
 
         validate_fusion_mode(fusion_mode)
         self.fusion_mode = fusion_mode
@@ -196,6 +208,8 @@ class MasterModel(nn.Module):
                 out_channels=fpn_channels,
                 dropout=fpn_dropout,
                 emit_strides=tuple(strides),
+                norm=neck_head_norm,
+                gn_groups=gn_groups,
             )
 
         # --- YOLO-style detection head (compatible with YOLO Nano student) ---

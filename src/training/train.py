@@ -121,6 +121,11 @@ def main():
     # Apply overrides
     for override in args.override:
         key, value = override.split("=", 1)
+        # An unknown key used to be skipped silently, so a typo (or several
+        # key=value pairs fused into one argument by the shell) ran the wrong
+        # experiment without any warning.
+        if not hasattr(config, key):
+            raise SystemExit(f"Unknown --override key '{key}' (from '{override}').")
         # Type coercion
         if hasattr(config, key):
             current = getattr(config, key)
@@ -147,6 +152,11 @@ def main():
     # CLI --model flag overrides config model_type
     if args.model is not None:
         config.model_type = args.model
+
+    # `setattr` bypasses the dataclass validation, so re-run it: an invalid
+    # override (e.g. `neck_head_norm=gm`, `ema_decay=1.5`) must fail here,
+    # not silently train a wrong configuration.
+    config.__post_init__()
 
     versioned_plan = None
     if args.versioned_run:
@@ -184,6 +194,10 @@ def main():
         f"  Batch size: {config.batch_size}, Precision: {config.precision}, "
         f"Device: {config.device}, effective_batch: {config.effective_batch}"
     )
+    print(
+        f"  use_ema: {config.use_ema} (decay={config.ema_decay}, tau={config.ema_tau}), "
+        f"neck_head_norm: {config.neck_head_norm}, patience: {config.patience}"
+    )
     if run_experiment_sha256:
         print(f"  experiment_sha256: {run_experiment_sha256}")
 
@@ -200,6 +214,7 @@ def main():
         nir_std=config.nir_std,
         letterbox_value=config.letterbox_value,
         manifest_path=config.split_manifest,
+        label_resolution=config.label_resolution,
     )
 
     val_dataset = YOLODataset(
@@ -212,6 +227,7 @@ def main():
         nir_std=config.nir_std,
         letterbox_value=config.letterbox_value,
         manifest_path=config.split_manifest,
+        label_resolution=config.label_resolution,
     )
 
     print(f"Dataset: {len(train_dataset)} train, {len(val_dataset)} val images")
@@ -251,6 +267,8 @@ def main():
             in_channels=config.in_channels,
             fusion_mode=config.fusion_mode,
             fusion_pos_encoding=config.fusion_pos_encoding,
+            neck_head_norm=config.neck_head_norm,
+            gn_groups=config.gn_groups,
         )
         params = model.count_parameters()
         print(f"Model parameters: {params['total']:,} total, {params['backbone']:,} backbone")
@@ -287,6 +305,10 @@ def main():
     print(f"\n{'='*60}")
     print(f"Training complete!")
     print(f"  Best mAP@0.5: {results['best_map50']:.4f}")
+    print(
+        f"  Selected on {results['selection_metric']}: "
+        f"{results['best_score']:.4f}"
+    )
     print(f"  Checkpoint: {final_checkpoint}")
     print(f"{'='*60}")
 

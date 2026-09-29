@@ -43,6 +43,8 @@ from src.training.strides import (
     validate_strides,
 )
 
+from .norms import DEFAULT_GN_GROUPS, DEFAULT_NECK_HEAD_NORM, make_norm
+
 
 class SingleFPN(nn.Module):
     """
@@ -204,6 +206,11 @@ class DualFPN(nn.Module):
         emit_strides (Sequence[int] | None): Strides to fuse and emit,
             finest-first. Defaults to `CROSS_ATTENTION_HEAD_STRIDES`
             (`(8, 16, 32)`), so every existing call site is unchanged.
+        norm (str): Norm layer inside each fusion conv — "bn" (default,
+            `nn.BatchNorm2d`, the existing checkpoint schema) or "gn"
+            (`nn.GroupNorm`). See `src/models/master/norms.py`.
+        gn_groups (int): GroupNorm group count upper bound (largest divisor
+            of `out_channels` <= `gn_groups` is used). Ignored for "bn".
     """
 
     def __init__(
@@ -212,6 +219,8 @@ class DualFPN(nn.Module):
         out_channels: int = 256,
         dropout: float = 0.1,
         emit_strides: Sequence[int] | None = None,
+        norm: str = DEFAULT_NECK_HEAD_NORM,
+        gn_groups: int = DEFAULT_GN_GROUPS,
     ):
         super().__init__()
 
@@ -230,7 +239,7 @@ class DualFPN(nn.Module):
         self.fusion_convs = nn.ModuleList([
             nn.Sequential(
                 nn.Conv2d(out_channels * 2, out_channels, kernel_size=1),
-                nn.BatchNorm2d(out_channels),
+                make_norm(norm, out_channels, gn_groups),
                 nn.ReLU(inplace=True),
                 nn.Dropout2d(p=dropout),
             )
