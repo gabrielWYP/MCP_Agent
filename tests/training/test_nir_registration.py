@@ -167,6 +167,18 @@ class TestDatasetRegistersNir:
         pad_y = (self.IMAGE_SIZE - RGB_H) // 2
         assert (cx, cy - pad_y) == pytest.approx((x_nir, y_nir), abs=1.5)
 
+    def test_kwarg_is_required(self, tmp_path: Path) -> None:
+        nir, _ = _nir_with_block_at_rgb_point(100, 60)
+        _write_pair(tmp_path, nir)
+        with pytest.raises(TypeError, match="nir_homography_path"):
+            YOLODataset(
+                rgb_dir=tmp_path / "rgb",
+                nir_dir=tmp_path / "nir",
+                labels_dir=tmp_path / "labels",
+                split="val",
+                image_size=self.IMAGE_SIZE,
+            )
+
     def test_missing_homography_raises_at_construction(self, tmp_path: Path) -> None:
         nir, _ = _nir_with_block_at_rgb_point(100, 60)
         _write_pair(tmp_path, nir)

@@ -167,7 +167,9 @@ class YOLODataset(Dataset):
             `inv(H)`) right after loading, before letterbox/augmentation, and
             the file MUST exist. None disables registration (NIR is used as
             captured, i.e. misaligned with the RGB-frame labels) and is only
-            meant for synthetic fixtures and explicit ablations.
+            meant for synthetic fixtures and explicit ablations. Required
+            keyword-only (no default): every caller must choose explicitly,
+            so forgetting it cannot silently train on unregistered NIR.
     """
 
     def __init__(
@@ -182,7 +184,8 @@ class YOLODataset(Dataset):
         nir_std: float = 0.0546,
         letterbox_value: int = 114,
         manifest_path: str | Path | None = None,
-        nir_homography_path: str | Path | None = None,
+        *,
+        nir_homography_path: str | Path | None,
     ):
         self.rgb_dir = Path(rgb_dir)
         self.nir_dir = Path(nir_dir)
